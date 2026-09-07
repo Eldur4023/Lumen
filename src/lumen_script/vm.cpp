@@ -59,7 +59,18 @@ VM::Result VM::start(const Chunk& chunk, std::vector<Value> params, NativeCtx& c
     functions_ = functions;
     frames_.clear();
     stack_.clear();
-    stack_.reserve(32);
+
+    // Capacidad reservada de una vez: frames_ tiene un tope fijo conocido
+    // (kMaxFrames) que nunca cambia, y stack_/locals_ usan un margen generoso
+    // para el grueso de los handlers reales en vez del 32 arbitrario de antes.
+    // reserve() no reasigna si la capacidad ya alcanza (el caso normal cuando
+    // esta misma VM se reutiliza entre peticiones via el shared_vm thread_local
+    // de project.cpp), asi que esto no cambia el comportamiento observable:
+    // solo evita las reasignaciones repetidas de std::vector::push_back/resize
+    // que salian en el perfil de CPU (Value::emplace_back, ver bench/RESULTS.md).
+    frames_.reserve(kMaxFrames);
+    stack_.reserve(256);
+    locals_.reserve(256);
 
     locals_.assign(static_cast<size_t>(chunk.num_locals), Value::null());
     for (size_t i = 0; i < params.size() && i < locals_.size(); ++i)
