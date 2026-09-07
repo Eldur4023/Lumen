@@ -13,8 +13,7 @@ void Emitter::error(SourceLoc loc, std::string msg) {
     failed_ = true;
 }
 
-int Emitter::declare_local(const std::string& name, SourceLoc loc,
-                           const std::string& type) {
+int Emitter::declare_local(const std::string& name, SourceLoc loc, Type type) {
     for (auto it = locals_.rbegin(); it != locals_.rend(); ++it) {
         if (it->depth < scope_depth_) break;
         if (it->name == name) {
@@ -22,15 +21,15 @@ int Emitter::declare_local(const std::string& name, SourceLoc loc,
             return static_cast<int>(std::distance(locals_.begin(), it.base()) - 1);
         }
     }
-    locals_.push_back({name, scope_depth_, type});
+    locals_.push_back({name, scope_depth_, std::move(type)});
     int slot = static_cast<int>(locals_.size()) - 1;
     if (slot + 1 > chunk_->num_locals) chunk_->num_locals = slot + 1;
     chunk_->local_names.push_back(name);
     return slot;
 }
 
-const std::string& Emitter::local_type(const std::string& name) const {
-    static const std::string kNone;
+const Type& Emitter::local_type(const std::string& name) const {
+    static const Type kNone = Type::unknown();
     for (int i = static_cast<int>(locals_.size()) - 1; i >= 0; --i)
         if (locals_[static_cast<size_t>(i)].name == name)
             return locals_[static_cast<size_t>(i)].type;
@@ -40,7 +39,11 @@ const std::string& Emitter::local_type(const std::string& name) const {
 bool Emitter::es_int(const Expr& e) const {
     switch (e.kind) {
         case ExprKind::IntLit: return true;
-        case ExprKind::Ident:  return local_type(e.text) == "int";
+        // OJO: comparacion por ortografia a proposito, no por Kind. Hoy
+        // 'long x' NO activa el opcode especializado (solo 'int' literal lo
+        // hace) -- es el comportamiento existente, que esta migracion no
+        // cambia aunque la gramatica diga que int/long son el mismo tipo.
+        case ExprKind::Ident:  return local_type(e.text).base_name() == "int";
         case ExprKind::Binary:
             if (e.text == "+" || e.text == "-" || e.text == "*")
                 return e.lhs && e.rhs && es_int(*e.lhs) && es_int(*e.rhs);
@@ -73,7 +76,7 @@ bool Emitter::emit_route(const RouteDecl& route, Chunk& out) {
     loops_.clear();
     scope_depth_ = 0;
 
-    for (const auto& p : route.params) declare_local(p.name, p.loc, p.type.name);
+    for (const auto& p : route.params) declare_local(p.name, p.loc, Type::from_declared(p.type));
 
     // Las guardas del grupo se emiten antes del cuerpo, de fuera hacia dentro:
     // para llegar al handler hay que pasar primero la del grupo padre.  Cada
@@ -106,7 +109,7 @@ bool Emitter::emit_function(const FnDecl& fn, Chunk& out) {
     loops_.clear();
     scope_depth_ = 0;
 
-    for (const auto& p : fn.params) declare_local(p.name, p.loc, p.type.name);
+    for (const auto& p : fn.params) declare_local(p.name, p.loc, Type::from_declared(p.type));
 
     emit_block(fn.body);
     out.emit(Op::ReturnNull, fn.loc);
@@ -122,8 +125,8 @@ bool Emitter::emit_method(const std::string& cls, const FnDecl& m, Chunk& out) {
     scope_depth_ = 0;
 
     // `this` es simplemente el parametro 0.
-    declare_local("this", m.loc, cls);
-    for (const auto& p : m.params) declare_local(p.name, p.loc, p.type.name);
+    declare_local("this", m.loc, Type::class_ref(cls));
+    for (const auto& p : m.params) declare_local(p.name, p.loc, Type::from_declared(p.type));
 
     emit_block(m.body);
     out.emit(Op::ReturnNull, m.loc);
@@ -139,8 +142,8 @@ bool Emitter::emit_ctor(const std::string& cls, const std::vector<std::string>& 
     loops_.clear();
     scope_depth_ = 0;
 
-    for (const auto& p : ct.params) declare_local(p.name, p.loc, p.type.name);
-    int self = declare_local("this", ct.loc, cls);
+    for (const auto& p : ct.params) declare_local(p.name, p.loc, Type::from_declared(p.type));
+    int self = declare_local("this", ct.loc, Type::class_ref(cls));
 
     // La instancia arranca con todos los campos declarados a null, para que
     // acceder a uno que el constructor no toque de null y no falle.
@@ -182,7 +185,7 @@ bool Emitter::emit_condition(const Expr& e, const std::vector<NombreTipado>& nam
     loops_.clear();
     scope_depth_ = 0;
 
-    for (const auto& n : names) declare_local(n.nombre, e.loc, n.tipo);
+    for (const auto& n : names) declare_local(n.nombre, e.loc, Type::from_legacy_name(n.tipo));
 
     emit_expr(e);
     out.emit(Op::Return, e.loc);
@@ -223,7 +226,7 @@ void Emitter::emit_stmt(const Stmt& s) {
         case StmtKind::VarDecl: {
             if (s.value) emit_expr(*s.value);
             else         chunk_->emit(Op::Const, s.loc, chunk_->add_constant(Value::null()));
-            int slot = declare_local(s.name, s.loc, s.type.name);
+            int slot = declare_local(s.name, s.loc, Type::from_declared(s.type));
             chunk_->emit(Op::StoreLocal, s.loc, static_cast<uint32_t>(slot));
             break;
         }
@@ -359,7 +362,7 @@ void Emitter::emit_stmt(const Stmt& s) {
             int index = declare_local(" index", s.loc);
             chunk_->emit(Op::StoreLocal, s.loc, static_cast<uint32_t>(index));
 
-            int var = declare_local(s.name, s.loc, s.type.name);
+            int var = declare_local(s.name, s.loc, Type::from_declared(s.type));
 
             size_t start = chunk_->here();
             chunk_->emit(Op::LoadLocal, s.loc, static_cast<uint32_t>(index));
@@ -716,21 +719,22 @@ void Emitter::emit_expr(const Expr& e) {
 // el fallo aparece paginas mas adelante, lejos de la errata.
 bool Emitter::comprobar_campo(const Expr& objeto, const std::string& campo,
                               SourceLoc loc) {
-    const std::string tr = tipo_de(objeto);
-    if (tr.empty()) return true;
+    const Type tr = tipo_de(objeto);
+    if (tr.is_unknown()) return true;
+    const std::string base = tr.base_name();
 
     if (classes_) {
-        auto it = classes_->find(tr);
+        auto it = classes_->find(base);
         if (it != classes_->end()) {
             const auto& f = it->second.fields;
             if (std::find(f.begin(), f.end(), campo) != f.end()) return true;
             if (it->second.methods.count(campo)) {
-                error(loc, "'" + tr + "." + campo + "' es un metodo: "
+                error(loc, "'" + base + "." + campo + "' es un metodo: "
                            "hay que llamarlo con ()");
             } else {
                 std::string hay;
                 for (const auto& n : f) hay += (hay.empty() ? "" : ", ") + n;
-                error(loc, "'" + tr + "' no tiene un campo '" + campo + "'" +
+                error(loc, "'" + base + "' no tiene un campo '" + campo + "'" +
                            (hay.empty() ? "" : "; tiene " + hay));
             }
             return false;
@@ -738,40 +742,42 @@ bool Emitter::comprobar_campo(const Expr& objeto, const std::string& campo,
     }
     // Un escalar o una List no tienen campos, se llame como se llame lo que se
     // les pida.  Un Dict si: ahi cualquier clave es valida.
-    if (metodos_de(tr) && tr != "Dict") {
-        error(loc, "'" + campo + "' sobre " + tr + ", que no tiene campos");
+    if (metodos_de(base) && base != "Dict") {
+        error(loc, "'" + campo + "' sobre " + base + ", que no tiene campos");
         return false;
     }
     return true;
 }
 
-// Solo lo evidente: un literal, o una variable con tipo declarado.  No hay
-// inferencia, asi que ante la duda devuelve "" y no se comprueba nada.
-std::string Emitter::tipo_de(const Expr& e) const {
+// Solo lo evidente: un literal, o una variable con tipo declarado. No hay
+// inferencia, asi que ante la duda devuelve Type::unknown() y no se
+// comprueba nada.
+Type Emitter::tipo_de(const Expr& e) const {
     switch (e.kind) {
-        case ExprKind::StringLit: return "string";
-        case ExprKind::IntLit:    return "int";
-        case ExprKind::FloatLit:  return "float";
-        case ExprKind::BoolLit:   return "bool";
+        case ExprKind::StringLit: return Type::primitive(Type::Kind::String);
+        case ExprKind::IntLit:    return Type::primitive(Type::Kind::Int);
+        case ExprKind::FloatLit:  return Type::primitive(Type::Kind::Float);
+        case ExprKind::BoolLit:   return Type::primitive(Type::Kind::Bool);
         case ExprKind::Ident:     return local_type(e.text);
         case ExprKind::This:      return local_type("this");
         // Metodo builtin sobre un receptor de tipo conocido: la cadena sigue.
         case ExprKind::Call: {
-            if (!e.object || e.object->kind != ExprKind::Member) return {};
-            const std::string recv = tipo_de(*e.object->object);
-            const auto* lista = metodos_de(recv);
-            if (!lista) return {};
+            if (!e.object || e.object->kind != ExprKind::Member) return Type::unknown();
+            const Type recv = tipo_de(*e.object->object);
+            const auto* lista = metodos_de(recv.base_name());
+            if (!lista) return Type::unknown();
             for (const auto& m : *lista)
                 if (e.object->text == m.nombre)
-                    return m.devuelve ? m.devuelve : recv;
-            return {};
+                    return m.devuelve ? Type::from_legacy_name(m.devuelve) : recv;
+            return Type::unknown();
         }
-        default:                  return {};
+        default:                  return Type::unknown();
     }
 }
 
 bool Emitter::comprobar_metodo_builtin(const Expr& e) {
-    const auto* lista = metodos_de(tipo_de(*e.object->object));
+    const Type recv = tipo_de(*e.object->object);
+    const auto* lista = metodos_de(recv.base_name());
     if (!lista) return true;                  // tipo sin lista cerrada
 
     const std::string& metodo = e.object->text;
@@ -782,7 +788,7 @@ bool Emitter::comprobar_metodo_builtin(const Expr& e) {
     if (!def) {
         std::string hay;
         for (const auto& m : *lista) hay += (hay.empty() ? "" : ", ") + std::string(m.nombre);
-        error(e.object->loc, "los valores de tipo " + tipo_de(*e.object->object) +
+        error(e.object->loc, "los valores de tipo " + recv.base_name() +
                              " no tienen el metodo '" + metodo + "'; tienen " + hay);
         return false;
     }
@@ -980,13 +986,14 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
     // Metodo de clase: el tipo declarado del receptor se conoce al compilar,
     // asi que se resuelve aqui y un nombre mal escrito no llega a produccion.
     else if (e.object->kind == ExprKind::Member && classes_) {
-        std::string recv_type;
+        Type recv_type = Type::unknown();
         if (e.object->object->kind == ExprKind::Ident)
             recv_type = local_type(e.object->object->text);
         else if (e.object->object->kind == ExprKind::This)
             recv_type = local_type("this");
+        const std::string recv_name = recv_type.base_name();
 
-        auto cls = recv_type.empty() ? classes_->end() : classes_->find(recv_type);
+        auto cls = recv_type.is_unknown() ? classes_->end() : classes_->find(recv_name);
         if (cls != classes_->end()) {
             auto m = cls->second.methods.find(e.object->text);
             if (m == cls->second.methods.end()) {
@@ -994,7 +1001,7 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
                 if (!cls->second.fields.empty() &&
                     std::find(cls->second.fields.begin(), cls->second.fields.end(),
                               e.object->text) == cls->second.fields.end()) {
-                    error(e.object->loc, "'" + recv_type + "' no tiene un metodo '" +
+                    error(e.object->loc, "'" + recv_name + "' no tiene un metodo '" +
                                          e.object->text + "'");
                     return;
                 }
@@ -1011,7 +1018,7 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
                     ++given;
                 }
                 if (given < sig.required || given > sig.defaults.size()) {
-                    error(e.loc, "'" + recv_type + "." + e.object->text +
+                    error(e.loc, "'" + recv_name + "." + e.object->text +
                                  "()' espera " + std::to_string(sig.required) +
                                  " argumento(s), pero recibe " + std::to_string(given));
                     return;
@@ -1142,7 +1149,7 @@ void Emitter::emitir_render_compilado(const Expr& e) {
     std::vector<NombreTipado> claves;
     for (const auto& a : e.args) {
         if (a.name.empty()) continue;
-        claves.push_back({a.name, tipo_de(*a.value)});
+        claves.push_back({a.name, tipo_de(*a.value).base_name()});
     }
 
     const std::filesystem::path ruta =

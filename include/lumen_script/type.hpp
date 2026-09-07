@@ -68,6 +68,12 @@ public:
     // que parte esto. Implementado en type.cpp (necesita ast.hpp completo).
     static Type from_declared(const TypeRef& t);
 
+    // A partir de un nombre desnudo ya resuelto (lo que hoy lleva
+    // NombreTipado::tipo: un campo de clase, o el tipo exacto de un Value
+    // constante). "" da unknown(). No hay generics ni '?' que reconstruir
+    // porque NombreTipado nunca los llevo.
+    static Type from_legacy_name(const std::string& name);
+
     // El nombre desnudo tal y como lo usan hoy Local::type/tipo_de: sin `?`,
     // sin los argumentos de un generico ("List<int>" da "List", no
     // "List<int>"). Es la clave de busqueda que ya esperan ClassSigs y

@@ -40,6 +40,13 @@ Type Type::from_declared(const TypeRef& t) {
     return result;
 }
 
+Type Type::from_legacy_name(const std::string& name) {
+    if (name.empty()) return Type::unknown();
+    TypeRef t;
+    t.name = name;
+    return from_declared(t);
+}
+
 std::string Type::base_name() const {
     return spelling_.empty() ? canonical_name() : spelling_;
 }

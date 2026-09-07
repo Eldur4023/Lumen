@@ -7,6 +7,7 @@
 #include "ast.hpp"
 #include "bytecode.hpp"
 #include "diagnostic.hpp"
+#include "type.hpp"
 
 namespace lumen_script {
 
@@ -114,7 +115,7 @@ private:
 
     // El tipo declarado se guarda para poder resolver `u.metodo()` en
     // compilacion: en runtime una instancia es un Dict y no se distinguiria.
-    struct Local { std::string name; int depth; std::string type; };
+    struct Local { std::string name; int depth; Type type; };
     std::vector<Local> locals_;
     int                scope_depth_ = 0;
 
@@ -130,8 +131,8 @@ private:
     void error(SourceLoc loc, std::string msg);
 
     int  declare_local(const std::string& name, SourceLoc loc,
-                       const std::string& type = {});
-    const std::string& local_type(const std::string& name) const;
+                       Type type = Type::unknown());
+    const Type& local_type(const std::string& name) const;
 
     // Cierto solo si se PUEDE demostrar que la expresion es de tipo int.  Ante
     // la duda dice que no: especializar de menos solo deja codigo generico,
@@ -145,9 +146,10 @@ private:
     void emit_stmt(const Stmt& s);
     void emit_expr(const Expr& e);
     void emitir_render_compilado(const Expr& e);
-    // Tipo estatico de una expresion, o "" si no se puede saber.  Solo mira lo
-    // que es evidente sin inferencia: un literal, o una variable declarada.
-    std::string tipo_de(const Expr& e) const;
+    // Tipo estatico de una expresion, o Type::unknown() si no se puede saber.
+    // Solo mira lo que es evidente sin inferencia: un literal, o una variable
+    // declarada.
+    Type tipo_de(const Expr& e) const;
     // Comprueba un metodo contra la lista cerrada del tipo del receptor.
     // Devuelve false —y ya ha dado el error— si ese metodo no existe.
     bool comprobar_metodo_builtin(const Expr& e);
