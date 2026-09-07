@@ -1,0 +1,110 @@
+import mysql
+
+app:
+    port 8800
+
+    mysql:
+        host     "127.0.0.1"
+        port     3306
+        database "lumen_pruebas"
+        user     "lumen"
+        password "lumen"
+        pool     8
+
+get endpoint("/__ping__"):
+    return { "ok": true }
+
+# ── Lo basico ────────────────────────────────────────────────────────────────
+
+get endpoint("/todos"):
+    return await mysql.query("select id, titulo, autor, vistas from articulos order by id")
+
+get endpoint("/uno/:id", int id):
+    List<Json> filas = await mysql.query("select id, titulo, autor, vistas from articulos where id = ?", id)
+    if len(filas) == 0:
+        return status(404)
+    return filas[0]
+
+# ── El texto largo: 4000 caracteres.  Si el buffer se queda corto, se ve aqui ─
+
+get endpoint("/largo"):
+    List<Json> filas = await mysql.query("select id, titulo, cuerpo from articulos where titulo = ?", "largo")
+    if len(filas) == 0:
+        return status(404)
+    return { "recibido": len(filas[0]["cuerpo"]), "esperado": 4000 }
+
+# ── Todos los tipos de golpe ─────────────────────────────────────────────────
+
+get endpoint("/tipos"):
+    List<Json> filas = await mysql.query("select * from tipos where id = 1")
+    if len(filas) == 0:
+        return status(404)
+    return filas[0]
+
+# length() de MySQL cuenta bytes de verdad; lo que se comprueba es que el
+# driver no trunca al convertir el resultado a std::string.
+get endpoint("/nulo_en_texto"):
+    return await mysql.query("select id, t_text, length(t_text) as bytes from tipos where id = 2")
+
+# ── Parametros: tipos de entrada y NULL ──────────────────────────────────────
+
+get endpoint("/eco", int n = 7, string s = "hola"):
+    return await mysql.query("select ? as entero, ? as texto, ? as nulo", n, s, null)
+
+get endpoint("/unicode"):
+    return await mysql.query("select id, titulo from articulos where titulo = ?", "unicode ñ 🐻")
+
+# ── Inyeccion: el parametro va por bind, nunca concatenado ───────────────────
+
+get endpoint("/inyeccion", string q = "x"):
+    List<Json> filas = await mysql.query("select id, titulo from articulos where titulo = ?", q)
+    return { "encontrados": len(filas) }
+
+# ── Escritura, filas afectadas y last_id ─────────────────────────────────────
+
+post endpoint("/alta/:nombre", string nombre):
+    await mysql.exec("insert into articulos (titulo, cuerpo, autor, vistas) values (?, ?, ?, ?)", nombre, "cuerpo", "test", 0)
+    int id = await mysql.last_id()
+    return { "id": id }.status(201)
+
+post endpoint("/borra/:id", int id):
+    await mysql.exec("delete from articulos where id = ?", id)
+    return { "ok": true }
+
+# ── Transacciones ────────────────────────────────────────────────────────────
+
+post endpoint("/transfiere"):
+    await mysql.begin()
+    await mysql.exec("update cuentas set saldo = saldo - 30 where nombre = ?", "ana")
+    await mysql.exec("update cuentas set saldo = saldo + 30 where nombre = ?", "bob")
+    await mysql.commit()
+    return { "ok": true }
+
+post endpoint("/deshace"):
+    await mysql.begin()
+    await mysql.exec("update cuentas set saldo = saldo - 50 where nombre = ?", "ana")
+    await mysql.rollback()
+    return { "ok": true }
+
+# Igual que /deshace pero devolviendo lo que contesta CADA paso.
+#
+# Existe por un fallo real: begin() devolvia un error —MySQL no admite BEGIN por
+# el protocolo de sentencias preparadas— y la version de arriba lo tiraba a la
+# basura.  La transaccion no se abria, el update se autocommiteaba y el rollback
+# decia que si.  Una prueba que solo mire el {"ok": true} no lo ve.
+post endpoint("/deshace_verboso"):
+    Json b = await mysql.begin()
+    Json u = await mysql.exec("update cuentas set saldo = saldo - 50 where nombre = ?", "ana")
+    Json r = await mysql.rollback()
+    return { "begin": b, "update": u, "rollback": r }
+
+get endpoint("/saldos"):
+    return await mysql.query("select nombre, saldo from cuentas order by nombre")
+
+# ── Errores del motor: tienen que llegar como error, no tumbar nada ──────────
+
+get endpoint("/tabla_mala"):
+    return await mysql.query("select * from no_existe")
+
+get endpoint("/parametros_de_menos"):
+    return await mysql.query("select * from articulos where id = ? and titulo = ?", 1)

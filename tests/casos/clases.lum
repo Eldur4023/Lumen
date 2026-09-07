@@ -1,0 +1,57 @@
+app:
+    port 8790
+
+class Alta:
+    string nombre
+    int    edad
+
+    validate:
+        nombre != ""   "nombre: obligatorio"
+        edad >= 18     "edad: tienes que ser mayor de edad"
+
+class Punto:
+    int x
+    int y
+
+    fn int cuadrado():
+        return this.x * this.x + this.y * this.y
+
+    fn string etiqueta(string prefijo = "P"):
+        return prefijo + "(" + str(this.x) + "," + str(this.y) + ")"
+
+fn int doble(int x):
+    return x * 2
+
+fn int factorial(int n):
+    if n <= 1:
+        return 1
+    return n * factorial(n - 1)
+
+fn int infinita(int n):
+    return infinita(n + 1)
+
+get endpoint("/__ping__"):
+    return { "ok": true }
+
+post endpoint("/alta", Alta a):
+    return { "creado": a.nombre }.status(201)
+
+get endpoint("/punto/:x/:y", int x, int y):
+    Punto p = Punto(x, y)
+    return { "cuadrado": p.cuadrado() }
+
+get endpoint("/etiqueta/:x/:y", int x, int y):
+    Punto p = Punto(x, y)
+    return { "una": p.etiqueta(), "otra": p.etiqueta("Q") }
+
+get endpoint("/doble/:n", int n):
+    return { "r": doble(n) }
+
+get endpoint("/factorial/:n", int n):
+    return { "r": factorial(n) }
+
+get endpoint("/infinita"):
+    return { "r": infinita(1) }
+
+on error 422:
+    return { "cuantos": len(error.messages), "detalles": error.messages }

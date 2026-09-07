@@ -1,0 +1,2 @@
+get endpoint("/a", string quien):
+    return { "r": quien.mayusculas() }

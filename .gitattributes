@@ -1,0 +1,12 @@
+# Los guiones de prueba los ejecuta bash —dentro de WSL, en el caso de un
+# Windows con el repo montado en /mnt/c—, y bash NO tolera el retorno de carro:
+# un fichero con CRLF falla con "$'\r': command not found" en la primera linea.
+#
+# Sin esto, en un clon de Windows con core.autocrlf=true se sacan con CRLF y la
+# suite no arranca.  Peor: git los sigue viendo limpios, porque normaliza al
+# comparar, asi que el problema no aparece en `git status` y cuesta de ver.
+*.sh text eol=lf
+
+# Lo mismo para lo que se carga desde bash o desde un cliente de base de datos.
+*.lum text eol=lf
+*.sql  text eol=lf

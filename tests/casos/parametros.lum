@@ -1,0 +1,45 @@
+# Matriz de enlace de parametros: origen (ruta / query / multipart) x tipo
+# (escalar, opcional, File, List<File>) x presencia (falta, vacio, mal tipado).
+#
+# Existe porque el bug de multipart -- un parametro de texto siempre vacio en
+# una peticion con ficheros -- no lo caza ningun test que pruebe query y
+# multipart por separado.  Solo aparece cuando los dos conviven en la MISMA
+# ruta, que es exactamente el patron que documenta el proyecto (fichero +
+# titulo/album en el mismo formulario) y que nadie habia probado asi.
+
+app:
+    port 8079
+
+get endpoint("/ruta/:id", int id):
+    return { "id": id }
+
+get endpoint("/query", string q, int n = 5):
+    return { "q": q, "n": n }
+
+# El caso exacto del bug: un campo de texto junto a un fichero.
+post endpoint("/mp/uno", File f, string titulo):
+    return { "titulo": titulo, "filename": f.filename }
+
+# Los cuatro tipos escalares que existen, todos como campos de texto de un
+# formulario con ficheros.
+post endpoint("/mp/tipos", File f, string s, int n, bool b):
+    return { "s": s, "n": n, "b": b }
+
+# Con List<File>, no solo File.
+post endpoint("/mp/lista", List<File> fs, string album):
+    return { "album": album, "n": len(fs) }
+
+# Si no llega ni en query ni en el formulario, el valor por defecto sigue
+# valiendo -- el arreglo no puede haber roto ese camino.
+post endpoint("/mp/defecto", File f, string etiqueta = "sin-etiqueta"):
+    return { "etiqueta": etiqueta }
+
+# Mismo nombre en la query Y en el campo de texto del formulario: la query
+# gana, por ser la regla ya existente y no una sorpresa nueva.
+post endpoint("/mp/prioridad", File f, string origen):
+    return { "origen": origen }
+
+# Un escalar mal tipado dentro de multipart tiene que dar 400, igual que en
+# la query -- el enlace nuevo no puede saltarse la validacion de tipo.
+post endpoint("/mp/malo", File f, int n):
+    return { "n": n }

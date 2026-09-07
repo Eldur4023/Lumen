@@ -1,0 +1,3 @@
+get endpoint("/a"):
+    Json r = await sqlite.query("select 1")
+    return r

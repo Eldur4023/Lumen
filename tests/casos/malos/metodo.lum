@@ -1,0 +1,6 @@
+class P:
+    int x
+
+get endpoint("/a"):
+    P p = P(1)
+    return { "r": p.noexiste() }

@@ -1,0 +1,2 @@
+get endpoint("/u/:id"):
+    return { "a": 1 }

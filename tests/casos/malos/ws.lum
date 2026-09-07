@@ -1,0 +1,2 @@
+ws endpoint("/a"):
+    ws.send("x")

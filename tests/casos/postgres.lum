@@ -1,0 +1,120 @@
+import postgres
+
+app:
+    port 8810
+
+    postgres:
+        host     "127.0.0.1"
+        port     5432
+        database "lumen_pruebas"
+        user     "lumen"
+        password "lumen"
+        pool     8
+
+get endpoint("/__ping__"):
+    return { "ok": true }
+
+# ── Lo basico.  Todas las consultas usan `?`, que es el marcador de Lumen Script: el
+#    driver lo traduce a $1.  Esto ejercita la traduccion contra un servidor de
+#    verdad, no solo contra la funcion suelta.
+# ────────────────────────────────────────────────────────────────────────────
+
+get endpoint("/todos"):
+    return await postgres.query("select id, titulo, autor, vistas from articulos order by id")
+
+get endpoint("/uno/:id", int id):
+    List<Json> filas = await postgres.query("select id, titulo, autor, vistas from articulos where id = ?", id)
+    if len(filas) == 0:
+        return status(404)
+    return filas[0]
+
+# Dos marcadores, para comprobar que se numeran en orden.
+get endpoint("/dos", string autor = "Ana", int vistas = 0):
+    return await postgres.query("select id, titulo from articulos where autor = ? and vistas >= ? order by id", autor, vistas)
+
+# Escrito al estilo de postgres: tiene que seguir valiendo sin tocarlo.
+get endpoint("/numerado/:id", int id):
+    return await postgres.query("select titulo from articulos where id = $1", id)
+
+# Un `?` dentro de una cadena no es un marcador.
+get endpoint("/interrogante"):
+    return await postgres.query("select id from articulos where titulo = 'que?' or titulo = ?", "corto")
+
+# ── Texto largo: 4000 caracteres ─────────────────────────────────────────────
+
+get endpoint("/largo"):
+    List<Json> filas = await postgres.query("select cuerpo from articulos where titulo = ?", "largo")
+    if len(filas) == 0:
+        return status(404)
+    return { "recibido": len(filas[0]["cuerpo"]), "esperado": 4000 }
+
+# ── Tipos ────────────────────────────────────────────────────────────────────
+
+get endpoint("/tipos"):
+    List<Json> filas = await postgres.query("select * from tipos where id = ?", 1)
+    if len(filas) == 0:
+        return status(404)
+    return filas[0]
+
+# NaN e Infinity: postgres los admite y JSON no los sabe escribir.
+get endpoint("/especiales"):
+    return await postgres.query("select que, d, n from especiales order by que")
+
+# ── Unicode e inyeccion ──────────────────────────────────────────────────────
+
+get endpoint("/unicode"):
+    return await postgres.query("select id, titulo from articulos where titulo = ?", "unicode ñ 🐻")
+
+get endpoint("/inyeccion", string q = "x"):
+    List<Json> filas = await postgres.query("select id from articulos where titulo = ?", q)
+    return { "encontrados": len(filas) }
+
+# ── Escritura ────────────────────────────────────────────────────────────────
+
+post endpoint("/alta/:nombre", string nombre):
+    int filas = await postgres.exec("insert into articulos (titulo, cuerpo, autor, vistas) values (?, ?, ?, ?)", nombre, "cuerpo", "test", 0)
+    return { "filas": filas }.status(201)
+
+# La forma que SI tiene postgres de devolver el id generado.
+post endpoint("/alta_id/:nombre", string nombre):
+    List<Json> filas = await postgres.query("insert into articulos (titulo, autor) values (?, ?) returning id", nombre, "test")
+    return filas[0].status(201)
+
+# last_id() no existe en postgres: el driver lo dice en vez de inventarse algo.
+post endpoint("/last_id"):
+    return { "r": await postgres.last_id() }
+
+post endpoint("/borra/:id", int id):
+    int filas = await postgres.exec("delete from articulos where id = ?", id)
+    return { "filas": filas }
+
+# ── Transacciones ────────────────────────────────────────────────────────────
+
+post endpoint("/transfiere"):
+    await postgres.begin()
+    await postgres.exec("update cuentas set saldo = saldo - 30 where nombre = ?", "ana")
+    await postgres.exec("update cuentas set saldo = saldo + 30 where nombre = ?", "bob")
+    await postgres.commit()
+    return { "ok": true }
+
+# Devuelve lo que contesta CADA paso.  En mysql begin() fallaba y su error se
+# descartaba, asi que la transaccion no se abria y el rollback decia que si.
+post endpoint("/deshace_verboso"):
+    Json b = await postgres.begin()
+    Json u = await postgres.exec("update cuentas set saldo = saldo - 50 where nombre = ?", "ana")
+    Json r = await postgres.rollback()
+    return { "begin": b, "update": u, "rollback": r }
+
+get endpoint("/saldos"):
+    return await postgres.query("select nombre, saldo from cuentas order by nombre")
+
+# ── Errores del motor ────────────────────────────────────────────────────────
+
+get endpoint("/tabla_mala"):
+    return await postgres.query("select * from no_existe")
+
+get endpoint("/marcadores_de_menos"):
+    return await postgres.query("select * from articulos where id = ? and titulo = ?", 1)
+
+get endpoint("/mezcla"):
+    return await postgres.query("select * from articulos where id = $1 and titulo = ?", 1, "x")

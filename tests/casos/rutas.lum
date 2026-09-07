@@ -1,0 +1,24 @@
+app:
+    port 8790
+
+get endpoint("/__ping__"):
+    return { "ok": true }
+
+get endpoint("/eco/:id", int id):
+    return { "id": id }
+
+get endpoint("/pagina", int page = 1, int limit = 20):
+    return { "page": page, "limit": limit }
+
+group("/api/v1"):
+    get endpoint("/hola"):
+        return { "v": 1 }
+
+group("/admin"):
+    require query("k", "") == "abre" else status(403)
+
+    get endpoint("/panel"):
+        return { "panel": true }
+
+on error 404:
+    return { "error": "no existe", "ruta": request.path }

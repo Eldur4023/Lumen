@@ -1,0 +1,8 @@
+class U:
+    int id
+
+    validate:
+        idd > 0   "mal"
+
+post endpoint("/u", U u):
+    return { "a": 1 }

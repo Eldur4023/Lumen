@@ -1,0 +1,103 @@
+app:
+    port 8790
+
+get endpoint("/__ping__"):
+    return { "ok": true }
+
+get endpoint("/aritmetica"):
+    return { "suma": 3 + 4, "resta": 10 - 3, "div": 9 / 3, "mod": 7 % 3, "mixto": 1 + 2.5 }
+
+get endpoint("/cadenas"):
+    string s = "hola"
+    return { "mayus": s.upper(), "empieza": s.starts_with("ho"), "limpio": "  x  ".trim() }
+
+# JSON tiene que ser UTF-8.  Un byte suelto entra por el cuerpo, por la query o
+# por una cabecera, y sin sanear dejaba la respuesta ilegible para el cliente que
+# la habia mandado.  Estas rutas devuelven lo que entra, para comprobar las dos
+# mitades: que lo roto se sanea y que lo valido NO se toca.
+get endpoint("/eco_query", string q = "vacio"):
+    return { "eco": q }
+
+get endpoint("/eco_cabecera"):
+    return { "eco": header("X-Prueba") }
+
+get endpoint("/eco_valido"):
+    return { "eco": "añoñó 🐻 ñ" }
+
+get endpoint("/multilinea"):
+    string sql = """
+        SELECT id
+        FROM posts
+        """
+    string suelta = """en una linea"""
+    return { "sql": sql, "suelta": suelta, "escapes": """con \"comillas\"""" }
+
+get endpoint("/veracidad"):
+    List<int> vacia = []
+    return { "cero": 0 ? true : false, "vacia": vacia ? true : false,
+             "cadena": "" ? true : false, "uno": 1 ? true : false }
+
+get endpoint("/coercion"):
+    return { "malo": 1 + "uno" }
+
+get endpoint("/clasifica/:n", int n):
+    if n < 0:
+        return { "r": "negativo" }
+    elif n == 0:
+        return { "r": "cero" }
+    elif n < 10:
+        return { "r": "pequeno" }
+    else:
+        return { "r": "grande" }
+
+get endpoint("/suma_hasta/:n", int n):
+    int total = 0
+    int i = 1
+    while i <= n:
+        total += i
+        i++
+    return { "total": total }
+
+get endpoint("/pares"):
+    List<int> out = []
+    for int x in [1, 2, 3, 4, 5, 6, 7]:
+        if x > 6:
+            break
+        if x % 2 != 0:
+            continue
+        out.add(x)
+    return { "pares": out }
+
+get endpoint("/operadores"):
+    int a = 10
+    a += 5
+    a -= 3
+    a *= 2
+    a /= 4
+    a %= 4
+    return { "a": a }
+
+get endpoint("/incremento"):
+    int i = 5
+    int previo = i++
+    int nuevo = ++i
+    return { "post": previo, "pre": nuevo, "i": i }
+
+get endpoint("/indices"):
+    List<int> l = [10, 20, 30]
+    l[0] = 99
+    l[2] = l[1] + 5
+    return { "l": l }
+
+get endpoint("/ternario/:edad", int edad):
+    return { "rol": edad >= 18 ? "adulto" : "menor" }
+
+get endpoint("/captura"):
+    try:
+        int x = 1 / 0
+        return { "no": x }
+    catch e:
+        return { "capturado": e.message }
+
+get endpoint("/revienta"):
+    return { "malo": 1 / 0 }
