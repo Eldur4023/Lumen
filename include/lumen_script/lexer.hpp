@@ -5,28 +5,28 @@
 
 namespace lumen_script {
 
-// Lexer con bloques por indentacion al estilo Python.
+// Lexer with indentation blocks, Python style.
 //
-// Reglas de linea logica:
-//   • Las lineas en blanco y las que solo tienen comentario no generan Newline
-//     ni afectan a la indentacion.
-//   • Dentro de (), [] o {} se suprimen Newline/Indent/Dedent: una llamada
-//     puede repartirse en varias lineas.
-//   • Una linea cuyo primer token es '.' continua la anterior, para permitir
-//     encadenar sobre el valor devuelto:
+// Logical line rules:
+//   • Blank lines and comment-only lines generate no Newline and do not
+//     affect the indentation.
+//   • Inside (), [] or {}, Newline/Indent/Dedent are suppressed: a call can
+//     be spread over several lines.
+//   • A line whose first token is '.' continues the previous one, to allow
+//     chaining on the returned value:
 //         return render("x.html")
 //                  .status(201)
 //
-// Regla lexica del grammar: '>' '>' NUNCA se fusionan en un token de
-// desplazamiento, para que List<Dict<string,int>> cierre sin ambiguedad.
+// Lexical rule of the grammar: '>' '>' NEVER merge into a shift token, so that
+// List<Dict<string,int>> closes without ambiguity.
 class Lexer {
 public:
     Lexer(const SourceFile& file, DiagnosticBag& diags)
         : file_(file), diags_(diags) {}
 
-    // Tokeniza el fichero entero.  Siempre termina en EndOfFile, con los Dedent
-    // pendientes emitidos antes.  Los errores van al DiagnosticBag; el vector
-    // devuelto sigue siendo utilizable para que el parser avance y reporte mas.
+    // Tokenizes the whole file.  It always ends in EndOfFile, with the pending
+    // Dedents emitted before it.  Errors go to the DiagnosticBag; the returned
+    // vector stays usable so the parser can advance and report more.
     std::vector<Token> tokenize();
 
 private:

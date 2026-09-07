@@ -50,8 +50,8 @@ inline Middleware logger() {
     };
 }
 
-// CORS, compresion, cabeceras de seguridad y limitacion de ritmo vivian aqui.
-// En Lumen 2.0 los pone el proxy inverso que hay delante —nginx, Caddy,
-// Traefik— que ya lo hace mejor y sin gastar el hilo del event loop.
+// CORS, compression, security headers and rate limiting used to live here.
+// In Lumen they are applied by the reverse proxy in front —nginx, Caddy,
+// Traefik— which already does it better and without spending an event loop thread.
 
 } // namespace lumen

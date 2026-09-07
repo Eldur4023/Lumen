@@ -6,22 +6,22 @@
 
 namespace lumen_script {
 
-// Parser descendente recursivo sobre el flujo de tokens del lexer.
+// Recursive descent parser over the lexer's token stream.
 //
-// Ante un error no aborta: lo registra y sincroniza hasta el siguiente inicio
-// de declaracion, para poder reportar varios fallos en una sola pasada.
+// On an error it does not abort: it records it and synchronizes to the next
+// declaration start, so it can report several faults in a single pass.
 class Parser {
 public:
     Parser(std::vector<Token> tokens, DiagnosticBag& diags)
         : toks_(std::move(tokens)), diags_(diags) {}
 
-    // Parsea en `out`.  Varias llamadas con distintos ficheros acumulan sobre
-    // el mismo Program: es lo que permite repartir la app en varios .lum.
+    // Parses into `out`.  Several calls with different files accumulate onto
+    // the same Program: that is what allows splitting the app across .lum files.
     void parse_into(Program& out);
 
-    // Parsea UNA expresion y nada mas.  Lo usan las plantillas: lo que va
-    // dentro de {{ }} o de {% if %} es una expresion de Lumen Script, no un lenguaje
-    // aparte.  Devuelve nulo si no hay expresion o si sobra algo detras.
+    // Parses ONE expression and nothing else.  The templates use it: what goes
+    // inside {{ }} or {% if %} is a Lumen Script expression, not a separate
+    // language.  Returns null if there is no expression or trailing input.
     ExprPtr parse_single_expression();
 
 private:
@@ -47,7 +47,7 @@ private:
     void parse_group(Program& out, const std::string& prefix,
                      const std::vector<Guard>& guards);
     void parse_app(Program& out);
-    // Resuelve un valor de configuracion: cadena, numero, booleano o env("VAR").
+    // Resuelve un value de configuracion: string_value, number, booleano o env("VAR").
     bool config_value(std::string& text, long long& number, bool& flag, int& kind);
     void parse_class(Program& out);
     void parse_error(Program& out);

@@ -1,0 +1,120 @@
+import postgres
+
+app:
+    port 8810
+
+    postgres:
+        host     "127.0.0.1"
+        port     5432
+        database "lumen_pruebas"
+        user     "lumen"
+        password "lumen"
+        pool     8
+
+get endpoint("/__ping__"):
+    return { "ok": true }
+
+# ── The basics.  Every query uses `?`, the Lumen Script placeholder: the driver
+#    translates it to $1.  This exercises the translation against a real server,
+#    not just against the function on its own.
+# ────────────────────────────────────────────────────────────────────────────
+
+get endpoint("/all"):
+    return await postgres.query("select id, title, author, views from articles order by id")
+
+get endpoint("/one/:id", int id):
+    List<Json> rows = await postgres.query("select id, title, author, views from articles where id = ?", id)
+    if len(rows) == 0:
+        return status(404)
+    return rows[0]
+
+# Two placeholders, to check they are numbered in order.
+get endpoint("/two", string author = "Ana", int views = 0):
+    return await postgres.query("select id, title from articles where author = ? and views >= ? order by id", author, views)
+
+# Written postgres style: it has to keep working untouched.
+get endpoint("/numbered/:id", int id):
+    return await postgres.query("select title from articles where id = $1", id)
+
+# A `?` inside a string is not a placeholder.
+get endpoint("/question_mark"):
+    return await postgres.query("select id from articles where title = 'what?' or title = ?", "short")
+
+# ── Texto length: 4000 caracteres ─────────────────────────────────────────────
+
+get endpoint("/length"):
+    List<Json> rows = await postgres.query("select body from articles where title = ?", "length")
+    if len(rows) == 0:
+        return status(404)
+    return { "recibido": len(rows[0]["body"]), "esperado": 4000 }
+
+# ── Types ────────────────────────────────────────────────────────────────────
+
+get endpoint("/types"):
+    List<Json> rows = await postgres.query("select * from types where id = ?", 1)
+    if len(rows) == 0:
+        return status(404)
+    return rows[0]
+
+# NaN and Infinity: postgres accepts them and JSON cannot write them.
+get endpoint("/special"):
+    return await postgres.query("select kind, d, n from special order by kind")
+
+# ── Unicode e injection ──────────────────────────────────────────────────────
+
+get endpoint("/unicode"):
+    return await postgres.query("select id, title from articles where title = ?", "unicode ñ 🐻")
+
+get endpoint("/injection", string q = "x"):
+    List<Json> rows = await postgres.query("select id from articles where title = ?", q)
+    return { "encontrados": len(rows) }
+
+# ── Escritura ────────────────────────────────────────────────────────────────
+
+post endpoint("/add/:name", string name):
+    int rows = await postgres.exec("insert into articles (title, body, author, views) values (?, ?, ?, ?)", name, "body", "test", 0)
+    return { "rows": rows }.status(201)
+
+# The way postgres DOES have of returning the generated id.
+post endpoint("/add_id/:name", string name):
+    List<Json> rows = await postgres.query("insert into articles (title, author) values (?, ?) returning id", name, "test")
+    return rows[0].status(201)
+
+# last_id() does not exist in postgres: the driver says so instead of making something up.
+post endpoint("/last_id"):
+    return { "r": await postgres.last_id() }
+
+post endpoint("/delete_row/:id", int id):
+    int rows = await postgres.exec("delete from articles where id = ?", id)
+    return { "rows": rows }
+
+# ── Transacciones ────────────────────────────────────────────────────────────
+
+post endpoint("/transfer"):
+    await postgres.begin()
+    await postgres.exec("update accounts set balance = balance - 30 where name = ?", "ana")
+    await postgres.exec("update accounts set balance = balance + 30 where name = ?", "bob")
+    await postgres.commit()
+    return { "ok": true }
+
+# Returns what EACH step answers.  In mysql begin() failed and its error was
+# discarded, so the transaction never opened and the rollback said yes.
+post endpoint("/undo_verbose"):
+    Json b = await postgres.begin()
+    Json u = await postgres.exec("update accounts set balance = balance - 50 where name = ?", "ana")
+    Json r = await postgres.rollback()
+    return { "begin": b, "update": u, "rollback": r }
+
+get endpoint("/balances"):
+    return await postgres.query("select name, balance from accounts order by name")
+
+# ── Engine errors ────────────────────────────────────────────────────────────
+
+get endpoint("/bad_table"):
+    return await postgres.query("select * from no_existe")
+
+get endpoint("/too_few_placeholders"):
+    return await postgres.query("select * from articles where id = ? and title = ?", 1)
+
+get endpoint("/mixed"):
+    return await postgres.query("select * from articles where id = $1 and title = ?", 1, "x")

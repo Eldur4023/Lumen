@@ -9,16 +9,16 @@
 
 namespace lumen {
 
-// Adapta un handler de C++ a la firma que guarda el router.
+// Adapts a C++ handler to the signature the router stores.
 //
-// En Lumen 2.0 los handlers nativos son un punado —/docs, /health, /metrics y
-// el dispatcher de Lumen Script—, asi que la adaptacion se reduce a repartir `Request&`
-// y `Response&` y a aceptar tanto `void` como `Task<void>`.
+// In Lumen the native handlers are a handful —/docs, /health, /metrics and the
+// Lumen Script dispatcher— so the adaptation comes down to handing out
+// `Request&` and `Response&` and accepting both `void` and `Task<void>`.
 //
-// La extraccion tipada de parametros —ruta, query, cuerpo, validacion,
-// inyeccion— vivia aqui como metaprogramacion de plantillas.  Ahora la resuelve
-// el frontend de Lumen Script al compilar el .lum, con los nombres y los tipos
-// delante, asi que aquello sobra.
+// La extraccion tipada de parametros —path, query, cuerpo, validacion,
+// injection— used to live here as template metaprogramming.  Now the Lumen
+// Script frontend resolves it while compiling the .lum, with the names and the
+// types in front of it, so all that is unnecessary.
 
 namespace detail {
 

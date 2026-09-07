@@ -10,7 +10,7 @@
 
 namespace lumen_script {
 
-// MySQL 8 retiro `my_bool` en favor de `bool`; MariaDB y MySQL 5 lo mantienen.
+// MySQL 8 dropped `my_bool` in favour of `bool`; MariaDB and MySQL 5 keep it.
 #if !defined(MARIADB_VERSION_ID) && MYSQL_VERSION_ID >= 80000
 using lumen_script_my_bool = bool;
 #else
@@ -19,30 +19,30 @@ using lumen_script_my_bool = my_bool;
 
 namespace {
 
-// Driver de MySQL/MariaDB sobre libmysqlclient.
+// MySQL/MariaDB driver on top of libmysqlclient.
 //
-// Todo lo que lleva parametros va por sentencia preparada: viajan por bind y
-// nunca concatenados, que es lo que hace imposible la inyeccion de SQL desde
-// Lumen Script.  Lo que NO lleva parametros se manda directo, porque el protocolo
-// preparado de MySQL no admite abrir una transaccion.
+// Everything carrying parameters goes through a prepared statement: they
+// travel by bind and never concatenated, which is what makes SQL injection
+// impossible from Lumen Script.  What does NOT carry parameters is sent
+// directly, because MySQL's prepared protocol cannot open a transaction.
 class MysqlDriver : public DbDriver {
 public:
     const char* name() const override { return "mysql"; }
 
     bool configure(const std::map<std::string, std::string>& options,
                    std::string& error) override {
-        // libmysqlclient hay que inicializarla UNA vez y desde un solo hilo,
-        // antes de que ningun otro la toque.  Sin esto, la inicializacion
-        // implicita de mysql_init() la disparaba el primer worker del pool que
-        // recibiera trabajo, mientras otro ya estaba dentro de la biblioteca:
-        // ThreadSanitizer lo caza como carrera sobre el mutex que monta
-        // mysql_server_init.  configure() corre antes de pool->start(), asi que
-        // aqui todavia no hay workers.
-        static std::once_flag una_vez;
-        static bool arrancada = false;
-        std::call_once(una_vez, [] { arrancada = mysql_library_init(0, nullptr, nullptr) == 0; });
-        if (!arrancada) {
-            error = "mysql: no se puede inicializar libmysqlclient";
+        // libmysqlclient has to be initialized ONCE and from a single thread,
+        // before anyone else touches it.  Without this, the implicit
+        // initialization of mysql_init() was triggered by the first pool worker
+        // to receive work, while another was already inside the library:
+        // ThreadSanitizer catches it as a race on the mutex mysql_server_init
+        // sets up.  configure() runs before pool->start(), so there are no
+        // workers yet at this point.
+        static std::once_flag once;
+        static bool started = false;
+        std::call_once(once, [] { started = mysql_library_init(0, nullptr, nullptr) == 0; });
+        if (!started) {
+            error = "mysql: cannot initialize libmysqlclient";
             return false;
         }
 
@@ -57,7 +57,7 @@ public:
         db_   = get("database", "");
 
         if (db_.empty()) {
-            error = "mysql: falta 'database' en el bloque de configuracion";
+            error = "mysql: missing 'database' in the configuration block";
             return false;
         }
 
@@ -65,7 +65,7 @@ public:
         if (p != options.end()) {
             long n = std::strtol(p->second.c_str(), nullptr, 10);
             if (n < 1 || n > 64) {
-                error = "mysql: 'pool' tiene que estar entre 1 y 64";
+                error = "mysql: 'pool' must be between 1 and 64";
                 return false;
             }
             set_pool_size(static_cast<size_t>(n));
@@ -75,7 +75,7 @@ public:
     }
 
     bool open(size_t worker, std::string& error) override {
-        if (worker >= conns_.size()) { error = "mysql: worker fuera de rango"; return false; }
+        if (worker >= conns_.size()) { error = "mysql: worker out of range"; return false; }
         if (conns_[worker] && mysql_ping(conns_[worker]) != 0) {
             mysql_close(conns_[worker]);
             conns_[worker] = nullptr;
@@ -83,11 +83,12 @@ public:
         if (conns_[worker]) return true;
 
         MYSQL* c = mysql_init(nullptr);
-        if (!c) { error = "mysql: sin memoria"; return false; }
+        if (!c) { error = "mysql: out of memory"; return false; }
 
-        // Reconexion automatica desactivada: reabrir en silencio a mitad de una
-        // transaccion la perderia sin avisar.  open() ya reabre entre consultas.
-        // MySQL 8.0.34 retiro la opcion y ese es ya el comportamiento.
+        // Automatic reconnection disabled: silently reopening halfway through a
+        // transaction would lose it without warning.  open() already reopens
+        // between queries.  MySQL 8.0.34 dropped the option and that is now
+        // the default behaviour.
 #if defined(MYSQL_OPT_RECONNECT)
         lumen_script_my_bool reconnect = 0;
         mysql_options(c, MYSQL_OPT_RECONNECT, &reconnect);
@@ -95,7 +96,7 @@ public:
 
         if (!mysql_real_connect(c, host_.c_str(), user_.c_str(), pass_.c_str(),
                                 db_.c_str(), port_, nullptr, 0)) {
-            error = std::string("mysql: no se puede conectar: ") + mysql_error(c);
+            error = std::string("mysql: cannot connect: ") + mysql_error(c);
             mysql_close(c);
             return false;
         }
@@ -106,10 +107,10 @@ public:
 
     bool query(size_t worker, const std::string& sql, const std::vector<Value>& args,
                Value& out, std::string& error) override {
-        // Todo esto es local a la llamada, y tiene que serlo: el driver es uno
-        // solo y lo comparten los N workers del pool.  Con los buffers de bind
-        // guardados en el objeto, dos consultas simultaneas se pisaban los
-        // punteros que libmysqlclient todavia estaba usando.
+        // All of this is local to the call, and has to be: there is a single
+        // driver shared by the N pool workers.  With the bind buffers kept in
+        // the object, two simultaneous queries trod on the pointers
+        // libmysqlclient was still using.
         MYSQL_STMT* stmt = nullptr;
         std::vector<MYSQL_BIND>  binds;
         std::vector<std::string> store;
@@ -125,19 +126,19 @@ public:
         }
 
         MYSQL_RES* meta = mysql_stmt_result_metadata(stmt);
-        if (!meta) {                       // no devolvia filas
+        if (!meta) {                       // it returned no rows
             mysql_stmt_close(stmt);
             out = Value::list();
             return true;
         }
 
-        // `max_length` vale CERO mientras no se pida expresamente y no se traiga
-        // el resultado al cliente.  Sin estas dos llamadas, todos los buffers se
-        // quedaban en el tamano de reserva y cualquier columna mas larga se
-        // truncaba EN SILENCIO: un TEXT de 4 KB llegaba con 1024 bytes, cortado
-        // ademas a mitad de caracter si era UTF-8.
-        lumen_script_my_bool si = 1;
-        mysql_stmt_attr_set(stmt, STMT_ATTR_UPDATE_MAX_LENGTH, &si);
+        // `max_length` is ZERO unless it is asked for explicitly and the result
+        // is brought to the client.  Without these two calls, every buffer
+        // stayed at the reserved size and any longer column was truncated
+        // SILENTLY: a 4 KB TEXT arrived with 1024 bytes, cut mid-character on
+        // top of that if it was UTF-8.
+        lumen_script_my_bool yes = 1;
+        mysql_stmt_attr_set(stmt, STMT_ATTR_UPDATE_MAX_LENGTH, &yes);
         if (mysql_stmt_store_result(stmt) != 0) {
             error = std::string("mysql: ") + mysql_stmt_error(stmt);
             mysql_free_result(meta);
@@ -148,12 +149,12 @@ public:
         unsigned cols = mysql_num_fields(meta);
         MYSQL_FIELD* fields = mysql_fetch_fields(meta);
 
-        // Buffers de salida: se pide todo como texto y se convierte despues,
-        // que evita una tabla de tipos por cada variante de entero de MySQL.
+        // Output buffers: everything is asked for as text and converted
+        // afterwards, which avoids a type table per MySQL integer variant.
         std::vector<std::vector<char>> bufs(cols);
         std::vector<unsigned long>     lens(cols, 0);
-        // Arrays y no vector<bool>: esa especializacion empaqueta bits y no
-        // permite tomar la direccion de un elemento, que es lo que pide la API.
+        // Arrays and not vector<bool>: that specialization packs bits and does
+        // not allow taking the address of an element, which is what the API needs.
         auto nulls = std::make_unique<lumen_script_my_bool[]>(cols);
         auto errs  = std::make_unique<lumen_script_my_bool[]>(cols);
         std::vector<MYSQL_BIND>        obind(cols);
@@ -175,9 +176,9 @@ public:
         for (;;) {
             int rc = mysql_stmt_fetch(stmt);
             if (rc == MYSQL_NO_DATA) break;
-            // MYSQL_DATA_TRUNCATED se colaba por aqui como si fuera una fila
-            // buena.  Con los buffers ya bien dimensionados no deberia ocurrir;
-            // si ocurre, es un fallo y no un dato a medias.
+            // MYSQL_DATA_TRUNCATED used to slip through here as if it were a
+            // good row.  With the buffers properly sized it should not happen;
+            // if it does, it is a failure and not half a row of data.
             if (rc == 1 || rc == MYSQL_DATA_TRUNCATED) {
                 error = (rc == MYSQL_DATA_TRUNCATED)
                       ? std::string("mysql: fila truncada al leerla")
@@ -204,16 +205,16 @@ public:
 
     bool exec(size_t worker, const std::string& sql, const std::vector<Value>& args,
               long long& affected, std::string& error) override {
-        // Sin parametros la sentencia va directa, sin pasar por el protocolo de
-        // sentencias preparadas.
+        // With no parameters the statement goes straight through, without the
+        // prepared statement protocol.
         //
-        // No es una optimizacion, es que HACE FALTA: MySQL no admite ahi ni
-        // BEGIN ni START TRANSACTION —error 1295—, asi que por el camino
-        // preparado la transaccion no llegaba a abrirse nunca.  El UPDATE se
-        // autocommiteaba y el ROLLBACK devolvia exito sin nada que deshacer.
+        // It is not an optimization, it is NEEDED: MySQL accepts neither BEGIN
+        // nor START TRANSACTION there —error 1295— so down the prepared path the
+        // transaction never actually opened.  The UPDATE autocommitted and the
+        // ROLLBACK returned success with nothing to undo.
         //
-        // Y no abre ningun agujero: lo que hace imposible la inyeccion es que
-        // los PARAMETROS viajen por bind, y aqui no hay ninguno que enlazar.
+        // And it opens no hole: what makes injection impossible is that the
+        // PARAMETERS travel by bind, and here there are none to bind.
         if (args.empty()) {
             MYSQL* c = conns_[worker];
             if (mysql_real_query(c, sql.c_str(),
@@ -221,17 +222,17 @@ public:
                 error = std::string("mysql: ") + mysql_error(c);
                 return false;
             }
-            // Un exec() sobre algo que devuelve filas dejaria la conexion a
-            // medias y la siguiente consulta fallaria sin motivo aparente.
+            // An exec() on something returning rows would leave the connection
+            // half-used and the next query would fail for no apparent reason.
             if (MYSQL_RES* r = mysql_store_result(c)) mysql_free_result(r);
             affected = static_cast<long long>(mysql_affected_rows(c));
             return true;
         }
 
-        // Todo esto es local a la llamada, y tiene que serlo: el driver es uno
-        // solo y lo comparten los N workers del pool.  Con los buffers de bind
-        // guardados en el objeto, dos consultas simultaneas se pisaban los
-        // punteros que libmysqlclient todavia estaba usando.
+        // All of this is local to the call, and has to be: there is a single
+        // driver shared by the N pool workers.  With the bind buffers kept in
+        // the object, two simultaneous queries trod on the pointers
+        // libmysqlclient was still using.
         MYSQL_STMT* stmt = nullptr;
         std::vector<MYSQL_BIND>  binds;
         std::vector<std::string> store;
@@ -252,7 +253,7 @@ public:
 
     bool last_insert_id(size_t worker, long long& id, std::string& error) override {
         if (worker >= conns_.size() || !conns_[worker]) {
-            error = "mysql: sin conexion";
+            error = "mysql: no connection";
             return false;
         }
         id = static_cast<long long>(mysql_insert_id(conns_[worker]));
@@ -276,7 +277,7 @@ private:
                  std::vector<unsigned long>& lens, std::string& error) {
         MYSQL* c = conns_[worker];
         *out = mysql_stmt_init(c);
-        if (!*out) { error = "mysql: sin memoria"; return false; }
+        if (!*out) { error = "mysql: out of memory"; return false; }
 
         if (mysql_stmt_prepare(*out, sql.c_str(),
                                static_cast<unsigned long>(sql.size())) != 0) {
@@ -288,16 +289,16 @@ private:
 
         unsigned expected = mysql_stmt_param_count(*out);
         if (expected != args.size()) {
-            error = "mysql: la consulta tiene " + std::to_string(expected) +
-                    " parametro(s) y se pasaron " + std::to_string(args.size());
+            error = "mysql: the query has " + std::to_string(expected) +
+                    " parameter(s) but " + std::to_string(args.size()) + " were passed";
             mysql_stmt_close(*out);
             *out = nullptr;
             return false;
         }
         if (args.empty()) return true;
 
-        // Todo se manda como texto: MySQL lo convierte al tipo de la columna, y
-        // asi no hace falta una rama por cada tipo numerico.
+        // Everything is sent as text: MySQL converts it to the column type, and
+        // that way no branch per numeric type is needed.
         store.reserve(args.size());
         for (const auto& v : args)
             store.push_back(v.is_null() ? std::string()
@@ -327,16 +328,16 @@ private:
         return true;
     }
 
-    // `charsetnr == 63` es el juego binary: eso distingue un BLOB de un TEXT,
-    // que en MySQL comparten tipo y solo se diferencian en la codificacion.
+    // `charsetnr == 63` is the binary charset: that is what tells a BLOB from a
+    // TEXT, which in MySQL share a type and differ only in the encoding.
     static constexpr unsigned kBinario = 63;
 
     static Value typed(enum_field_types t, unsigned flags, unsigned charset,
                        const std::string& text) {
-        // Un BLOB no es texto: son bytes cualesquiera.  Devolverlos como cadena
-        // dejaba la respuesta sin ser UTF-8 valido, y entonces el fallo no es de
-        // la peticion sino del cliente que la recibe.  Base64 es como se mete un
-        // binario en un JSON.
+        // A BLOB is not text: it is arbitrary bytes.  Returning them as a string
+        // left the response not valid UTF-8, and then the failure is not the
+        // request's but the client's that receives it.  Base64 is how a binary
+        // goes into a JSON.
         if (charset == kBinario &&
             (t == MYSQL_TYPE_BLOB      || t == MYSQL_TYPE_TINY_BLOB ||
              t == MYSQL_TYPE_MEDIUM_BLOB || t == MYSQL_TYPE_LONG_BLOB ||
@@ -347,11 +348,11 @@ private:
             case MYSQL_TYPE_TINY:  case MYSQL_TYPE_SHORT:
             case MYSQL_TYPE_LONG:  case MYSQL_TYPE_LONGLONG:
             case MYSQL_TYPE_INT24: case MYSQL_TYPE_YEAR: {
-                // Un BIGINT UNSIGNED llega hasta 18446744073709551615, que no
-                // cabe en el entero de Lumen Script.  strtoll lo dejaria clavado en
-                // INT64_MAX sin avisar, asi que por encima de ese tope se cae a
-                // decimal, que es lo mismo que hace el parser de JSON y lo que
-                // hace JavaScript.  Por debajo sigue siendo exacto.
+                // A BIGINT UNSIGNED reaches 18446744073709551615, which does not
+                // fit in the Lumen Script integer.  strtoll would pin it at
+                // INT64_MAX without warning, so above that cap it falls back to
+                // a decimal, which is what the JSON parser does and what
+                // JavaScript does.  Below that it stays exact.
                 if (flags & UNSIGNED_FLAG) {
                     unsigned long long u = std::strtoull(text.c_str(), nullptr, 10);
                     if (u > static_cast<unsigned long long>(INT64_MAX))

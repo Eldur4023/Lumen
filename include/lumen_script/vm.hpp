@@ -8,56 +8,56 @@
 
 namespace lumen_script {
 
-// Maquina virtual de Lumen Script.
+// Virtual machine of Lumen Script.
 //
-// La pila de operandos y las variables locales viven aqui, no en la pila de
-// C++.  Por eso un handler puede detenerse a mitad: `run()` devuelve
-// Suspended con la operacion pendiente, quien lo llama hace el co_await de
-// verdad sobre el motor, y `resume()` continua justo donde lo dejo.
+// The operand stack and the local variables live here, not on the C++ stack.
+// That is why a handler can stop halfway: `run()` returns Suspended with the
+// pending operation, the caller does the real co_await on the engine, and
+// `resume()` picks up exactly where it left off.
 //
-// El VM no es una corrutina; el handler que lo conduce si lo es.  Esa division
-// es lo que evita tener que reimplementar un planificador dentro del VM.
+// The VM is not a coroutine; the handler driving it is.  That split is what
+// avoids reimplementing a scheduler inside the VM.
 //
-// Una instancia por peticion en vuelo, alojada en el marco de la corrutina del
-// handler: dos VM suspendidos a la vez no pueden pisarse el estado.
+// One instance per in-flight request, held in the handler's coroutine frame:
+// two suspended VMs cannot tread on each other's state.
 class VM {
 public:
     enum class Status { Done, Error, Suspended };
 
     struct Result {
         Status      status = Status::Done;
-        Value       value;          // Done: valor devuelto por el handler
+        Value       value;          // Done: value returned by the handler
         std::string error;          // Error: motivo
         SourceLoc   error_loc;
 
-        // Suspended: que hay que esperar antes de reanudar.
+        // Suspended: what to wait for before resuming.
         int                await_id = -1;
         std::vector<Value> await_args;
     };
 
-    // Arranca `chunk` con `params` en las primeras ranuras.  `functions` es la
-    // tabla de funciones de usuario del modulo; puede ser nula si no hay.
+    // Starts `chunk` with `params` in the first slots.  `functions` is the
+    // module's user function table; it may be null if there is none.
     Result start(const Chunk& chunk, std::vector<Value> params, NativeCtx& ctx,
                  const FunctionTable* functions = nullptr);
 
-    // Continua tras una suspension, dejando `awaited` como valor de la
-    // expresion `await`.
+    // Continues after a suspension, leaving `awaited` as the value of the
+    // `await` expression.
     Result resume(Value awaited, NativeCtx& ctx);
 
-    // Tope de pasos por handler: corta un bucle infinito en un .lum en vez de
-    // dejar clavado un hilo del event loop, que se llevaria por delante todas
-    // las conexiones de ese core.  Se reinicia en cada suspension, porque un
-    // bucle de SSE legitimo puede correr durante horas.
+    // Step cap per handler: cuts an infinite loop in a .lum instead of pinning
+    // an event loop thread, which would take down every connection on that
+    // core.  It resets on every suspension, because a legitimate SSE loop can
+    // run for hours.
     static constexpr long long kStepLimit = 50'000'000;
 
-    // Tope de anidamiento de llamadas.  Una recursion sin caso base tiene que
-    // dar un error del lenguaje, no agotar la memoria del proceso.
+    // Call nesting cap.  Recursion without a base case has to give a language
+    // error, not exhaust the process memory.
     static constexpr size_t kMaxFrames = 200;
 
 private:
-    // Un marco por llamada en curso.  Locales y pila viven en vectores unicos
-    // con una base por marco: asi suspender y reanudar es conservar dos
-    // vectores, sin importar a que profundidad de llamada se detuvo.
+    // One frame per call in progress.  Locals and stack live in single vectors
+    // with a base per frame: that way suspending and resuming is keeping two
+    // vectors, no matter how deep the call was when it stopped.
     struct Frame {
         const Chunk* chunk       = nullptr;
         size_t       pc          = 0;

@@ -9,81 +9,92 @@
 
 namespace lumen_script {
 
-// Instrucciones del VM.
+// VM instructions.
 //
-// Pila de operandos propia, no la de C++: es lo que permitira suspender un
-// handler a mitad de `await` sin perder el estado.  El `await` en si llega
-// despues; el diseno de la pila ya lo contempla.
+// Its own operand stack, not the C++ one: that is what will allow suspending a
+// handler halfway through an `await` without losing the state.  The `await`
+// itself comes later; the stack design already accounts for it.
 enum class Op : uint8_t {
-    Const,        // operand = indice en el pool de constantes
-    LoadLocal,    // operand = ranura
-    StoreLocal,   // operand = ranura
+    Const,        // operand = index into the constant pool
+    LoadLocal,    // operand = slot
+    StoreLocal,   // operand = slot
     Pop,
 
     Add, Sub, Mul, Div, Mod, Neg,
     Eq, Ne, Lt, Le, Gt, Ge,
     Not,
 
-    // Variantes con los dos lados declarados `int`.  Lumen Script es de tipado
-    // estatico, asi que el emisor sabe al compilar lo que el VM generico tiene
-    // que averiguar en cada vuelta: son la misma operacion sin la cascada de
-    // comprobaciones de tipo.
+    // A collapsed chain of '+': operand = how many values off the top are joined.
     //
-    // El tipo declarado no se impone en la asignacion, asi que llevan guarda:
-    // si los valores no son enteros de verdad, caen al camino generico y el
-    // programa se comporta igual, con el mismo mensaje de error.
+    // "a" + str(n) + "b" with separate Adds creates a box and a buffer for every
+    // '+', and throws away all but the last.  Here the total is measured once,
+    // reserved in one go, and only one box is born.
+    //
+    // It carries a guard like the Int variants: if any of the values is not a
+    // string, it folds with the same generic Add, so the result and the error
+    // are identical to what the uncollapsed chain of '+' would give.
+    ConcatN,
+
+    // Variants with both sides declared `int`.  Lumen Script is statically
+    // typed, so what the generic VM works out on every pass is known here once:
+    // they are the same operation without the cascade of type checks.
+    // comprobaciones de type.
+    //
+    // The declared type is not enforced on assignment, so they carry a guard:
+    // if the values are not really integers, they fall to the generic path and
+    // the program behaves the same, with the same error message.
     AddInt, SubInt, MulInt,
     LtInt, LeInt, GtInt, GeInt,
 
     Jump,         // operand = destino absoluto
-    JumpIfFalse,  // idem; consume la cima
-    JumpIfFalsePeek,  // idem, pero deja la cima (cortocircuito de and/or)
+    JumpIfFalse,  // same; consumes the top
+    JumpIfFalsePeek,  // same, but leaves the top (and/or short-circuit)
     JumpIfTruePeek,
 
-    MakeList,     // operand = numero de elementos
-    MakeDict,     // operand = numero de pares
+    MakeList,     // operand = number de elementos
+    MakeDict,     // operand = number de pares
     GetIndex,
-    SetIndex,     // apila contenedor, indice y valor; deja el valor
-    IterList,     // convierte la cima en la lista que se va a recorrer
-    GetMember,    // operand = indice de constante con el nombre
-    SetMember,    // idem; apila objeto y valor, y deja el valor
+    SetIndex,     // pushes container, index and value; leaves the value
+    IterList,     // turns the top into the list to walk
+    GetMember,    // operand = index of the constant holding the name
+    SetMember,    // same; pushes object and value, and leaves the value
 
     CallFunction, // operand = (indice-de-funcion << 8) | argc
-    CallMethod,   // operand = (indice-de-constante-con-el-nombre << 8) | argc
+    CallMethod,   // operand = (name-constant-index << 8) | argc
     CallNative,   // operand = (id << 8) | argc
-    CallAsync,    // idem, pero suspende: el driver hace el co_await real
-    Return,       // devuelve la cima
+    CallAsync,    // same, but suspends: the driver does the real co_await
+    Return,       // returns the top
     ReturnNull,
 };
 
 struct Instr {
     Op        op;
     uint32_t  operand = 0;
-    SourceLoc loc;      // para poder situar un error de ejecucion
+    SourceLoc loc;      // so a runtime error can be located
 };
 
-// Un `try:` cubierto por su `catch:`.
+// A `try:` covered by its `catch:`.
 //
-// Se resuelve por rango en compilacion y no por una pila en runtime: asi un
-// `return`, un `break` o un `continue` que salgan del try no pueden dejar un
-// manejador colgado que atrape un error posterior.
+// Resolved by range at compile time and not by a runtime stack: that way a
+// `return`, a `break` or a `continue` leaving the try cannot leave a handler
+// dangling that would catch a later error.
 struct TryRange {
-    size_t begin    = 0;   // primera instruccion protegida
-    size_t end      = 0;   // primera instruccion YA fuera del try
+    size_t begin    = 0;   // first protected instruction
+    size_t end      = 0;   // first instruction ALREADY outside the try
     size_t catch_pc = 0;
 };
 
-// El codigo de un handler, ya compilado.
+// The code of a handler, already compiled.
 struct Chunk {
     std::vector<Instr> code;
-    // Si es false, el handler no puede detenerse y se puede ejecutar sobre un
-    // VM reutilizado por hilo en vez de uno por peticion.
+    // If false, the handler cannot stop and can run on a VM reused per thread
+    // instead of one per request.
     bool               has_await = false;
     std::vector<Value>    constants;
     std::vector<TryRange> try_ranges;
     int                   num_locals = 0;
 
-    // Nombres de las ranuras, solo para mensajes de error.
+    // Slot names, only for error messages.
     std::vector<std::string> local_names;
 
     uint32_t add_constant(Value v) {
@@ -96,15 +107,15 @@ struct Chunk {
         return code.size() - 1;
     }
 
-    // Los saltos se emiten sin destino y se rellenan al cerrar el bloque.
+    // Jumps are emitted without a target and patched when the block closes.
     void patch(size_t at, size_t target) {
         code[at].operand = static_cast<uint32_t>(target);
     }
     size_t here() const { return code.size(); }
 };
 
-// Las funciones de usuario compiladas, indexadas por el orden de declaracion.
-// El emisor resuelve el nombre a indice, asi que el VM no busca por nombre.
+// The compiled user functions, indexed by declaration order.  The emitter
+// resolves the name to an index, so the VM never looks one up by name.
 using FunctionTable = std::vector<std::shared_ptr<Chunk>>;
 
 const char* op_name(Op op);

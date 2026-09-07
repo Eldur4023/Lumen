@@ -10,31 +10,31 @@ namespace lumen_script {
 
 namespace {
 
-// ─── Marcadores de parametro ─────────────────────────────────────────────────
+// ─── Parameter placeholders ──────────────────────────────────────────────────
 //
-// En Lumen Script el marcador es `?`, el de sqlite y mysql, para que la MISMA consulta
-// valga en los tres motores.  Postgres es el unico que los numera, asi que la
-// traduccion vive aqui: el driver es quien conoce su dialecto, y asi cambiar de
-// motor no obliga a reescribir todas las consultas de la aplicacion.
+// In Lumen Script the placeholder is `?`, sqlite's and mysql's, so the SAME
+// query works on all three engines.  Postgres is the only one that numbers
+// them, so the translation lives here: the driver is the one that knows its
+// dialect, and that way switching engines does not force rewriting every query.
 //
-// Reglas, y cada una tiene su motivo:
+// The rules, each with its reason:
 //
-//   • Solo se traduce si la consulta lleva parametros.  Sin ellos no hay nada
-//     que sustituir, y un `?` suelto en postgres es el operador de JSONB
-//     —`datos ? 'clave'`—, que hay que dejar en paz.
-//   • Una consulta escrita con $1 no tiene ningun `?`, asi que sale intacta.
-//     El codigo anterior a esto sigue funcionando sin tocarlo.
-//   • Lo que hay dentro de una cadena, de un identificador entrecomillado, de
-//     un comentario o de un bloque $etiqueta$ no es un marcador.
-//   • `??` es un `?` literal, para poder usar el operador de JSONB en una
-//     consulta que ademas lleva parametros.
+//   • It only translates if the query carries parameters.  Without them there
+//     is nothing to substitute, and a bare `?` in postgres is the JSONB
+//     operator —`data ? 'key'`— which must be left alone.
+//   • A query written with $1 has no `?` at all, so it comes out untouched.
+//     Code written before this keeps working without changes.
+//   • What is inside a string, a quoted identifier, a comment or a $tag$ block
+//     is not a placeholder.
+//   • `??` is a literal `?`, so the JSONB operator can be used in a query that
+//     also carries parameters.
 //
-// Devuelve false —y deja el motivo en `error`— si la consulta mezcla los dos
-// estilos o si los marcadores no cuadran con los argumentos.
+// Returns false —leaving the reason in `error`— if the query mixes both styles
+// or if the placeholders do not match the arguments.
 bool traducir_marcadores(const std::string& sql, size_t nargs,
                          std::string& out, std::string& error) {
-    // Sin parametros no hay nada que sustituir, y cualquier `?` de la consulta
-    // es el operador de JSONB.  Se sale antes de mirar siquiera.
+    // With no parameters there is nothing to substitute, and any `?` in the
+    // query is the JSONB operator.  It leaves before even looking.
     if (nargs == 0) { out = sql; return true; }
 
     auto ident = [](unsigned char c) { return std::isalnum(c) || c == '_'; };
@@ -43,18 +43,18 @@ bool traducir_marcadores(const std::string& sql, size_t nargs,
     res.reserve(sql.size() + 8);
     size_t i = 0;
     int    n = 0;              // marcadores `?` encontrados
-    bool   numerado = false;   // se vio un $1, $2...
+    bool   numerado = false;   // a $1, $2... was seen
 
     while (i < sql.size()) {
         const char c = sql[i];
 
-        // Comentario de linea.
+        // Line comment.
         if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
             while (i < sql.size() && sql[i] != '\n') res += sql[i++];
             continue;
         }
 
-        // Comentario de bloque.  En postgres anidan, asi que se cuenta.
+        // Block comment.  In postgres they nest, so they are counted.
         if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
             int prof = 0;
             while (i < sql.size()) {
@@ -71,8 +71,8 @@ bool traducir_marcadores(const std::string& sql, size_t nargs,
             continue;
         }
 
-        // Cadena.  Dentro, '' es una comilla escapada; si la cadena viene
-        // precedida de E, la barra tambien escapa.
+        // String.  Inside, '' is an escaped quote; if the string is preceded by
+        // an E, the backslash escapes too.
         if (c == '\'') {
             const bool con_barra = !res.empty() && (res.back() == 'E' || res.back() == 'e');
             res += sql[i++];
@@ -92,7 +92,7 @@ bool traducir_marcadores(const std::string& sql, size_t nargs,
             continue;
         }
 
-        // Identificador entrecomillado.
+        // Quoted identifier.
         if (c == '"') {
             res += sql[i++];
             while (i < sql.size()) {
@@ -109,21 +109,21 @@ bool traducir_marcadores(const std::string& sql, size_t nargs,
         }
 
         if (c == '$') {
-            // $1, $2...: la consulta ya viene numerada.
+            // $1, $2...: the query already comes numbered.
             if (i + 1 < sql.size() && std::isdigit(static_cast<unsigned char>(sql[i + 1]))) {
                 numerado = true;
                 res += sql[i++];
                 continue;
             }
-            // $etiqueta$ ... $etiqueta$: nada de dentro es un marcador.
+            // $tag$ ... $tag$: nothing inside is a placeholder.
             size_t j = i + 1;
             while (j < sql.size() && ident(static_cast<unsigned char>(sql[j]))) ++j;
             if (j < sql.size() && sql[j] == '$') {
                 const std::string tag = sql.substr(i, j - i + 1);
                 const size_t fin = sql.find(tag, j + 1);
-                const size_t hasta = (fin == std::string::npos) ? sql.size() : fin + tag.size();
-                res.append(sql, i, hasta - i);
-                i = hasta;
+                const size_t up_to = (fin == std::string::npos) ? sql.size() : fin + tag.size();
+                res.append(sql, i, up_to - i);
+                i = up_to;
                 continue;
             }
             res += sql[i++];
@@ -145,31 +145,31 @@ bool traducir_marcadores(const std::string& sql, size_t nargs,
         res += sql[i++];
     }
 
-    // Ni un solo `?`: la consulta esta escrita al estilo de postgres y se manda
-    // tal cual, sin tocar siquiera los `??` que pudiera llevar.
+    // Not a single `?`: the query is written postgres style and is sent as is,
+    // without even touching any `??` it might carry.
     if (n == 0) { out = sql; return true; }
 
     if (numerado) {
-        error = "postgres: la consulta mezcla marcadores '?' y '$1'; usa solo uno "
-                "de los dos estilos";
+        error = "postgres: the query mixes '?' and '$1' placeholders; use only one "
+                "of the two styles";
         return false;
     }
     if (static_cast<size_t>(n) != nargs) {
-        error = "postgres: la consulta tiene " + std::to_string(n) +
-                " marcador(es) '?' y se pasaron " + std::to_string(nargs) +
-                " argumento(s)";
+        error = "postgres: the query has " + std::to_string(n) +
+                " '?' placeholder(s) but " + std::to_string(nargs) +
+                " argument(s) were passed";
         return false;
     }
     out = std::move(res);
     return true;
 }
 
-// Driver de PostgreSQL sobre libpq.
+// PostgreSQL driver on top of libpq.
 //
-// libpq tiene API asincrona, pero su modelo de espera no encaja con un event
-// loop ajeno sin reimplementar el bucle de conexion.  Se usa la bloqueante
-// dentro del pool: es mas simple y el efecto para quien escribe Lumen Script es el
-// mismo, porque el handler se suspende igual.
+// libpq has an asynchronous API, but its waiting model does not fit someone
+// else's event loop without reimplementing the connection loop.  The blocking
+// one is used inside the pool: it is simpler and the effect for whoever writes
+// Lumen Script is the same, because the handler suspends either way.
 class PostgresDriver : public DbDriver {
 public:
     const char* name() const override { return "postgres"; }
@@ -180,7 +180,7 @@ public:
         if (url != options.end() && !url->second.empty()) {
             conninfo_ = url->second;
         } else {
-            // Sin url, se compone a partir de las piezas sueltas.
+            // Without a url, it is composed from the separate pieces.
             auto get = [&](const char* k, const char* def) {
                 auto it = options.find(k);
                 return it == options.end() ? std::string(def) : it->second;
@@ -191,7 +191,7 @@ public:
             std::string user = get("user", "");
             std::string pass = get("password", "");
             if (db.empty()) {
-                error = "postgres: falta 'url' o 'database' en el bloque de configuracion";
+                error = "postgres: missing 'url' or 'database' in the configuration block";
                 return false;
             }
             conninfo_ = "host=" + host + " port=" + port + " dbname=" + db;
@@ -203,7 +203,7 @@ public:
         if (p != options.end()) {
             long n = std::strtol(p->second.c_str(), nullptr, 10);
             if (n < 1 || n > 64) {
-                error = "postgres: 'pool' tiene que estar entre 1 y 64";
+                error = "postgres: 'pool' must be between 1 and 64";
                 return false;
             }
             set_pool_size(static_cast<size_t>(n));
@@ -213,10 +213,10 @@ public:
     }
 
     bool open(size_t worker, std::string& error) override {
-        if (worker >= conns_.size()) { error = "postgres: worker fuera de rango"; return false; }
+        if (worker >= conns_.size()) { error = "postgres: worker out of range"; return false; }
 
-        // Una conexion caida se reabre sola en la siguiente consulta, sin que
-        // el .lum tenga que enterarse.
+        // A dropped connection reopens itself on the next query, without the
+        // .lum having to know.
         if (conns_[worker] && PQstatus(conns_[worker]) != CONNECTION_OK) {
             PQfinish(conns_[worker]);
             conns_[worker] = nullptr;
@@ -225,8 +225,8 @@ public:
 
         PGconn* c = PQconnectdb(conninfo_.c_str());
         if (!c || PQstatus(c) != CONNECTION_OK) {
-            error = std::string("postgres: no se puede conectar: ") +
-                    (c ? PQerrorMessage(c) : "sin memoria");
+            error = std::string("postgres: cannot connect: ") +
+                    (c ? PQerrorMessage(c) : "out of memory");
             if (c) PQfinish(c);
             return false;
         }
@@ -276,9 +276,9 @@ private:
     std::string          conninfo_;
     std::vector<PGconn*> conns_;
 
-    // Los parametros van por PQexecParams, nunca concatenados: es lo que hace
-    // imposible la inyeccion de SQL desde Lumen Script.  Se mandan como texto y el
-    // servidor los convierte al tipo de la columna.
+    // The parameters go through PQexecParams, never concatenated: that is what
+    // makes SQL injection impossible from Lumen Script.  They are sent as text
+    // and the server converts them to the column type.
     PGresult* run(size_t worker, const std::string& sql, const std::vector<Value>& args,
                   std::string& error) {
         PGconn* c = conns_[worker];
@@ -295,7 +295,7 @@ private:
             store.push_back(v.is_bool() ? (v.as_bool() ? "true" : "false") : v.to_string());
             ptrs.push_back(store.back().c_str());
         }
-        // store puede haber realojado: se rehacen los punteros.
+        // store may have reallocated: the pointers are rebuilt.
         for (size_t i = 0, j = 0; i < args.size(); ++i)
             if (!args[i].is_null()) { ptrs[i] = store[i].c_str(); ++j; }
 
@@ -311,7 +311,7 @@ private:
         return res;
     }
 
-    // OIDs de los tipos que merecen no llegar como cadena.
+    // OIDs of the types that deserve not to arrive as a string.
     static Value typed(unsigned oid, const char* text) {
         switch (oid) {
             case 16:   return Value::boolean(text && (*text == 't' || *text == 'T'));

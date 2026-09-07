@@ -1,8 +1,8 @@
 // Herramienta de desarrollo: comprueba SHA-256, HMAC-SHA256 y base64url.
 //
-//   crypto_check sha  <texto>
-//   crypto_check hmac <clave> <texto>
-//   crypto_check b64  <texto>
+//   crypto_check sha  <text>
+//   crypto_check hmac <clave> <text>
+//   crypto_check b64  <text>
 //   crypto_check self          → vectores conocidos
 #include <lumen_script/crypto.hpp>
 #include <iostream>
@@ -25,7 +25,7 @@ void expect(const std::string& what, const std::string& got, const std::string& 
     if (!ok) ++failures;
     std::cout << (ok ? "  ok   " : "  FALLO ") << what << "\n";
     if (!ok) std::cout << "        obtenido: " << got << "\n"
-                       << "        esperado: " << want << "\n";
+                       << "        expected: " << want << "\n";
 }
 
 int self_test() {
@@ -39,8 +39,8 @@ int self_test() {
            hex(sha256("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
 
-    // Cruza el limite de bloque en el relleno (55, 56 y 64 bytes son los casos
-    // que rompen una implementacion mal hecha).
+    // Crosses the block boundary in the padding (55, 56 and 64 bytes are the
+    // cases that break a badly done implementation).
     expect("sha256(55 x 'a')", hex(sha256(std::string(55, 'a'))),
            "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318");
     expect("sha256(56 x 'a')", hex(sha256(std::string(56, 'a'))),
@@ -53,8 +53,8 @@ int self_test() {
            hex(hmac_sha256("Jefe", "what do ya want for nothing?")),
            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
 
-    // Clave mas larga que el bloque: se sustituye por su hash (RFC 2104).
-    expect("hmac(clave de 131 bytes)",
+    // Key longer than the block: it is replaced by its hash (RFC 2104).
+    expect("hmac(131-byte key)",
            hex(hmac_sha256(std::string(131, '\xaa'),
                            "Test Using Larger Than Block-Size Key - Hash Key First")),
            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
@@ -64,7 +64,7 @@ int self_test() {
     expect("base64url ida y vuelta",
            base64url_decode(base64url_encode(raw), round) && round == raw ? "si" : "no",
            "si");
-    expect("base64url sin relleno", base64url_encode("a"), "YQ");
+    expect("base64url without padding", base64url_encode("a"), "YQ");
     expect("base64url alfabeto url-safe",
            base64url_encode(std::string("\xfb\xff", 2)), "-_8");
 

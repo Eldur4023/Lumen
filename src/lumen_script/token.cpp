@@ -5,14 +5,14 @@ namespace lumen_script {
 
 const char* tok_name(Tok t) {
     switch (t) {
-        case Tok::EndOfFile: return "fin de fichero";
-        case Tok::Newline:   return "fin de linea";
+        case Tok::EndOfFile: return "fin de file";
+        case Tok::Newline:   return "fin de line";
         case Tok::Indent:    return "indentacion";
         case Tok::Dedent:    return "des-indentacion";
         case Tok::Ident:     return "identificador";
         case Tok::Int:       return "entero";
         case Tok::Float:     return "decimal";
-        case Tok::String:    return "cadena";
+        case Tok::String:    return "string_value";
 
         case Tok::KwImport:   return "import";
         case Tok::KwClass:    return "class";

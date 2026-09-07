@@ -37,9 +37,9 @@ private:
 
     int  epoll_fd_  = -1;
     int  wakeup_fd_ = -1;
-    // Atomico porque stop() lo escribe desde OTRO hilo —el del apagado— y el
-    // loop lo lee en cada vuelta.  Como bool corriente era una carrera, aunque
-    // en la practica el compilador no llegara a morderla.
+    // Atomic because stop() writes it from ANOTHER thread —the shutdown one—
+    // and the loop reads it on every turn.  As a plain bool it was a race, even
+    // if in practice the compiler never bit it.
     std::atomic<bool> running_{false};
 
     std::unordered_map<int, Callback> callbacks_;

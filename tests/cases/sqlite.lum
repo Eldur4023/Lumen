@@ -1,0 +1,185 @@
+import sqlite
+
+app:
+    port 8820
+
+    sqlite:
+        file "./tests-sqlite-types.db"
+        pool 8
+
+get endpoint("/__ping__"):
+    return { "ok": true }
+
+# ── Schema ───────────────────────────────────────────────────────────────────
+#
+# It is created from here and not with the sqlite3 CLI, so the suite needs only
+# the Lumen binary.
+
+get endpoint("/create"):
+    await sqlite.exec("drop table if exists articles")
+    await sqlite.exec("drop table if exists accounts")
+    await sqlite.exec("drop table if exists types")
+    await sqlite.exec("drop table if exists affinity")
+
+    await sqlite.exec("""
+        create table articles (
+            id     integer primary key autoincrement,
+            title text not null,
+            body text,
+            author  text,
+            views integer not null default 0
+        )
+        """)
+    await sqlite.exec("create table accounts (id integer primary key autoincrement, name text, balance integer)")
+    await sqlite.exec("""
+        create table types (
+            id      integer primary key,
+            t_int   integer,
+            t_neg   integer,
+            t_real  real,
+            t_text text,
+            t_blob  blob,
+            t_null  text,
+            t_bool  integer
+        )
+        """)
+    # sqlite does not enforce the declared type: an integer column can hold
+    # text.  This table exists to check that what comes out is what IS THERE,
+    # not what the declaration says.
+    await sqlite.exec("create table affinity (id integer primary key, value integer)")
+
+    # 4000 characters, well above any reserved buffer.
+    string length = ""
+    int i = 0
+    while i < 400:
+        length = length + "0123456789"
+        i++
+
+    await sqlite.exec("insert into articles (title, body, author, views) values (?, ?, ?, ?)", "long", length, "Ana", 1)
+    await sqlite.exec("insert into articles (title, body, author, views) values (?, ?, ?, ?)", "short", "a short body", "Bob", 2)
+    await sqlite.exec("insert into articles (title, body, author, views) values (?, ?, ?, ?)", "unicode ñ 🐻", "body with ñ and 🐻", "Cé", 3)
+
+    await sqlite.exec("insert into accounts (name, balance) values (?, ?)", "ana", 100)
+    await sqlite.exec("insert into accounts (name, balance) values (?, ?)", "bob", 100)
+
+    # The blob carries bytes that are NOT valid UTF-8: if they reach the JSON
+    # raw, the document stops being readable for any client.
+    await sqlite.exec("""
+        insert into types (id, t_int, t_neg, t_real, t_text, t_blob, t_null, t_bool)
+        values (1, 9223372036854775807, -9223372036854775808, 3.141592653589793,
+                'with accents: añoñó and an emoji 🐻', x'00FF80FE', null, 1)
+        """)
+
+    # A text with a null byte inside: sqlite stores it and returns it whole.
+    await sqlite.exec("insert into types (id, t_text) values (2, ?)", "antes")
+    await sqlite.exec("update types set t_text = cast(x'6100620063' as text) where id = 2")
+
+    # A column declared integer with text inside.
+    await sqlite.exec("insert into affinity (id, value) values (1, ?)", "no soy un number")
+    await sqlite.exec("insert into affinity (id, value) values (2, ?)", 42)
+
+    return { "ok": true }
+
+# ── The basics ───────────────────────────────────────────────────────────────
+
+get endpoint("/all"):
+    return await sqlite.query("select id, title, author, views from articles order by id")
+
+get endpoint("/one/:id", int id):
+    List<Json> rows = await sqlite.query("select id, title, author, views from articles where id = ?", id)
+    if len(rows) == 0:
+        return status(404)
+    return rows[0]
+
+get endpoint("/length"):
+    List<Json> rows = await sqlite.query("select body from articles where title = ?", "long")
+    if len(rows) == 0:
+        return status(404)
+    return { "recibido": len(rows[0]["body"]), "esperado": 4000 }
+
+# ── Types ────────────────────────────────────────────────────────────────────
+
+get endpoint("/types"):
+    List<Json> rows = await sqlite.query("select * from types where id = ?", 1)
+    if len(rows) == 0:
+        return status(404)
+    return rows[0]
+
+# sqlite's length() counts up to the first NUL, by the engine's definition.  For
+# the real bytes you have to ask for the blob.  What is checked here is that
+# the driver returns the WHOLE text, with the nulls inside.
+get endpoint("/null_in_text"):
+    return await sqlite.query("select id, t_text, length(cast(t_text as blob)) as bytes, length(t_text) as up_to_null from types where id = ?", 2)
+
+# sqlite does not enforce the declared type: what is really stored comes out.
+get endpoint("/affinity"):
+    return await sqlite.query("select id, value, typeof(value) as type from affinity order by id")
+
+# Infinity: sqlite accepts it in a real column.
+get endpoint("/infinite"):
+    return await sqlite.query("select 9e999 as inf, -9e999 as menosinf")
+
+# ── The statement cache ──────────────────────────────────────────────────────
+#
+# The same query is prepared once and reused.  If the bindings were not cleared
+# on reuse, the second call would return what the first one gave.  This route
+# runs it N times with different parameters.
+
+get endpoint("/repeated/:id", int id):
+    List<Json> rows = await sqlite.query("select title from articles where id = ?", id)
+    if len(rows) == 0:
+        return { "title": null }
+    return rows[0]
+
+# The same query with a parameter that is sometimes null: if `clear_bindings`
+# were not called, the null would stay stuck from the previous turn.
+get endpoint("/optional", string author = ""):
+    if author == "":
+        return await sqlite.query("select count(*) as n from articles where author is ?", null)
+    return await sqlite.query("select count(*) as n from articles where author is ?", author)
+
+# ── Unicode e injection ──────────────────────────────────────────────────────
+
+get endpoint("/unicode"):
+    return await sqlite.query("select id, title from articles where title = ?", "unicode ñ 🐻")
+
+get endpoint("/injection", string q = "x"):
+    List<Json> rows = await sqlite.query("select id from articles where title = ?", q)
+    return { "encontrados": len(rows) }
+
+# ── Escritura ────────────────────────────────────────────────────────────────
+
+post endpoint("/add/:name", string name):
+    await sqlite.exec("insert into articles (title, author) values (?, ?)", name, "test")
+    int id = await sqlite.last_id()
+    return { "id": id }.status(201)
+
+post endpoint("/delete_row/:id", int id):
+    int rows = await sqlite.exec("delete from articles where id = ?", id)
+    return { "rows": rows }
+
+# ── Transacciones ────────────────────────────────────────────────────────────
+
+post endpoint("/transfer"):
+    await sqlite.begin()
+    await sqlite.exec("update accounts set balance = balance - 30 where name = ?", "ana")
+    await sqlite.exec("update accounts set balance = balance + 30 where name = ?", "bob")
+    await sqlite.commit()
+    return { "ok": true }
+
+post endpoint("/undo_verbose"):
+    Json b = await sqlite.begin()
+    Json u = await sqlite.exec("update accounts set balance = balance - 50 where name = ?", "ana")
+    Json r = await sqlite.rollback()
+    return { "begin": b, "update": u, "rollback": r }
+
+get endpoint("/balances"):
+    return await sqlite.query("select name, balance from accounts order by name")
+
+# ── Errores ──────────────────────────────────────────────────────────────────
+
+get endpoint("/bad_table"):
+    return await sqlite.query("select * from no_existe")
+
+get endpoint("/too_few_params"):
+    return await sqlite.query("select * from articles where id = ? and title = ?", 1)

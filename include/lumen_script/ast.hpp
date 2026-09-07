@@ -9,7 +9,7 @@
 
 namespace lumen_script {
 
-// ─── Tipos ───────────────────────────────────────────────────────────────────
+// ─── Types ───────────────────────────────────────────────────────────────────
 
 struct TypeRef {
     std::string          name;      // int, string, List, User, ...
@@ -20,7 +20,7 @@ struct TypeRef {
     std::string str() const;
 };
 
-// ─── Expresiones ─────────────────────────────────────────────────────────────
+// ─── Expressions ─────────────────────────────────────────────────────────────
 
 struct Expr;
 using ExprPtr = std::unique_ptr<Expr>;
@@ -33,9 +33,9 @@ enum class ExprKind {
     ListLit, DictLit,
 };
 
-// Un argumento de llamada: posicional, o con nombre (`error_window="..."`).
+// A call argument: positional, or named (`error_window="..."`).
 struct Arg {
-    std::string name;    // vacio si es posicional
+    std::string name;    // empty if positional
     ExprPtr     value;
     SourceLoc   loc;
 };
@@ -49,13 +49,13 @@ struct Expr {
     ExprKind  kind;
     SourceLoc loc;
 
-    // Literales
+    // Literals
     std::string text;        // StringLit / Ident / Member.name / operador
     long long   int_value  = 0;
     double      float_value = 0;
     bool        bool_value = false;
 
-    // Estructura
+    // Structure
     ExprPtr                object;    // Member/Index/Call: receptor
     ExprPtr                lhs, rhs;  // Binary / Ternary(cond=object)
     std::vector<Arg>       args;      // Call
@@ -63,7 +63,7 @@ struct Expr {
     std::vector<DictEntry> entries;   // DictLit
 };
 
-// ─── Sentencias ──────────────────────────────────────────────────────────────
+// ─── Statements ──────────────────────────────────────────────────────────────
 
 struct Stmt;
 using StmtPtr = std::unique_ptr<Stmt>;
@@ -87,28 +87,28 @@ struct Stmt {
     Block body;         // If-then / While / For / Try
     Block orelse;       // If-else / Try-catch
 
-    // Cadena else-if: cada eslabon es un If completo dentro de `orelse`.
+    // else-if chain: every link is a complete If inside `orelse`.
 };
 
-// ─── Declaraciones ───────────────────────────────────────────────────────────
+// ─── Declarations ────────────────────────────────────────────────────────────
 
-// Un parametro de endpoint o de funcion.
+// A parameter of an endpoint or a function.
 struct Param {
     TypeRef     type;
     std::string name;
-    ExprPtr     default_value;   // nulo si no tiene
+    ExprPtr     default_value;   // null if it has none
     SourceLoc   loc;
 };
 
-// Un campo de clase.
+// A class field.
 struct Field {
     TypeRef     type;
     std::string name;
     SourceLoc   loc;
 };
 
-// Una regla del bloque `validate:`: expresion booleana y el mensaje que se
-// emite cuando es falsa.
+// A rule of the `validate:` block: a boolean expression and the message
+// emitted when it is false.
 struct ValidateRule {
     ExprPtr     condition;
     std::string message;
@@ -123,9 +123,9 @@ struct FnDecl {
     SourceLoc          loc;
 };
 
-// Un constructor.  Sin cuerpo, asigna cada parametro al campo del mismo
-// nombre; con cuerpo, lo ejecuta con `this` ya creado y con todos los campos
-// a null.
+// A constructor.  Without a body, it assigns each parameter to the field of the
+// same name; with a body, it runs it with `this` already created and every
+// field set to null.
 struct CtorDecl {
     std::vector<Param> params;
     Block              body;
@@ -142,10 +142,10 @@ struct ClassDecl {
     SourceLoc                 loc;
 };
 
-// Una guarda `require X else Y` declarada a nivel de grupo.  Se antepone al
-// cuerpo de cada ruta del grupo, en orden de fuera hacia dentro.
-// Se comparten en vez de copiarse: una guarda declarada una vez la usan todas
-// las rutas del grupo, y el emisor solo las lee.
+// A `require X else Y` guard declared at group level.  It is prepended to the
+// body of every route in the group, from the outside in.
+// They are shared instead of copied: a guard declared once is used by every
+// route in the group, and the emitter only reads them.
 struct Guard {
     std::shared_ptr<Expr> condition;
     std::shared_ptr<Expr> otherwise;
@@ -154,17 +154,17 @@ struct Guard {
 
 struct RouteDecl {
     std::string              method;    // "GET", "POST", ..., "SSE", "WS"
-    std::string              pattern;   // "/users/:id", ya con el prefijo del grupo
+    std::string              pattern;   // "/users/:id", already with the group prefix
     std::vector<Param>       params;
-    std::vector<std::string> origins;   // solo ws
-    std::vector<Guard>       guards;    // acumuladas de los grupos que la envuelven
+    std::vector<std::string> origins;   // ws only
+    std::vector<Guard>       guards;    // accumulated from the enclosing groups
     Block                    body;
     SourceLoc                loc;
     SourceLoc                pattern_loc;
 };
 
-// `on error 404:` / `on error:` — que servir cuando el motor produce un codigo
-// de error.  code == 0 es el manejador global.
+// `on error 404:` / `on error:` — what to serve when the engine produces an
+// error code.  code == 0 is the global handler.
 struct ErrorDecl {
     int       code = 0;
     Block     body;
@@ -186,15 +186,15 @@ struct AppDecl {
     std::vector<StaticMount> statics;
     bool                     docs = false, health = false, metrics = false;
 
-    // session: y jwt: — los secretos se resuelven al compilar, normalmente con
-    // env(), para que no acaben escritos en el .lum.
+    // session: and jwt: — the secrets are resolved at compile time, usually
+    // with env(), so they do not end up written in the .lum.
     std::string session_secret;
     int         session_max_age = 86400;
     bool        session_secure  = true;
     std::string jwt_secret;
     std::string jwt_issuer;
 
-    // Bloques de configuracion de modulos: nombre -> clave -> valor.
+    // Module configuration blocks: name -> key -> value.
     std::map<std::string, std::map<std::string, std::string>> modules;
 
     SourceLoc                loc;
@@ -202,7 +202,7 @@ struct AppDecl {
 };
 
 struct Program {
-    // Modulos importados.  Solo se puede usar `sqlite.query(...)` si hay un
+    // Imported modules.  `sqlite.query(...)` can only be used if there is an
     // `import sqlite`.
     std::set<std::string>  imports;
     std::vector<ClassDecl> classes;

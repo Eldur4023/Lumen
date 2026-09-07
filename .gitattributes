@@ -1,12 +1,13 @@
-# Los guiones de prueba los ejecuta bash —dentro de WSL, en el caso de un
-# Windows con el repo montado en /mnt/c—, y bash NO tolera el retorno de carro:
-# un fichero con CRLF falla con "$'\r': command not found" en la primera linea.
+# The test scripts are run by bash —inside WSL, in the case of a Windows box
+# with the repo mounted on /mnt/c— and bash does NOT tolerate carriage returns:
+# a file with CRLF fails with "$'\r': command not found" on the first line.
 #
-# Sin esto, en un clon de Windows con core.autocrlf=true se sacan con CRLF y la
-# suite no arranca.  Peor: git los sigue viendo limpios, porque normaliza al
-# comparar, asi que el problema no aparece en `git status` y cuesta de ver.
+# Without this, on a Windows clone with core.autocrlf=true they are checked out
+# with CRLF and the suite does not start.  Worse: git keeps seeing them as
+# clean, because it normalizes when comparing, so the problem never shows up in
+# `git status` and is hard to spot.
 *.sh text eol=lf
 
-# Lo mismo para lo que se carga desde bash o desde un cliente de base de datos.
+# The same for whatever is loaded from bash or from a database client.
 *.lum text eol=lf
 *.sql  text eol=lf

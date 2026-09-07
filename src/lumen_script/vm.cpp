@@ -4,8 +4,8 @@ namespace lumen_script {
 
 namespace {
 
-// Falla con un mensaje que dice los tipos implicados: un error de ejecucion en
-// un .lum tiene que ser tan legible como uno de compilacion.
+// Fails with a message naming the types involved: a runtime error in a .lum
+// has to be as readable as a compile-time one.
 VM::Result fail(std::string msg, SourceLoc loc) {
     VM::Result r;
     r.status    = VM::Status::Error;
@@ -18,7 +18,7 @@ bool numeric_pair(const Value& a, const Value& b) {
     return a.is_num() && b.is_num();
 }
 
-// Comparacion de orden: solo entre numeros, o entre cadenas.
+// Ordering comparison: only between numbers, or between strings.
 bool compare(const Value& a, const Value& b, Op op, bool& ok) {
     ok = true;
     if (numeric_pair(a, b)) {
@@ -70,14 +70,14 @@ VM::Result VM::start(const Chunk& chunk, std::vector<Value> params, NativeCtx& c
 }
 
 VM::Result VM::resume(Value awaited, NativeCtx& ctx) {
-    // El valor esperado ocupa el hueco que dejo la expresion `await`.
+    // The awaited value takes the slot the `await` expression left behind.
     push(std::move(awaited));
     return execute(ctx);
 }
 
 namespace {
 
-// El try mas interno que cubre `pc`: entre varios anidados, el de rango menor.
+// The innermost try covering `pc`: among nested ones, the narrowest range.
 const TryRange* find_handler(const Chunk& chunk, size_t pc) {
     const TryRange* best = nullptr;
     for (const auto& r : chunk.try_ranges) {
@@ -95,14 +95,14 @@ Value error_value(const std::string& message) {
 
 } // namespace
 
-// Ejecuta y, si algo falla dentro de un `try`, salta a su `catch` y sigue.
-// El error se entrega como un valor mas, en la cima de la pila.
+// Runs and, if something fails inside a `try`, jumps to its `catch` and goes on.
+// The error is delivered as one more value, on top of the stack.
 VM::Result VM::execute(NativeCtx& ctx) {
     Result r = run_until_error(ctx);
     while (r.status == Status::Error) {
-        // El pc del marco ya apunta a la siguiente instruccion, asi que la que
-        // fallo es la anterior.  Un error sube por los marcos hasta encontrar un try que lo cubra: si
-        // la funcion llamada no lo maneja, puede manejarlo quien la llamo.
+        // The frame's pc already points at the next instruction, so the one
+        // that failed is the previous one.  An error climbs the frames until it
+        // finds a try covering it: if the callee does not handle it, the caller may.
         const TryRange* h = nullptr;
         while (!frames_.empty()) {
             Frame& f = frames_.back();
@@ -114,9 +114,9 @@ VM::Result VM::execute(NativeCtx& ctx) {
         }
         if (!h) return r;
 
-        // En un limite de sentencia la pila de operandos esta vacia, que es
-        // donde puede empezar un try; limpiarla deja el estado consistente sin
-        // tener que anotar profundidades.
+        // At a statement boundary the operand stack is empty, which is where a
+        // try can begin; clearing it leaves the state consistent without having
+        // to record depths.
         stack_.resize(frames_.back().stack_base);
         push(error_value(r.error));
         frames_.back().pc = h->catch_pc;
@@ -125,9 +125,45 @@ VM::Result VM::execute(NativeCtx& ctx) {
     return r;
 }
 
-// Un opcode especializado se comporta exactamente como su generico cuando la
-// guarda de tipo falla.
-static Op sin_especializar(Op op) {
+// The language's '+', in a single place: both Op::Add and the fallback path of
+// Op::ConcatN use it, so collapsing a chain cannot change either the result or
+// the error message.
+//
+// '+' demands that BOTH sides be of the same type.  Two strings concatenate,
+// two numbers add, two lists join.
+//
+// 1 + "1" is an error, not "11": operating across different types is exactly
+// what Lumen Script does not want to inherit from JavaScript.  To join a number
+// to a string you have to say so: "n = " + str(n).
+static bool add_values(const Value& a, const Value& b, Value& out, std::string& err) {
+    if (a.is_str() && b.is_str()) {
+        out = Value::str(a.as_str() + b.as_str());
+        return true;
+    }
+    if (a.is_str() || b.is_str()) {
+        err = std::string("cannot add ") + a.type_name() + " and " +
+              b.type_name() + "; to concatenate use str(): \"...\" + str(x)";
+        return false;
+    }
+    if (numeric_pair(a, b)) {
+        out = (a.is_int() && b.is_int())
+                  ? Value::integer(a.as_int() + b.as_int())
+                  : Value::real(a.as_float() + b.as_float());
+        return true;
+    }
+    if (a.is_list() && b.is_list()) {
+        Value::List l = a.as_list();
+        for (const auto& v : b.as_list()) l.push_back(v);
+        out = Value::list(std::move(l));
+        return true;
+    }
+    err = std::string("cannot add ") + a.type_name() + " and " + b.type_name();
+    return false;
+}
+
+// A specialized opcode behaves exactly like its generic form when the type
+// guard fails.
+static Op generic_form_of(Op op) {
     switch (op) {
         case Op::AddInt: return Op::Add;
         case Op::SubInt: return Op::Sub;
@@ -141,15 +177,15 @@ static Op sin_especializar(Op op) {
 }
 
 VM::Result VM::run_until_error(NativeCtx& ctx) {
-    // El contador se reinicia en cada tramo: un bucle de SSE legitimo puede
-    // estar horas vivo, pero entre dos suspensiones no debe dar mas de kStepLimit.
+    // The counter resets on every stretch: a legitimate SSE loop can be alive
+    // for hours, but between two suspensions it must not exceed kStepLimit.
     long long steps = 0;
 
     while (!frames_.empty()) {
         Frame&       frame = frames_.back();
         const Chunk& chunk = *frame.chunk;
 
-        // Una funcion que se acaba sin `return` devuelve null a quien la llamo.
+        // A function that runs off the end returns null to its caller.
         if (frame.pc >= chunk.code.size()) {
             size_t lbase = frame.locals_base, sbase = frame.stack_base;
             frames_.pop_back();
@@ -179,52 +215,71 @@ VM::Result VM::run_until_error(NativeCtx& ctx) {
                 pop();
                 break;
 
-            case Op::Add: generico_add: {
+            case Op::Add: generic_add: {
                 Value b = pop(), a = pop();
-                // '+' exige que AMBOS lados sean del mismo tipo. Dos cadenas
-                // concatenan, dos numeros suman, dos listas se unen.
-                //
-                // 1 + "1" es un error, no "11": operar entre tipos distintos es
-                // justo lo que Lumen Script no quiere heredar de JavaScript. Para unir
-                // un numero a una cadena hay que decirlo: "n = " + str(n).
-                if (a.is_str() && b.is_str()) {
-                    push(Value::str(a.as_str() + b.as_str()));
-                } else if (a.is_str() || b.is_str()) {
-                    return fail(std::string("no se puede sumar ") + a.type_name() +
-                                " y " + b.type_name() +
-                                "; para concatenar usa str(): \"...\" + str(x)", in.loc);
-                } else if (numeric_pair(a, b)) {
-                    if (a.is_int() && b.is_int())
-                        push(Value::integer(a.as_int() + b.as_int()));
-                    else
-                        push(Value::real(a.as_float() + b.as_float()));
-                } else if (a.is_list() && b.is_list()) {
-                    Value::List out = a.as_list();
-                    for (const auto& v : b.as_list()) out.push_back(v);
-                    push(Value::list(std::move(out)));
-                } else {
-                    return fail(std::string("no se puede sumar ") + a.type_name() +
-                                " y " + b.type_name(), in.loc);
-                }
+                Value       r;
+                std::string err;
+                if (!add_values(a, b, r, err)) return fail(err, in.loc);
+                push(std::move(r));
                 break;
             }
 
-            case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod: generico_arit: {
-                const Op og = sin_especializar(in.op);
+            // A chain of '+' already collapsed by the emitter.
+            case Op::ConcatN: {
+                const size_t n    = in.operand;
+                const size_t base = stack_.size() - n;
+
+                // Guard: it is only concatenation if ALL of them are strings.
+                // The total is measured on the way, which is what allows one reserve.
+                bool   todas = true;
+                size_t total = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    if (!stack_[base + i].is_str()) { todas = false; break; }
+                    total += stack_[base + i].as_str().size();
+                }
+
+                if (todas) {
+                    std::string out;
+                    out.reserve(total);
+                    for (size_t i = 0; i < n; ++i) out += stack_[base + i].as_str();
+                    stack_.resize(base);
+                    push(Value::str(std::move(out)));
+                    break;
+                }
+
+                // If they are not, it folds with the same generic '+' and to the
+                // left: same result and same error as without collapsing.
+                Value acc = std::move(stack_[base]);
+                for (size_t i = 1; i < n; ++i) {
+                    Value       r;
+                    std::string err;
+                    if (!add_values(acc, stack_[base + i], r, err)) {
+                        stack_.resize(base);
+                        return fail(err, in.loc);
+                    }
+                    acc = std::move(r);
+                }
+                stack_.resize(base);
+                push(std::move(acc));
+                break;
+            }
+
+            case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod: generic_arith: {
+                const Op og = generic_form_of(in.op);
                 Value b = pop(), a = pop();
                 if (!numeric_pair(a, b))
-                    return fail(std::string("operacion aritmetica entre ") +
-                                a.type_name() + " y " + b.type_name(), in.loc);
+                    return fail(std::string("arithmetic between ") +
+                                a.type_name() + " and " + b.type_name(), in.loc);
 
                 bool ints = a.is_int() && b.is_int();
                 if (og == Op::Mod) {
-                    if (!ints) return fail("'%' solo aplica a enteros", in.loc);
-                    if (b.as_int() == 0) return fail("modulo por cero", in.loc);
+                    if (!ints) return fail("'%' only applies to integers", in.loc);
+                    if (b.as_int() == 0) return fail("modulo by zero", in.loc);
                     push(Value::integer(a.as_int() % b.as_int()));
                     break;
                 }
                 if (og == Op::Div) {
-                    if (b.as_float() == 0) return fail("division por cero", in.loc);
+                    if (b.as_float() == 0) return fail("division by zero", in.loc);
                     if (ints && a.as_int() % b.as_int() == 0)
                         push(Value::integer(a.as_int() / b.as_int()));
                     else
@@ -245,19 +300,19 @@ VM::Result VM::run_until_error(NativeCtx& ctx) {
                 Value a = pop();
                 if (a.is_int())        push(Value::integer(-a.as_int()));
                 else if (a.is_float()) push(Value::real(-a.as_float()));
-                else return fail(std::string("no se puede negar ") + a.type_name(), in.loc);
+                else return fail(std::string("cannot negate ") + a.type_name(), in.loc);
                 break;
             }
 
             case Op::Eq: { Value b = pop(), a = pop(); push(Value::boolean(a.equals(b)));  break; }
             case Op::Ne: { Value b = pop(), a = pop(); push(Value::boolean(!a.equals(b))); break; }
 
-            case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: generico_cmp: {
+            case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: generic_cmp: {
                 Value b = pop(), a = pop();
                 bool ok = false;
-                bool r  = compare(a, b, sin_especializar(in.op), ok);
+                bool r  = compare(a, b, generic_form_of(in.op), ok);
                 if (!ok)
-                    return fail(std::string("no se pueden comparar ") + a.type_name() +
+                    return fail(std::string("cannot compare ") + a.type_name() +
                                 " y " + b.type_name(), in.loc);
                 push(Value::boolean(r));
                 break;
@@ -267,24 +322,24 @@ VM::Result VM::run_until_error(NativeCtx& ctx) {
                 push(Value::boolean(!pop().truthy()));
                 break;
 
-            // ── Enteros conocidos al compilar ────────────────────────────────
+            // ── Integers known at compile time ──────────────────────────────
             //
-            // El emisor las pone cuando puede demostrar que los dos lados son
-            // `int`.  Se ahorran la cascada de comprobaciones de tipo del
-            // camino generico y las dos copias de Value: se mira la cima sin
-            // sacarla.
+            // The emitter places these when it can prove both sides are `int`.
+            // They skip the generic path's cascade of type checks and the two
+            // Value copies: the top is read without popping it.
             //
-            // La guarda esta porque el tipo declarado no se impone al asignar.
-            // Si no cuadra, cae al generico y el programa se comporta igual,
-            // con el mismo mensaje de error.
+            //
+            // The guard is there because the declared type is not enforced on
+            // assignment.  If it does not match, it falls to the generic path and
+            // the program behaves the same, with the same error message.
             case Op::AddInt: case Op::SubInt: case Op::MulInt:
             case Op::LtInt:  case Op::LeInt:  case Op::GtInt: case Op::GeInt: {
                 const Value& vb = stack_[stack_.size() - 1];
                 const Value& va = stack_[stack_.size() - 2];
                 if (!va.is_int() || !vb.is_int()) {
-                    if (in.op == Op::AddInt) goto generico_add;
-                    if (in.op == Op::SubInt || in.op == Op::MulInt) goto generico_arit;
-                    goto generico_cmp;
+                    if (in.op == Op::AddInt) goto generic_add;
+                    if (in.op == Op::SubInt || in.op == Op::MulInt) goto generic_arith;
+                    goto generic_cmp;
                 }
                 const long long x = va.as_int(), y = vb.as_int();
                 stack_.pop_back();
@@ -302,12 +357,12 @@ VM::Result VM::run_until_error(NativeCtx& ctx) {
             }
 
             case Op::Jump:
-                // El contador solo se mira aqui.  Un bucle infinito necesita un
-                // salto hacia atras por definicion, y la recursion infinita la
-                // corta antes el tope de marcos: comprobarlo en cada
-                // instruccion era una rama por instruccion para nada.
+                // The counter is only checked here.  An infinite loop needs a
+                // backward jump by definition, and infinite recursion is cut
+                // earlier by the frame cap: checking on every instruction was a
+                // branch per instruction for nothing.
                 if (in.operand <= frame.pc && ++steps > kStepLimit)
-                    return fail("el handler supero el limite de pasos: bucle infinito?",
+                    return fail("handler exceeded the step limit: infinite loop?",
                                 in.loc);
                 frame.pc = in.operand;
                 break;
@@ -333,22 +388,22 @@ VM::Result VM::run_until_error(NativeCtx& ctx) {
             }
 
             case Op::MakeDict: {
-                // Los pares ya estan en la pila en orden clave,valor: se leen
-                // ahi mismo.  Antes se volcaban a un vector temporal, que era
-                // una asignacion mas por diccionario, y el diccionario crecia a
-                // saltos porque nadie le decia cuantas claves iban a entrar.
+                // The pairs are already on the stack in key,value order: they are
+                // read right there.  They used to be dumped into a temporary
+                // vector, which was one more allocation per dictionary, and the
+                // dictionary grew in steps because nobody told it the key count.
                 const size_t n    = in.operand;
                 const size_t base = stack_.size() - n * 2;
 
                 Value::Dict d;
-                d.reservar(n);
+                d.reserve(n);
                 for (size_t i = 0; i < n; ++i) {
                     Value& k = stack_[base + i * 2];
                     Value& v = stack_[base + i * 2 + 1];
                     if (!k.is_str()) {
                         std::string t = k.type_name();
                         stack_.resize(base);
-                        return fail("la clave de un Dict tiene que ser string, no " + t,
+                        return fail("a Dict key must be a string, not " + t,
                                     in.loc);
                     }
                     d[k.as_str()] = std::move(v);
@@ -362,27 +417,27 @@ VM::Result VM::run_until_error(NativeCtx& ctx) {
                 Value idx = pop(), obj = pop();
                 if (obj.is_list()) {
                     if (!idx.is_int())
-                        return fail("el indice de una List tiene que ser int", in.loc);
+                        return fail("a List index must be an int", in.loc);
                     long long i = idx.as_int();
                     auto& l = obj.as_list();
                     if (i < 0 || i >= (long long)l.size())
-                        return fail("indice fuera de rango: " + std::to_string(i) +
-                                    " (tamano " + std::to_string(l.size()) + ")", in.loc);
+                        return fail("index out of range: " + std::to_string(i) +
+                                    " (size " + std::to_string(l.size()) + ")", in.loc);
                     push(l[static_cast<size_t>(i)]);
                 } else if (obj.is_dict()) {
                     if (!idx.is_str())
-                        return fail("la clave de un Dict tiene que ser string", in.loc);
+                        return fail("a Dict key must be a string", in.loc);
                     auto& d  = obj.as_dict();
                     auto  it = d.find(idx.as_str());
                     push(it == d.end() ? Value::null() : it->second);
                 } else {
-                    return fail(std::string("no se puede indexar ") + obj.type_name(), in.loc);
+                    return fail(std::string("cannot index ") + obj.type_name(), in.loc);
                 }
                 break;
             }
 
-            // Un `for` siempre recorre una lista: un Dict se recorre por sus
-            // claves, que es lo que espera quien viene de Python.
+            // A `for` always walks a list: a Dict is walked by its keys, which is
+            // what someone coming from Python expects.
             case Op::IterList: {
                 Value v = pop();
                 if (v.is_list()) { push(std::move(v)); break; }
@@ -393,16 +448,16 @@ VM::Result VM::run_until_error(NativeCtx& ctx) {
                     push(Value::list(std::move(keys)));
                     break;
                 }
-                return fail(std::string("no se puede recorrer ") + v.type_name() +
-                            " con 'for'", in.loc);
+                return fail(std::string("cannot iterate over ") + v.type_name() +
+                            " with 'for'", in.loc);
             }
 
             case Op::GetMember: {
                 Value obj = pop();
                 const std::string& name = chunk.constants[in.operand].as_str();
                 if (!obj.is_dict())
-                    return fail(std::string("'") + name + "' sobre " + obj.type_name() +
-                                ", que no tiene campos", in.loc);
+                    return fail(std::string("'") + name + "' on " + obj.type_name() +
+                                ", which has no fields", in.loc);
                 auto& d  = obj.as_dict();
                 auto  it = d.find(name);
                 push(it == d.end() ? Value::null() : it->second);
@@ -439,9 +494,9 @@ VM::Result VM::run_until_error(NativeCtx& ctx) {
                 break;
             }
 
-            // El VM no sabe esperar: recoge los argumentos, se detiene, y deja
-            // que el driver haga el co_await de verdad sobre el motor.  Al
-            // volver, resume() apila el resultado y el marco sigue donde estaba.
+            // The VM does not know how to wait: it gathers the arguments, stops,
+            // and lets the driver do the real co_await on the engine.  On the way
+            // back, resume() pushes the result and the frame carries on.
             case Op::CallAsync: {
                 int id   = static_cast<int>(in.operand >> 8);
                 int argc = static_cast<int>(in.operand & 0xFF);
@@ -460,19 +515,19 @@ VM::Result VM::run_until_error(NativeCtx& ctx) {
                 Value obj = pop();
                 if (obj.is_list()) {
                     if (!idx.is_int())
-                        return fail("el indice de una List tiene que ser int", in.loc);
+                        return fail("a List index must be an int", in.loc);
                     long long i = idx.as_int();
                     auto& l = obj.as_list();
                     if (i < 0 || i >= (long long)l.size())
-                        return fail("indice fuera de rango: " + std::to_string(i) +
-                                    " (tamano " + std::to_string(l.size()) + ")", in.loc);
+                        return fail("index out of range: " + std::to_string(i) +
+                                    " (size " + std::to_string(l.size()) + ")", in.loc);
                     l[static_cast<size_t>(i)] = v;
                 } else if (obj.is_dict()) {
                     if (!idx.is_str())
-                        return fail("la clave de un Dict tiene que ser string", in.loc);
+                        return fail("a Dict key must be a string", in.loc);
                     obj.as_dict()[idx.as_str()] = v;
                 } else {
-                    return fail(std::string("no se puede indexar ") + obj.type_name(),
+                    return fail(std::string("cannot index ") + obj.type_name(),
                                 in.loc);
                 }
                 push(std::move(v));
@@ -484,10 +539,10 @@ VM::Result VM::run_until_error(NativeCtx& ctx) {
                 Value obj = pop();
                 const std::string& name = chunk.constants[in.operand].as_str();
                 if (!obj.is_dict())
-                    return fail(std::string("no se puede asignar '") + name +
-                                "' sobre " + obj.type_name(), in.loc);
-                // El Dict se comparte por shared_ptr, asi que la escritura la ve
-                // quien tenga el mismo valor.
+                    return fail(std::string("cannot assign '") + name +
+                                "' on " + obj.type_name(), in.loc);
+                // The Dict is shared by refcount, so the write is seen by anyone
+                // holding the same value.
                 obj.as_dict()[name] = v;
                 push(std::move(v));
                 break;
@@ -498,10 +553,10 @@ VM::Result VM::run_until_error(NativeCtx& ctx) {
                 int    argc  = static_cast<int>(in.operand & 0xFF);
 
                 if (!functions_ || index >= functions_->size())
-                    return fail("funcion no encontrada", in.loc);
+                    return fail("function not found", in.loc);
                 if (frames_.size() >= kMaxFrames)
-                    return fail("demasiada recursion: mas de " +
-                                std::to_string(kMaxFrames) + " llamadas anidadas",
+                    return fail("too much recursion: more than " +
+                                std::to_string(kMaxFrames) + " nested calls",
                                 in.loc);
 
                 const Chunk& callee = *(*functions_)[index];

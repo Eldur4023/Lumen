@@ -15,7 +15,7 @@ std::string_view SourceFile::line(int n) const {
     }
     size_t end = text.find('\n', start);
     if (end == std::string::npos) end = text.size();
-    // Quita el \r de finales de linea de Windows.
+    // Strips the \r from Windows line endings.
     if (end > start && text[end - 1] == '\r') --end;
     return std::string_view(text).substr(start, end - start);
 }
@@ -41,8 +41,8 @@ std::string DiagnosticBag::format(const std::vector<const SourceFile*>& files) c
                 std::string num = std::to_string(d.loc.line);
                 out += "  " + num + " | ";
                 out += std::string(text) + "\n";
-                // El cursor va bajo la columna; los tabs del fuente se
-                // reproducen para que quede alineado.
+                // The cursor goes under the column; the tabs of the source are
+                // reproduced so it stays aligned.
                 out += "  " + std::string(num.size(), ' ') + " | ";
                 for (int i = 0; i + 1 < d.loc.col && i < (int)text.size(); ++i)
                     out += (text[i] == '\t') ? '\t' : ' ';

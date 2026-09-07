@@ -1,5 +1,5 @@
-// Herramienta de desarrollo: vuelca los tokens de un .lum.
-// Sirve para verificar el lexer sin depender del parser.
+// Development tool: dumps the tokens of a .lum.
+// Useful for checking the lexer without depending on the parser.
 #include <lumen_script/lexer.hpp>
 #include <fstream>
 #include <iostream>
@@ -7,7 +7,7 @@
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "uso: dump_tokens <fichero.lum> [--quiet]\n";
+        std::cerr << "uso: dump_tokens <file.lum> [--quiet]\n";
         return 2;
     }
     bool quiet = (argc > 2 && std::string(argv[2]) == "--quiet");
@@ -16,7 +16,7 @@ int main(int argc, char** argv) {
     src.path = argv[1];
     {
         std::ifstream f(src.path, std::ios::binary);
-        if (!f) { std::cerr << "no se puede abrir: " << src.path << "\n"; return 2; }
+        if (!f) { std::cerr << "cannot open: " << src.path << "\n"; return 2; }
         std::ostringstream ss; ss << f.rdbuf();
         src.text = ss.str();
     }

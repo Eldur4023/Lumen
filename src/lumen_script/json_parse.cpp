@@ -7,14 +7,14 @@
 
 namespace lumen_script {
 
-// ─── Parseo de JSON ──────────────────────────────────────────────────────────
+// ─── JSON parsing ────────────────────────────────────────────────────────────
 //
-// Descenso recursivo pequeno y estricto que produce un Value directamente, sin
-// arbol intermedio.  No admite comentarios, ni comas colgando, ni NaN, ni
-// basura detras del documento: solo JSON.
+// A small, strict recursive descent that produces a Value directly, with no
+// intermediate tree.  It accepts no comments, no trailing commas, no NaN and
+// no garbage after the document: only JSON.
 //
-// Lo que entra por aqui viene de la red, asi que hay tope de anidamiento y no
-// se da nada por bueno.
+// What comes in here arrives from the network, so there is a nesting cap and
+// nothing is taken on trust.
 
 namespace {
 
@@ -24,14 +24,14 @@ public:
 
     bool documento(Value& out) {
         espacios();
-        if (!valor(out, 0)) return false;
+        if (!value(out, 0)) return false;
         espacios();
         return i_ == t_.size();
     }
 
 private:
-    // Sin tope, un documento con miles de corchetes anidados se lleva por
-    // delante la pila del hilo antes de que nadie pueda quejarse.
+    // Without a cap, a document with thousands of nested brackets takes the
+    // thread stack down before anyone can complain.
     static constexpr int kMaxProfundidad = 200;
 
     std::string_view t_;
@@ -54,7 +54,7 @@ private:
         return true;
     }
 
-    bool valor(Value& out, int prof) {
+    bool value(Value& out, int prof) {
         if (prof > kMaxProfundidad || i_ >= t_.size()) return false;
         switch (t_[i_]) {
             case 'n':
@@ -71,17 +71,17 @@ private:
                 return true;
             case '"': {
                 std::string s;
-                if (!cadena(s)) return false;
+                if (!string_value(s)) return false;
                 out = Value::str(std::move(s));
                 return true;
             }
-            case '[': return lista(out, prof);
-            case '{': return objeto(out, prof);
-            default:  return numero(out);
+            case '[': return list_(out, prof);
+            case '{': return object(out, prof);
+            default:  return number(out);
         }
     }
 
-    bool lista(Value& out, int prof) {
+    bool list_(Value& out, int prof) {
         ++i_;                                   // '['
         Value::List l;
         espacios();
@@ -93,7 +93,7 @@ private:
         for (;;) {
             espacios();
             Value v;
-            if (!valor(v, prof + 1)) return false;
+            if (!value(v, prof + 1)) return false;
             l.push_back(std::move(v));
             espacios();
             if (i_ >= t_.size()) return false;
@@ -105,7 +105,7 @@ private:
         return true;
     }
 
-    bool objeto(Value& out, int prof) {
+    bool object(Value& out, int prof) {
         ++i_;                                   // '{'
         Value::Dict d;
         espacios();
@@ -118,13 +118,13 @@ private:
             espacios();
             if (i_ >= t_.size() || t_[i_] != '"') return false;
             std::string k;
-            if (!cadena(k)) return false;
+            if (!string_value(k)) return false;
             espacios();
             if (i_ >= t_.size() || t_[i_] != ':') return false;
             ++i_;
             espacios();
             Value v;
-            if (!valor(v, prof + 1)) return false;
+            if (!value(v, prof + 1)) return false;
             d[k] = std::move(v);
             espacios();
             if (i_ >= t_.size()) return false;
@@ -136,7 +136,7 @@ private:
         return true;
     }
 
-    // Un punto de codigo a UTF-8.
+    // A code point to UTF-8.
     static void utf8(uint32_t cp, std::string& out) {
         if (cp < 0x80) {
             out.push_back(static_cast<char>(cp));
@@ -170,19 +170,19 @@ private:
         return true;
     }
 
-    bool cadena(std::string& out) {
-        ++i_;                                   // comilla de apertura
+    bool string_value(std::string& out) {
+        ++i_;                                   // opening quote
 
-        // Camino rapido: lo que va hasta la primera barra o comilla se copia de
-        // una vez.  La inmensa mayoria de las cadenas acaban aqui.
-        const size_t inicio = i_;
+        // Fast path: what runs up to the first backslash or quote is copied in
+        // one go.  The vast majority of strings end here.
+        const size_t start = i_;
         while (i_ < t_.size()) {
             const char c = t_[i_];
             if (c == '"' || c == '\\') break;
-            if (static_cast<unsigned char>(c) < 0x20) return false;  // control sin escapar
+            if (static_cast<unsigned char>(c) < 0x20) return false;  // unescaped control character
             ++i_;
         }
-        out.append(t_.data() + inicio, i_ - inicio);
+        out.append(t_.data() + start, i_ - start);
         if (i_ >= t_.size()) return false;
         if (t_[i_] == '"') { ++i_; return true; }
 
@@ -208,8 +208,8 @@ private:
                 case 'u': {
                     uint32_t cp = 0;
                     if (!hex4(cp)) return false;
-                    // Un subrogado alto tiene que venir seguido de su bajo; uno
-                    // suelto no representa nada y se rechaza.
+                    // A high surrogate has to be followed by its low one; a
+                    // stray one represents nothing and is rejected.
                     if (cp >= 0xD800 && cp <= 0xDBFF) {
                         if (i_ + 1 >= t_.size() || t_[i_] != '\\' || t_[i_ + 1] != 'u')
                             return false;
@@ -229,8 +229,8 @@ private:
         }
     }
 
-    bool numero(Value& out) {
-        const size_t inicio = i_;
+    bool number(Value& out) {
+        const size_t start = i_;
         if (i_ < t_.size() && t_[i_] == '-') ++i_;
         if (i_ >= t_.size()) return false;
 
@@ -257,7 +257,7 @@ private:
             while (i_ < t_.size() && digito(t_[i_])) ++i_;
         }
 
-        const char* p = t_.data() + inicio;
+        const char* p = t_.data() + start;
         const char* f = t_.data() + i_;
         if (!real) {
             long long n = 0;
@@ -266,7 +266,7 @@ private:
                 out = Value::integer(n);
                 return true;
             }
-            // Se sale del rango de long long: cae a double, como hace todo el mundo.
+            // Out of long long range: falls to double, as everyone does.
         }
         double d = 0;
         const auto r = std::from_chars(p, f, d);
@@ -278,8 +278,8 @@ private:
 
 } // namespace
 
-bool Value::parse_json(std::string_view texto, Value& out) {
-    Parser p(texto);
+bool Value::parse_json(std::string_view text, Value& out) {
+    Parser p(text);
     return p.documento(out);
 }
 

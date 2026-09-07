@@ -9,67 +9,67 @@
 #include <lumen/router.hpp>
 #include "bytecode.hpp"
 #include "ast.hpp"
-#include "plantilla.hpp"
+#include "template.hpp"
 #include "diagnostic.hpp"
 
 namespace lumen_script {
 
-// Un modulo compilado: el resultado de leer un conjunto de .lum.
+// A compiled module: the result of reading a set of .lum files.
 //
-// Es la unidad que se intercambia en caliente.  Recargar es construir un
-// Module nuevo y publicar el shared_ptr; si la compilacion falla, el anterior
-// sigue en su sitio y no se toca nada.
+// It is the unit that gets hot-swapped.  Reloading is building a new Module
+// and publishing the shared_ptr; if compilation fails, the previous one stays
+// in place and nothing is touched.
 struct Module {
     std::vector<std::unique_ptr<SourceFile>> files;
     Program        program;
     lumen::Router router;
 
-    // Funciones de usuario compiladas, indexadas por orden de declaracion.
+    // Compiled user functions, indexed by declaration order.
     FunctionTable functions;
 
-    // Plantillas compiladas, indexadas por el orden en que el emisor las
-    // encontro.  Cada render() del fuente tiene la suya, compilada contra las
-    // claves concretas que le pasa esa llamada.
-    std::vector<Plantilla> plantillas;
+    // Compiled templates, indexed by the order the emitter found them in.
+    // Every render() in the source has its own, compiled against the specific
+    // keys that call passes it.
+    std::vector<Template> templates;
 
-    // Especificacion OpenAPI generada desde el AST al compilar.
-    std::string    openapi;      // ya serializado al compilar
+    // OpenAPI specification generated from the AST at compile time.
+    std::string    openapi;      // already serialized at compile time
 
-    // Manejadores de `on error`, por codigo.  La clave 0 es el global.
+    // `on error` handlers, by code.  Key 0 is the global one.
     std::map<int, std::shared_ptr<Chunk>> error_handlers;
 
-    // Reparto entre los dos niveles de ruta (ver LUMEN-2.0.md, seccion 2):
-    // las declarativas no ejecutan ni un paso de bytecode.
+    // Split between the two route levels: the declarative ones do not run a
+    // single bytecode step.
     int declarative_routes = 0;
     int vm_routes          = 0;
 
-    // mtimes de los ficheros compilados, para detectar cambios.
+    // mtimes of the compiled files, to detect changes.
     std::vector<std::pair<std::filesystem::path,
                           std::filesystem::file_time_type>> stamps;
 };
 
-// Resuelve los argumentos de linea de comandos al conjunto de ficheros a
+// Resolves the command line arguments to the set of files to compile:
 // compilar:
-//   • un fichero  → solo ese
-//   • varios      → solo esos
-//   • un directorio → todos los .lum que contenga, recursivamente
+//   • one file      → just that one
+//   • several       → just those
+//   • a directory   → every .lum inside it, recursively
 //
-// Devuelve false y escribe en `error` si algun argumento no existe o si un
+// Returns false and writes to `error` if an argument is missing or if a
 // directorio no contiene ningun .lum.
 bool resolve_inputs(const std::vector<std::string>& args,
                     std::vector<std::filesystem::path>& out,
                     std::string& error);
 
-// Lee, lexa, parsea y construye la tabla de rutas.
+// Reads, lexes, parses and builds the route table.
 //
-// SIEMPRE devuelve un Module, incluso si hubo errores: los SourceLoc apuntan a
-// los SourceFile que este Module posee, asi que destruirlo antes de formatear
-// los diagnosticos dejaria punteros colgando.  El exito se comprueba con
-// `diags.empty()`, y un modulo con errores simplemente no se publica.
+// It ALWAYS returns a Module, even if there were errors: the SourceLocs point
+// at the SourceFiles this Module owns, so destroying it before formatting the
+// diagnostics would leave dangling pointers.  Success is checked with
+// `diags.empty()`, and a module with errors is simply not published.
 std::shared_ptr<Module> compile(const std::vector<std::filesystem::path>& inputs,
                                 DiagnosticBag& diags);
 
-// Formatea los diagnosticos de un intento fallido usando los ficheros leidos.
+// Formats the diagnostics of a failed attempt using the files that were read.
 std::string format_errors(const DiagnosticBag& diags,
                           const std::vector<std::unique_ptr<SourceFile>>& files);
 

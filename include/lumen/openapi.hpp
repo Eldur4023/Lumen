@@ -4,12 +4,12 @@
 
 namespace lumen {
 
-// La pagina de Swagger UI, y nada mas.
+// The Swagger UI page, and nothing else.
 //
-// El documento OpenAPI ya no se deduce de las firmas de C++ con plantillas: lo
-// genera el frontend de Lumen Script a partir del AST del .lum, que conoce los nombres
-// de los parametros y las clases.  De este fichero solo sobrevive el HTML que
-// sirve la UI contra ese documento.
+// The OpenAPI document is no longer deduced from C++ signatures with
+// templates: the Lumen Script frontend generates it from the .lum AST, which
+// knows the parameter names and the classes.  All that survives of this file
+// is the HTML that serves the UI against that document.
 
 // ─── Swagger UI HTML (CDN) ───────────────────────────────────────────────────
 // Serves a self-contained Swagger UI page from unpkg CDN.

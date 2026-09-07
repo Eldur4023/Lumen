@@ -266,7 +266,7 @@ static void signal_handler(int) {
 // ── App::run ──────────────────────────────────────────────────────────────────
 
 // ── App::prepare ─────────────────────────────────────────────────────────────
-// Ordena los montajes estaticos una sola vez (idempotente).
+// Sorts the static mounts once (idempotent).
 
 void App::prepare() {
     if (prepared_) return;
@@ -295,14 +295,22 @@ Task<void> App::handle_request(Request& req, Response& res) {
     // object. advanced is also heap-allocated for the same reason.
     using CallNext = std::function<Task<void>(size_t)>;
     auto call_next = std::make_shared<CallNext>();
-    *call_next = [this, &req, &res, call_next](size_t i) -> Task<void> {
+    // The lambda is stored INSIDE *call_next, so it holds a weak reference:
+    // capturing the shared_ptr here would make the object own itself, and the
+    // refcount would never reach zero -- one leaked control block and closure
+    // per request. The NextFn handed to the middleware does take a strong
+    // reference, which is what keeps it from dangling if it outlives us.
+    *call_next = [this, &req, &res,
+                  weak = std::weak_ptr<CallNext>(call_next)](size_t i) -> Task<void> {
+        auto self = weak.lock();
+        if (!self) co_return;
         if (i < middlewares_.size()) {
             auto advanced = std::make_shared<bool>(false);
             co_await middlewares_[i](req, res,
-                [call_next, advanced, i]() -> Task<void> {
+                [self, advanced, i]() -> Task<void> {
                     if (*advanced) co_return;
                     *advanced = true;
-                    co_await (*call_next)(i + 1);
+                    co_await (*self)(i + 1);
                 });
         } else {
             auto match = router_.match(req.method, req.path);
@@ -321,13 +329,13 @@ Task<void> App::handle_request(Request& req, Response& res) {
     if (res.status_code() >= 400) {
         int code = res.status_code();
 
-        // El cuerpo por defecto ya esta escrito y marcado como comprometido.
-        // Un manejador de error existe precisamente para sustituirlo, asi que
-        // se retira antes de darle el control; sin esto, su res.json() o
-        // res.render() se ignoraria en silencio.
+        // The default body is already written and marked as committed.  An
+        // error handler exists precisely to replace it, so it is taken away
+        // before handing over control; without this, its res.json() or
+        // res.render() would be silently ignored.
         //
-        // Si el manejador no escribe nada, se repone el cuerpo original: no
-        // haberlo escrito no puede significar quedarse sin respuesta.
+        // If the handler writes nothing, the original body is put back: not
+        // having written one cannot mean ending up with no response.
         auto guarded = [&res](auto&& fn) {
             std::string saved = res.take_body();
             fn();
@@ -359,7 +367,7 @@ Task<void> App::handle_request(Request& req, Response& res) {
 void App::run(const std::string& host, uint16_t port) {
     std::signal(SIGPIPE, SIG_IGN);
 
-    prepare();  // ordena los montajes estaticos
+    prepare();  // sorts the static mounts
 
     // ── Build the async dispatch function ─────────────────────────────────────
     // Returns handle_request() directly — no extra coroutine frame.
@@ -368,9 +376,9 @@ void App::run(const std::string& host, uint16_t port) {
     };
 
     // ── Multi-core: one event loop per hardware thread ────────────────────────
-    // hardware_concurrency() cuenta los cores de la maquina, no los que este
-    // proceso puede usar: ignora la mascara de afinidad y el limite de cpu del
-    // cgroup.  En un contenedor con 2 cores asignados de una maquina de 64,
+    // hardware_concurrency() counts the machine's cores, not the ones this
+    // process can use: it ignores the affinity mask and the cgroup cpu limit.
+    // In a container with 2 cores assigned out of a 64-core machine,
     // levantaria 64 event loops sobre 2 cores.
     unsigned num_threads = 0;
     {
@@ -408,15 +416,15 @@ void App::run(const std::string& host, uint16_t port) {
 
     g_initiate_drain = [this, &main_loop, shared_conn_count, &all_loops, &all_servers, &all_mutex]() {
         {
-            // Cada servidor deja de aceptar EN SU PROPIO loop.  Hacerlo desde
-            // aqui —que es el hilo del loop principal— tocaba el mapa de
-            // manejadores de los otros N loops mientras ellos lo estaban
-            // leyendo.  Cuatro lineas mas abajo ya se usa post() para lo suyo:
-            // es el mismo mecanismo, aplicado a todos.
+            // Each server stops accepting ON ITS OWN loop.  Doing it from here
+            // —which is the main loop's thread— touched the handler map of the
+            // other N loops while they were reading it.  Four lines below
+            // post() is already used for its own work: it is the same
+            // mechanism, applied to everyone.
             //
-            // El desfase es de una vuelta de loop, en la que un worker todavia
-            // podria aceptar una conexion.  Da igual: el drenaje espera hasta
-            // 30 segundos a que no quede ninguna.
+            // The lag is one loop turn, in which a worker could still accept a
+            // connection.  It does not matter: the drain waits up to 30 seconds
+            // for none to be left.
             std::lock_guard<std::mutex> lk(all_mutex);
             for (auto* s : all_servers) s->pedir_parada();
         }
@@ -437,9 +445,9 @@ void App::run(const std::string& host, uint16_t port) {
                                    remaining, " connection(s) dropped");
                     else
                         log().info("shutdown: all connections drained");
-                    // Ultimo momento en que los loops siguen vivos: aqui se
-                    // apaga lo que tenga hilos propios posteando a ellos.  Si
-                    // se hiciera despues, esos hilos escribirian en un loop ya
+                    // Last moment when the loops are still alive: here goes
+                    // the shutdown of anything with its own threads posting to
+                    // them.  If it were done later, those threads would write
                     // destruido.
                     if (before_stop_) before_stop_();
 

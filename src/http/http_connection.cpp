@@ -170,8 +170,8 @@ void HttpConnection::do_read() {
             }
         }
 
-        // El handler era sincrono y ya respondio dentro de feed(): ahora que la
-        // pausa esta puesta, se puede cerrar el ciclo de verdad.
+        // The handler was synchronous and already replied inside feed(): now
+        // that the pause is in place, the cycle can really be closed.
         if (cycle_pending_) {
             cycle_pending_ = false;
             finish_cycle();
@@ -446,7 +446,7 @@ void HttpConnection::on_write_complete() {
         return;
     }
 
-    // Dentro de feed() la pausa todavia no existe: aplazar el cierre de ciclo.
+    // Inside feed() the pause does not exist yet: defer the cycle close.
     if (in_parser_) { cycle_pending_ = true; return; }
     finish_cycle();
 }
@@ -505,7 +505,7 @@ void HttpConnection::finish_cycle() {
 
 void HttpConnection::send_error(int code, const char* msg) {
     lumen::Response r;
-    // El mensaje viene de una lista fija del motor, sin comillas ni barras.
+    // The message comes from a fixed engine list, with no quotes or backslashes.
     r.status(code).json_text(std::string(R"({"error":")") + msg + R"("})");
     r.header("Connection", "close");
     // send_error is only called for protocol-level errors; ignore keep-alive

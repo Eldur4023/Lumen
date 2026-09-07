@@ -1,0 +1,103 @@
+app:
+    port 8790
+
+get endpoint("/__ping__"):
+    return { "ok": true }
+
+get endpoint("/arithmetic"):
+    return { "sum": 3 + 4, "resta": 10 - 3, "div": 9 / 3, "mod": 7 % 3, "mixto": 1 + 2.5 }
+
+get endpoint("/strings"):
+    string s = "hello"
+    return { "upper": s.upper(), "starts": s.starts_with("he"), "trimmed": "  x  ".trim() }
+
+# JSON has to be UTF-8.  A stray byte comes in through the body, the query or
+# a header, and without sanitizing it left the response unreadable for the
+# client that sent it.  These routes return what comes in, to check both
+# halves: that the broken is sanitized and the valid is NOT touched.
+get endpoint("/echo_query", string q = "empty"):
+    return { "echo": q }
+
+get endpoint("/echo_header"):
+    return { "echo": header("X-Test") }
+
+get endpoint("/echo_valid"):
+    return { "echo": "añoñó 🐻 ñ" }
+
+get endpoint("/multiline"):
+    string sql = """
+        SELECT id
+        FROM posts
+        """
+    string loose = """on one line"""
+    return { "sql": sql, "loose": loose, "escapes": """with \"quotes\"""" }
+
+get endpoint("/truthiness"):
+    List<int> vacia = []
+    return { "zero": 0 ? true : false, "vacia": vacia ? true : false,
+             "text": "" ? true : false, "one": 1 ? true : false }
+
+get endpoint("/coercion"):
+    return { "bad": 1 + "one" }
+
+get endpoint("/classify/:n", int n):
+    if n < 0:
+        return { "r": "negative" }
+    elif n == 0:
+        return { "r": "zero" }
+    elif n < 10:
+        return { "r": "small" }
+    else:
+        return { "r": "big" }
+
+get endpoint("/sum_up_to/:n", int n):
+    int total = 0
+    int i = 1
+    while i <= n:
+        total += i
+        i++
+    return { "total": total }
+
+get endpoint("/evens"):
+    List<int> out = []
+    for int x in [1, 2, 3, 4, 5, 6, 7]:
+        if x > 6:
+            break
+        if x % 2 != 0:
+            continue
+        out.add(x)
+    return { "evens": out }
+
+get endpoint("/operators"):
+    int a = 10
+    a += 5
+    a -= 3
+    a *= 2
+    a /= 4
+    a %= 4
+    return { "a": a }
+
+get endpoint("/increment"):
+    int i = 5
+    int previo = i++
+    int nuevo = ++i
+    return { "post": previo, "pre": nuevo, "i": i }
+
+get endpoint("/indices"):
+    List<int> l = [10, 20, 30]
+    l[0] = 99
+    l[2] = l[1] + 5
+    return { "l": l }
+
+get endpoint("/ternary/:age", int age):
+    return { "role": age >= 18 ? "adult" : "minor" }
+
+get endpoint("/captura"):
+    try:
+        int x = 1 / 0
+        return { "no": x }
+    catch e:
+        return { "caught": e.message }
+
+get endpoint("/boom"):
+    return { "bad": 1 / 0 }

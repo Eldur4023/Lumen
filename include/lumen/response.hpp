@@ -50,16 +50,16 @@ public:
         return *this;
     }
 
-    // Retira el cuerpo ya escrito y lo devuelve, dejando la respuesta libre
-    // para escribir otro.
+    // Takes away the already written body and returns it, leaving the response
+    // free to write another one.
     //
-    // Existe para los manejadores de error: cuando uno se dispara, el cuerpo
-    // por defecto ya esta comprometido, asi que sin esto cualquier res.json()
-    // o res.render() del manejador se descartaria en silencio.  Devolverlo
-    // permite reponerlo si el manejador decide no escribir nada.
+    // It exists for the error handlers: when one fires, the default body is
+    // already committed, so without this any res.json() or res.render() of the
+    // handler would be silently discarded.  Returning it allows putting it
+    // back if the handler decides to write nothing.
     //
-    // No toca el codigo de estado ni las cabeceras, y es un no-op sobre una
-    // respuesta en modo SSE o WebSocket, donde ya se enviaron bytes al socket.
+    // It touches neither the status code nor the headers, and is a no-op on a
+    // response in SSE or WebSocket mode, where bytes were already sent.
     std::string take_body() {
         if (state_->sse_started || state_->ws_started) return {};
         std::string old = std::move(state_->body);
@@ -70,7 +70,7 @@ public:
         return old;
     }
 
-    // Repone un cuerpo retirado con take_body().
+    // Puts back a body taken with take_body().
     Response& restore_body(std::string body) {
         if (state_->sse_started || state_->ws_started) return *this;
         state_->body = std::move(body);
@@ -163,9 +163,9 @@ public:
         return *this;
     }
 
-    // Cuerpo JSON ya serializado.  Antes esto recibia un arbol nlohmann y
-    // llamaba a dump(); ahora quien tiene los datos los escribe directamente,
-    // que es una materializacion menos.
+    // Already serialized JSON body.  This used to take an nlohmann tree and
+    // call dump(); now whoever has the data writes it directly, which is one
+    // materialization less.
     Response& json_text(std::string cuerpo) {
         if (state_->body_committed) {
             std::cerr << "[lumen] Response.json_text() called after body already committed - ignoring\n";
@@ -187,14 +187,14 @@ public:
         return *this;
     }
 
-    // Las plantillas ya no se renderizan aqui.
+    // Templates are no longer rendered here.
     //
-    // El motor vive en el frontend de Lumen Script (src/lumen_script/plantilla.cpp): compila la
-    // plantilla al arrancar contra las claves de cada render(), y en caliente
-    // solo queda recorrer una lista de instrucciones.  El resultado llega a
-    // Response como HTML ya hecho, por header().send().
-    //
-    // Eso quito Jinja2Cpp de encima, y con el Boost, fmt, rapidjson y cuatro
+    // The engine lives in the Lumen Script frontend
+    // (src/lumen_script/template.cpp): it compiles the template at startup
+    // against the keys of each render(), and on the hot path all that is left
+    // is walking a list of instructions.  The result reaches Response as
+    // finished HTML, through header().send().
+    // That got Jinja2Cpp off our back, and with it Boost, fmt, rapidjson and
     // bibliotecas mas.
 
     // Zero-copy static file: instead of reading the file into the body,

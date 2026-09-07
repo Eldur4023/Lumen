@@ -18,7 +18,7 @@ std::string TypeRef::str() const {
     return s;
 }
 
-// ─── Navegacion ──────────────────────────────────────────────────────────────
+// ─── Navigation ──────────────────────────────────────────────────────────────
 
 const Token& Parser::peek(size_t ahead) const {
     size_t j = i_ + ahead;
@@ -46,8 +46,8 @@ void Parser::error_here(std::string msg) {
 
 bool Parser::expect(Tok k, const char* context) {
     if (match(k)) return true;
-    error_here(std::string("se esperaba '") + tok_name(k) + "' " + context +
-               ", pero hay '" + tok_name(peek().kind) + "'");
+    error_here(std::string("expected '") + tok_name(k) + "' " + context +
+               ", but there is '" + tok_name(peek().kind) + "'");
     return false;
 }
 
@@ -55,8 +55,8 @@ void Parser::skip_newlines() {
     while (check(Tok::Newline)) advance();
 }
 
-// Tras un error, avanza hasta algo que pueda empezar una declaracion, para no
-// encadenar fallos derivados del primero.
+// After an error, it advances to something that can start a declaration, so as
+// not to chain failures derived from the first one.
 void Parser::synchronize() {
     int depth = 0;
     while (!check(Tok::EndOfFile)) {
@@ -76,20 +76,20 @@ void Parser::synchronize() {
     }
 }
 
-// ─── Programa ────────────────────────────────────────────────────────────────
+// ─── Program ─────────────────────────────────────────────────────────────────
 
-// Una expresion suelta, para las plantillas.  Se exige que consuma todo el
-// flujo: `{{ a.titulo basura }}` tiene que ser un error, no leerse a medias.
+// A standalone expression, for the templates.  It is required to consume the
+// whole stream: `{{ a.title garbage }}` has to be an error, not a partial read.
 ExprPtr Parser::parse_single_expression() {
     skip_newlines();
     if (check(Tok::EndOfFile)) {
-        error_here("se esperaba una expresion");
+        error_here("expected an expression");
         return nullptr;
     }
     ExprPtr e = parse_expr();
     skip_newlines();
     if (!check(Tok::EndOfFile)) {
-        error_here("sobra algo detras de la expresion");
+        error_here("trailing input after the expression");
         return nullptr;
     }
     return e;
@@ -101,7 +101,7 @@ void Parser::parse_into(Program& out) {
         size_t before = i_;
         parse_declaration(out);
         skip_newlines();
-        if (i_ == before) advance();   // red de seguridad: nunca bucle infinito
+        if (i_ == before) advance();   // safety net: never an infinite loop
     }
 }
 
@@ -130,30 +130,30 @@ void Parser::parse_declaration(Program& out) {
             parse_fn(out);
             return;
 
-        // Declaraciones que la gramatica define pero que todavia no se compilan.
-        // Se reportan explicitamente en vez de fallar con un error de sintaxis
-        // confuso.
+        // Declarations the grammar defines but that are not compiled yet.  They
+        // are reported explicitly instead of failing with a confusing syntax
+        // error.
         case Tok::KwImport: {
             SourceLoc loc = advance().loc;
             if (!check(Tok::Ident)) {
-                error_here("se esperaba el nombre del modulo tras 'import'");
+                error_here("expected the module name after 'import'");
                 synchronize();
                 return;
             }
             std::string mod = advance().text;
             if (!out.imports.insert(mod).second)
-                diags_.error(loc, "'" + mod + "' ya estaba importado");
+                diags_.error(loc, "'" + mod + "' was already imported");
             return;
         }
 
         default:
-            error_here("se esperaba una declaracion (get/post/... endpoint, o app)");
+            error_here("expected a declaration (get/post/... endpoint, or app)");
             synchronize();
             return;
     }
 }
 
-// ─── Rutas ───────────────────────────────────────────────────────────────────
+// ─── Routes ──────────────────────────────────────────────────────────────────
 
 void Parser::parse_route(Program& out, const Token& method_tok,
                          const std::string& prefix,
@@ -172,18 +172,18 @@ void Parser::parse_route(Program& out, const Token& method_tok,
         default:            r.method = "GET";    break;
     }
 
-    if (!expect(Tok::KwEndpoint, "tras el metodo de la ruta")) { synchronize(); return; }
-    if (!expect(Tok::LParen, "tras 'endpoint'"))               { synchronize(); return; }
+    if (!expect(Tok::KwEndpoint, "after the route method")) { synchronize(); return; }
+    if (!expect(Tok::LParen, "after 'endpoint'"))               { synchronize(); return; }
 
     if (!check(Tok::String)) {
-        error_here("el primer argumento de endpoint() es el patron de ruta, entre comillas");
+        error_here("the first argument of endpoint() is the route pattern, in quotes");
         synchronize();
         return;
     }
     r.pattern_loc = peek().loc;
     r.pattern     = advance().text;
 
-    // El prefijo del grupo se pega delante, evitando la doble barra de
+    // The group prefix is glued in front, avoiding the double slash of
     // group("/api") + endpoint("/users").
     if (!prefix.empty()) {
         std::string p = prefix;
@@ -193,29 +193,29 @@ void Parser::parse_route(Program& out, const Token& method_tok,
         else                              r.pattern = p + r.pattern;
     }
 
-    // Cada ruta lleva la lista completa de guardas que la envuelven, de fuera
-    // hacia dentro.
+    // Every route carries the complete list of guards wrapping it, from the
+    // outside in.
     r.guards = guards;
 
     while (match(Tok::Comma)) {
         if (check(Tok::RParen)) break;          // coma final tolerada
         r.params.push_back(parse_param());
     }
-    if (!expect(Tok::RParen, "al cerrar endpoint()")) { synchronize(); return; }
+    if (!expect(Tok::RParen, "closing endpoint()")) { synchronize(); return; }
 
-    // Modificador origins(...) — la gramatica lo admite en cualquier ruta y el
-    // checker lo rechaza fuera de ws.
+    // origins(...) modifier — the grammar accepts it on any route and the
+    // checker rejects it outside ws.
     if (match(Tok::KwOrigins)) {
-        expect(Tok::LParen, "tras 'origins'");
+        expect(Tok::LParen, "after 'origins'");
         while (!check(Tok::RParen) && !check(Tok::EndOfFile)) {
             if (check(Tok::String)) r.origins.push_back(advance().text);
-            else { error_here("origins() solo admite cadenas"); advance(); }
+            else { error_here("origins() only accepts strings"); advance(); }
             if (!match(Tok::Comma)) break;
         }
-        expect(Tok::RParen, "al cerrar origins()");
+        expect(Tok::RParen, "closing origins()");
     }
 
-    if (!expect(Tok::Colon, "al abrir el cuerpo de la ruta")) { synchronize(); return; }
+    if (!expect(Tok::Colon, "opening the route body")) { synchronize(); return; }
     r.body = parse_block();
     out.routes.push_back(std::move(r));
 }
@@ -225,12 +225,12 @@ Param Parser::parse_param() {
     p.loc  = peek().loc;
     p.type = parse_type();
     if (check(Tok::Ident)) p.name = advance().text;
-    else                   error_here("se esperaba el nombre del parametro");
+    else                   error_here("expected the parameter name");
     if (match(Tok::Assign)) p.default_value = parse_expr();
     return p;
 }
 
-// ─── Funciones ───────────────────────────────────────────────────────────────
+// ─── Functions ───────────────────────────────────────────────────────────────
 
 void Parser::parse_fn(Program& out) {
     FnDecl f;
@@ -238,42 +238,42 @@ void Parser::parse_fn(Program& out) {
 
     f.return_type = parse_type();
     if (check(Tok::Ident)) f.name = advance().text;
-    else { error_here("se esperaba el nombre de la funcion"); synchronize(); return; }
+    else { error_here("expected the function name"); synchronize(); return; }
 
     for (const auto& prev_fn : out.functions) {
         if (prev_fn.name == f.name) {
-            diags_.error(f.loc, "la funcion '" + f.name + "' ya esta declarada");
+            diags_.error(f.loc, "function '" + f.name + "' is already declared");
             break;
         }
     }
 
-    if (!expect(Tok::LParen, "tras el nombre de la funcion")) { synchronize(); return; }
+    if (!expect(Tok::LParen, "after the function name")) { synchronize(); return; }
     while (!check(Tok::RParen) && !check(Tok::EndOfFile)) {
         f.params.push_back(parse_param());
         if (!match(Tok::Comma)) break;
     }
-    if (!expect(Tok::RParen, "al cerrar los parametros")) { synchronize(); return; }
-    if (!expect(Tok::Colon, "al abrir el cuerpo de la funcion")) { synchronize(); return; }
+    if (!expect(Tok::RParen, "closing the parameters")) { synchronize(); return; }
+    if (!expect(Tok::Colon, "opening the function body")) { synchronize(); return; }
 
     f.body = parse_block();
     out.functions.push_back(std::move(f));
 }
 
-// ─── Manejadores de error ────────────────────────────────────────────────────
+// ─── Error handlers ──────────────────────────────────────────────────────────
 
 void Parser::parse_error(Program& out) {
     ErrorDecl e;
     e.loc = advance().loc;                          // 'on'
 
-    if (!expect(Tok::KwError, "tras 'on'")) { synchronize(); return; }
+    if (!expect(Tok::KwError, "after 'on'")) { synchronize(); return; }
 
     if (check(Tok::Int)) {
         long v = std::strtol(advance().text.c_str(), nullptr, 10);
-        // Solo tiene sentido para lo que genera el motor: con un 2xx el handler
-        // ya escribio el cuerpo, y sobrescribirlo seria un filtro de respuesta.
+        // It only makes sense for what the engine generates: with a 2xx the
+        // handler already wrote the body, and overwriting it would be a filter.
         if (v < 400 || v > 599) {
-            diags_.error(prev().loc, "'on error' solo cubre codigos 400-599; con un "
-                                     "2xx el handler ya ha escrito la respuesta");
+            diags_.error(prev().loc, "'on error' only covers codes 400-599; with a "
+                                     "2xx the handler has already written the response");
             synchronize();
             return;
         }
@@ -282,30 +282,30 @@ void Parser::parse_error(Program& out) {
 
     for (const auto& prev_decl : out.errors) {
         if (prev_decl.code == e.code) {
-            diags_.error(e.loc, e.code ? "ya hay un manejador para el codigo " +
+            diags_.error(e.loc, e.code ? "there is already a handler for code " +
                                          std::to_string(e.code)
-                                       : std::string("ya hay un manejador global de error"));
+                                       : std::string("there is already a global error handler"));
             break;
         }
     }
 
-    if (!expect(Tok::Colon, "al abrir el manejador de error")) { synchronize(); return; }
+    if (!expect(Tok::Colon, "opening the error handler")) { synchronize(); return; }
     e.body = parse_block();
     out.errors.push_back(std::move(e));
 }
 
-// ─── Grupos ──────────────────────────────────────────────────────────────────
+// ─── Groups ──────────────────────────────────────────────────────────────────
 
 void Parser::parse_group(Program& out, const std::string& prefix,
                          const std::vector<Guard>& outer_guards) {
     SourceLoc loc = advance().loc;                    // 'group'
 
-    if (!expect(Tok::LParen, "tras 'group'")) { synchronize(); return; }
+    if (!expect(Tok::LParen, "after 'group'")) { synchronize(); return; }
     std::string own_prefix;
     if (check(Tok::String)) own_prefix = advance().text;
-    else { error_here("group() espera el prefijo de URL entre comillas"); }
-    if (!expect(Tok::RParen, "al cerrar group()")) { synchronize(); return; }
-    if (!expect(Tok::Colon, "al abrir el cuerpo del grupo")) { synchronize(); return; }
+    else { error_here("group() expects the URL prefix in quotes"); }
+    if (!expect(Tok::RParen, "closing group()")) { synchronize(); return; }
+    if (!expect(Tok::Colon, "opening the group body")) { synchronize(); return; }
 
     std::string combined = prefix;
     if (!combined.empty() && combined.back() == '/') combined.pop_back();
@@ -316,10 +316,10 @@ void Parser::parse_group(Program& out, const std::string& prefix,
     }
 
     skip_newlines();
-    if (!expect(Tok::Indent, "al abrir el bloque del grupo")) { synchronize(); return; }
+    if (!expect(Tok::Indent, "opening the group block")) { synchronize(); return; }
 
-    // Las guardas se acumulan: una ruta anidada tiene que pasar las del padre
-    // y luego las propias, en ese orden.
+    // Guards accumulate: a nested route has to pass the parent's and then its
+    // own, in that order.
     std::vector<Guard> guards = outer_guards;
 
     bool seen_route = false;
@@ -331,11 +331,11 @@ void Parser::parse_group(Program& out, const std::string& prefix,
         if (check(Tok::KwRequire)) {
             SourceLoc gloc = advance().loc;
             if (seen_route)
-                diags_.error(gloc, "las guardas del grupo van antes que sus rutas");
+                diags_.error(gloc, "group guards come before its routes");
             Guard g;
             g.loc       = gloc;
             g.condition = std::shared_ptr<Expr>(parse_expr());
-            if (expect(Tok::KwElse, "en 'require ... else ...'"))
+            if (expect(Tok::KwElse, "in 'require ... else ...'"))
                 g.otherwise = std::shared_ptr<Expr>(parse_expr());
             guards.push_back(std::move(g));
         }
@@ -354,8 +354,8 @@ void Parser::parse_group(Program& out, const std::string& prefix,
                     break;
                 }
                 default:
-                    error_here("dentro de un grupo solo caben 'require', rutas y "
-                               "otros grupos");
+                    error_here("a group only accepts 'require', routes and "
+                               "other groups");
                     while (!check(Tok::Newline) && !check(Tok::Dedent) &&
                            !check(Tok::EndOfFile)) advance();
             }
@@ -368,18 +368,18 @@ void Parser::parse_group(Program& out, const std::string& prefix,
     (void)loc;
 }
 
-// ─── Clases ──────────────────────────────────────────────────────────────────
+// ─── Classes ─────────────────────────────────────────────────────────────────
 
 void Parser::parse_class(Program& out) {
     ClassDecl c;
     c.loc = advance().loc;                        // 'class'
 
     if (check(Tok::Ident)) c.name = advance().text;
-    else { error_here("se esperaba el nombre de la clase"); synchronize(); return; }
+    else { error_here("expected the class name"); synchronize(); return; }
 
-    if (!expect(Tok::Colon, "tras el nombre de la clase")) { synchronize(); return; }
+    if (!expect(Tok::Colon, "after the class name")) { synchronize(); return; }
     skip_newlines();
-    if (!expect(Tok::Indent, "al abrir el cuerpo de la clase")) { synchronize(); return; }
+    if (!expect(Tok::Indent, "opening the class body")) { synchronize(); return; }
 
     while (!check(Tok::Dedent) && !check(Tok::EndOfFile)) {
         skip_newlines();
@@ -387,12 +387,12 @@ void Parser::parse_class(Program& out) {
         size_t before = i_;
 
         // validate:
-        //     <expresion>   "mensaje"
+        //     <expression>   "message"
         if (check(Tok::KwValidate)) {
             advance();
-            expect(Tok::Colon, "tras 'validate'");
+            expect(Tok::Colon, "after 'validate'");
             skip_newlines();
-            if (!expect(Tok::Indent, "al abrir el bloque validate")) break;
+            if (!expect(Tok::Indent, "opening the validate block")) break;
 
             while (!check(Tok::Dedent) && !check(Tok::EndOfFile)) {
                 skip_newlines();
@@ -402,36 +402,36 @@ void Parser::parse_class(Program& out) {
                 rule.loc       = peek().loc;
                 rule.condition = parse_expr();
                 if (check(Tok::String)) rule.message = advance().text;
-                else error_here("cada regla de validate lleva su mensaje entre comillas");
+                else error_here("every validate rule needs its message in quotes");
                 c.rules.push_back(std::move(rule));
                 skip_newlines();
             }
             match(Tok::Dedent);
         }
-        // Metodo: fn <tipo> <nombre>(...)
+        // Method: fn <type> <name>(...)
         else if (check(Tok::KwFn)) {
             FnDecl m;
             m.loc = advance().loc;
             m.return_type = parse_type();
             if (check(Tok::Ident)) m.name = advance().text;
-            else { error_here("se esperaba el nombre del metodo"); break; }
+            else { error_here("expected the method name"); break; }
 
             for (const auto& prev_m : c.methods)
                 if (prev_m.name == m.name)
-                    diags_.error(m.loc, "el metodo '" + m.name + "' ya esta declarado "
-                                        "en la clase '" + c.name + "'");
+                    diags_.error(m.loc, "method '" + m.name + "' is already declared "
+                                        "in class '" + c.name + "'");
 
-            expect(Tok::LParen, "tras el nombre del metodo");
+            expect(Tok::LParen, "after the method name");
             while (!check(Tok::RParen) && !check(Tok::EndOfFile)) {
                 m.params.push_back(parse_param());
                 if (!match(Tok::Comma)) break;
             }
-            expect(Tok::RParen, "al cerrar los parametros del metodo");
-            expect(Tok::Colon, "al abrir el cuerpo del metodo");
+            expect(Tok::RParen, "closing the method parameters");
+            expect(Tok::Colon, "opening the method body");
             m.body = parse_block();
             c.methods.push_back(std::move(m));
         }
-        // Constructor: NombreDeLaClase(...), con cuerpo o sin el.
+        // Constructor: ClassName(...), with or without a body.
         else if (check(Tok::Ident) && peek().text == c.name && peek(1).is(Tok::LParen)) {
             CtorDecl ct;
             ct.loc = advance().loc;
@@ -440,32 +440,32 @@ void Parser::parse_class(Program& out) {
                 ct.params.push_back(parse_param());
                 if (!match(Tok::Comma)) break;
             }
-            expect(Tok::RParen, "al cerrar los parametros del constructor");
+            expect(Tok::RParen, "closing the constructor parameters");
 
             for (const auto& prev_ct : c.ctors)
                 if (prev_ct.params.size() == ct.params.size())
-                    diags_.error(ct.loc, "ya hay un constructor de '" + c.name +
-                                         "' con " + std::to_string(ct.params.size()) +
-                                         " parametro(s); se distinguen por su numero");
+                    diags_.error(ct.loc, "there is already a constructor for '" + c.name +
+                                         "' with " + std::to_string(ct.params.size()) +
+                                         " parameter(s); they are told apart by their count");
 
-            // Sin dos puntos, es el constructor por mapeo automatico.
+        // Without a colon, it is the automatic mapping constructor.
             if (match(Tok::Colon)) {
                 ct.has_body = true;
                 ct.body     = parse_block();
             }
             c.ctors.push_back(std::move(ct));
         }
-        // Campo: <tipo> <nombre>
+        // Field: <type> <name>
         else {
             Field f;
             f.loc  = peek().loc;
             f.type = parse_type();
             if (check(Tok::Ident)) f.name = advance().text;
-            else error_here("se esperaba el nombre del campo");
+            else error_here("expected the field name");
 
             for (const auto& prev_field : c.fields) {
                 if (prev_field.name == f.name) {
-                    diags_.error(f.loc, "el campo '" + f.name + "' esta duplicado");
+                    diags_.error(f.loc, "field '" + f.name + "' is duplicated");
                     break;
                 }
             }
@@ -478,16 +478,16 @@ void Parser::parse_class(Program& out) {
     match(Tok::Dedent);
 
     if (c.fields.empty())
-        diags_.error(c.loc, "la clase '" + c.name + "' no declara ningun campo");
+        diags_.error(c.loc, "class '" + c.name + "' declares no fields");
 
     out.classes.push_back(std::move(c));
 }
 
-// ─── Bloque app: ─────────────────────────────────────────────────────────────
+// ─── app: block ──────────────────────────────────────────────────────────────
 
-// kind: 0 cadena, 1 numero, 2 booleano.  env("VAR") se resuelve aqui mismo y
-// cuenta como cadena; si la variable no existe, queda vacia y el llamante
-// decide si eso es un error.
+// kind: 0 string, 1 number, 2 boolean.  env("VAR") is resolved right here and
+// counts as a string; if the variable does not exist it stays empty and the
+// caller decides whether that is an error.
 bool Parser::config_value(std::string& text, long long& number, bool& flag, int& kind) {
     if (check(Tok::String)) { text = advance().text; kind = 0; return true; }
     if (check(Tok::Int))    { number = std::strtoll(advance().text.c_str(), nullptr, 10); kind = 1; return true; }
@@ -498,22 +498,22 @@ bool Parser::config_value(std::string& text, long long& number, bool& flag, int&
     }
     if (check(Tok::Ident) && peek().text == "env" && peek(1).is(Tok::LParen)) {
         advance(); advance();
-        if (!check(Tok::String)) { error_here("env() espera el nombre entre comillas"); return false; }
+        if (!check(Tok::String)) { error_here("env() expects the name in quotes"); return false; }
         Token name_tok = advance();
         const std::string& name = name_tok.text;
-        expect(Tok::RParen, "al cerrar env()");
+        expect(Tok::RParen, "closing env()");
         const char* v = std::getenv(name.c_str());
-        // Sin esto, una variable de entorno olvidada se convierte en "" sin
-        // que nadie se entere hasta produccion: para session/jwt el secreto
-        // vacio falla cerrado (se trata igual que "sin configurar"), pero el
-        // error real queda escondido detras de un mensaje que no lo menciona.
-        // No es un error de compilacion — .lum no tiene por que conocer el
-        // entorno de despliegue final, y --check debe poder correr sin el.
+        // Without this, a forgotten environment variable turns into "" with
+        // nobody noticing until production: for session/jwt an empty secret
+        // fails closed (it is treated the same as "not configured"), but the
+        // real error stays hidden behind a message that does not mention it.
+        // It is not a compile error — a .lum has no business knowing the final
+        // deployment environment, and --check must be able to run without it.
         if (!v) {
-            std::cerr << "lumen: aviso: " << (name_tok.loc.file ? *name_tok.loc.file : "?")
+            std::cerr << "lumen: warning: " << (name_tok.loc.file ? *name_tok.loc.file : "?")
                       << ":" << name_tok.loc.line << ":" << name_tok.loc.col
-                      << ": la variable de entorno '" << name
-                      << "' no esta definida; se usa \"\" en su lugar\n";
+                      << ": the environment variable '" << name
+                      << "' is not defined; using \"\" instead\n";
         }
         text = v ? v : "";
         kind = 0;
@@ -525,14 +525,14 @@ bool Parser::config_value(std::string& text, long long& number, bool& flag, int&
 void Parser::parse_app(Program& out) {
     SourceLoc loc = advance().loc;                    // 'app'
     if (out.app.present) {
-        diags_.error(loc, "el bloque 'app:' solo puede aparecer una vez en el proyecto");
+        diags_.error(loc, "the 'app:' block can only appear once in the project");
     }
     out.app.present = true;
     out.app.loc     = loc;
 
-    if (!expect(Tok::Colon, "tras 'app'")) { synchronize(); return; }
+    if (!expect(Tok::Colon, "after 'app'")) { synchronize(); return; }
     skip_newlines();
-    if (!expect(Tok::Indent, "al abrir el bloque app")) { synchronize(); return; }
+    if (!expect(Tok::Indent, "opening the app block")) { synchronize(); return; }
 
     while (!check(Tok::Dedent) && !check(Tok::EndOfFile)) {
         skip_newlines();
@@ -545,17 +545,17 @@ void Parser::parse_app(Program& out) {
             StaticMount m;
             m.loc = key.loc;
             if (check(Tok::String)) m.url_prefix = advance().text;
-            else error_here("se esperaba el prefijo de URL entre comillas");
-            expect(Tok::Arrow, "entre el prefijo y el directorio");
+            else error_here("expected the URL prefix in quotes");
+            expect(Tok::Arrow, "between the prefix and the directory");
             if (check(Tok::String)) m.fs_root = advance().text;
-            else error_here("se esperaba el directorio entre comillas");
+            else error_here("expected the directory in quotes");
             if (match(Tok::KwSpa)) m.spa = true;
             out.app.statics.push_back(std::move(m));
         }
         else if (key.is(Tok::Ident)) {
             std::string k = advance().text;
             if (k == "name" || k == "version" || k == "templates") {
-                if (!check(Tok::String)) { error_here("se esperaba una cadena"); }
+                if (!check(Tok::String)) { error_here("expected a string"); }
                 else {
                     std::string v = advance().text;
                     if      (k == "name")      out.app.name = v;
@@ -563,38 +563,38 @@ void Parser::parse_app(Program& out) {
                     else                       out.app.templates_dir = v;
                 }
             } else if (k == "port") {
-                if (!check(Tok::Int)) error_here("se esperaba un numero de puerto");
+                if (!check(Tok::Int)) error_here("expected a port number");
                 else {
                     long v = std::strtol(advance().text.c_str(), nullptr, 10);
                     if (v < 1 || v > 65535)
-                        diags_.error(prev().loc, "puerto fuera de rango (1-65535)");
+                        diags_.error(prev().loc, "port out of range (1-65535)");
                     else out.app.port = static_cast<int>(v);
                 }
             } else if (k == "docs")    { out.app.docs    = true; }
             else if   (k == "health")  { out.app.health  = true; }
             else if   (k == "metrics") { out.app.metrics = true; }
-            // Bloque de configuracion de un modulo importado.
+            // Configuration block of an imported module.
             else if (out.imports.count(k)) {
-                expect(Tok::Colon, "tras el nombre del modulo");
+                expect(Tok::Colon, "after the module name");
                 skip_newlines();
-                if (!expect(Tok::Indent, "al abrir la configuracion del modulo")) break;
+                if (!expect(Tok::Indent, "opening the module configuration")) break;
 
                 auto& opts = out.app.modules[k];
                 while (!check(Tok::Dedent) && !check(Tok::EndOfFile)) {
                     skip_newlines();
                     if (check(Tok::Dedent) || check(Tok::EndOfFile)) break;
-                    if (!check(Tok::Ident)) { error_here("se esperaba una clave"); advance(); continue; }
+                    if (!check(Tok::Ident)) { error_here("expected a key"); advance(); continue; }
 
                     std::string mk = advance().text;
                     std::string text; long long number = 0; bool flag = false; int kind = -1;
                     if (!config_value(text, number, flag, kind)) {
-                        error_here("valor invalido: se esperaba una cadena, un numero, "
+                        error_here("invalid value: expected a string, a number, "
                                    "true/false o env(\"VAR\")");
                         while (!check(Tok::Newline) && !check(Tok::Dedent) &&
                                !check(Tok::EndOfFile)) advance();
                         continue;
                     }
-                    // Todo se guarda como texto: cada driver interpreta lo suyo.
+                    // Everything is kept as text: each driver reads its own.
                     opts[mk] = (kind == 1) ? std::to_string(number)
                              : (kind == 2) ? (flag ? "true" : "false")
                                            : text;
@@ -602,23 +602,23 @@ void Parser::parse_app(Program& out) {
                 }
                 match(Tok::Dedent);
             }
-            // session: y jwt: son sub-bloques con sus propias claves.
+            // session: and jwt: are sub-blocks with their own keys.
             else if (k == "session" || k == "jwt") {
                 bool is_session = (k == "session");
-                expect(Tok::Colon, "tras la clave del sub-bloque");
+                expect(Tok::Colon, "after the sub-block key");
                 skip_newlines();
-                if (!expect(Tok::Indent, "al abrir el sub-bloque")) break;
+                if (!expect(Tok::Indent, "opening the sub-block")) break;
 
                 while (!check(Tok::Dedent) && !check(Tok::EndOfFile)) {
                     skip_newlines();
                     if (check(Tok::Dedent) || check(Tok::EndOfFile)) break;
-                    if (!check(Tok::Ident)) { error_here("se esperaba una clave"); advance(); continue; }
+                    if (!check(Tok::Ident)) { error_here("expected a key"); advance(); continue; }
 
                     const Token& sub = peek();
                     std::string  sk  = advance().text;
                     std::string  text; long long number = 0; bool flag = false; int kind = -1;
                     if (!config_value(text, number, flag, kind)) {
-                        error_here("valor invalido: se esperaba una cadena, un numero, "
+                        error_here("invalid value: expected a string, a number, "
                                    "true/false o env(\"VAR\")");
                         while (!check(Tok::Newline) && !check(Tok::Dedent) &&
                                !check(Tok::EndOfFile)) advance();
@@ -629,26 +629,26 @@ void Parser::parse_app(Program& out) {
                         if      (sk == "secret"  && kind == 0) out.app.session_secret  = text;
                         else if (sk == "max_age" && kind == 1) out.app.session_max_age = (int)number;
                         else if (sk == "secure"  && kind == 2) out.app.session_secure  = flag;
-                        else diags_.error(sub.loc, "clave desconocida o de tipo equivocado "
-                                                   "en session: '" + sk + "'");
+                        else diags_.error(sub.loc, "unknown key or wrong type "
+                                                   "in session: '" + sk + "'");
                     } else {
                         if      (sk == "secret" && kind == 0) out.app.jwt_secret = text;
                         else if (sk == "issuer" && kind == 0) out.app.jwt_issuer = text;
-                        else diags_.error(sub.loc, "clave desconocida o de tipo equivocado "
-                                                   "en jwt: '" + sk + "'");
+                        else diags_.error(sub.loc, "unknown key or wrong type "
+                                                   "in jwt: '" + sk + "'");
                     }
                     skip_newlines();
                 }
                 match(Tok::Dedent);
             }
             else {
-                diags_.error(key.loc, "clave desconocida en el bloque app: '" + k + "'");
+                diags_.error(key.loc, "unknown key in the app block: '" + k + "'");
                 while (!check(Tok::Newline) && !check(Tok::Dedent) &&
                        !check(Tok::EndOfFile)) advance();
             }
         }
         else {
-            error_here("se esperaba una clave de configuracion");
+            error_here("expected a configuration key");
             while (!check(Tok::Newline) && !check(Tok::Dedent) &&
                    !check(Tok::EndOfFile)) advance();
         }
@@ -658,12 +658,12 @@ void Parser::parse_app(Program& out) {
     match(Tok::Dedent);
 }
 
-// ─── Bloques y sentencias ────────────────────────────────────────────────────
+// ─── Blocks and statements ───────────────────────────────────────────────────
 
 Block Parser::parse_block() {
     Block body;
     skip_newlines();
-    if (!expect(Tok::Indent, "al abrir el bloque")) return body;
+    if (!expect(Tok::Indent, "opening the block")) return body;
 
     while (!check(Tok::Dedent) && !check(Tok::EndOfFile)) {
         skip_newlines();
@@ -698,24 +698,24 @@ StmtPtr Parser::parse_statement() {
         default: break;
     }
 
-    // Declaracion de variable: <tipo> <ident> [= expr]
+    // Variable declaration: <type> <ident> [= expr]
     if (looks_like_type()) {
         auto s  = std::make_unique<Stmt>();
         s->kind = StmtKind::VarDecl;
         s->loc  = peek().loc;
         s->type = parse_type();
         if (check(Tok::Ident)) s->name = advance().text;
-        else                   error_here("se esperaba el nombre de la variable");
+        else                   error_here("expected the variable name");
         if (match(Tok::Assign)) s->value = parse_expr();
         return s;
     }
 
-    // Asignacion o expresion suelta.  `x++` es una expresion como cualquier
-    // otra: como sentencia, su valor simplemente se descarta.
+    // Assignment or standalone expression.  `x++` is an expression like any
+    // other: as a statement, its value is simply discarded.
     SourceLoc loc = peek().loc;
     ExprPtr   e   = parse_expr();
 
-    // x += e  →  x = x + e, y asi con los cinco.
+    // x += e  →  x = x + e, and so on for all five.
     if (check(Tok::PlusEq) || check(Tok::MinusEq) || check(Tok::StarEq) ||
         check(Tok::SlashEq) || check(Tok::PercentEq)) {
         const char* op = nullptr;
@@ -728,7 +728,7 @@ StmtPtr Parser::parse_statement() {
         }
         SourceLoc oploc = advance().loc;
         if (!assignable(*e)) {
-            diags_.error(loc, "solo se puede asignar a una variable o a un campo");
+            diags_.error(loc, "can only assign to a variable or a field");
             return nullptr;
         }
         auto bin  = make(ExprKind::Binary, oploc);
@@ -759,14 +759,14 @@ StmtPtr Parser::parse_statement() {
     return s;
 }
 
-// Solo una variable o un campo pueden estar a la izquierda de una asignacion.
+// Only a variable or a field can sit on the left of an assignment.
 bool Parser::assignable(const Expr& e) {
     return e.kind == ExprKind::Ident || e.kind == ExprKind::Member ||
            e.kind == ExprKind::Index;
 }
 
-// Copia el lado izquierdo para poder leerlo y escribirlo en la misma sentencia.
-// Con Ident y Member basta una copia superficial del receptor.
+// Copies the left-hand side so it can be read and written in the same
+// statement.  For Ident and Member a shallow copy of the receiver is enough.
 ExprPtr Parser::clone_target(const Expr& e) {
     auto out  = make(e.kind, e.loc);
     out->text = e.text;
@@ -792,13 +792,13 @@ StmtPtr Parser::parse_if() {
     s->kind = StmtKind::If;
     s->loc  = advance().loc;
     s->value = parse_expr();
-    expect(Tok::Colon, "tras la condicion del if");
+    expect(Tok::Colon, "after the if condition");
     s->body = parse_block();
 
     skip_newlines();
     if (check(Tok::KwElif)) {
-        // `elif` encadena: el else contiene un If completo.  `else if` hace lo
-        // mismo, y se admiten los dos.
+        // `elif` chains: the else holds a complete If.  `else if` does the same,
+        // and both are accepted.
         s->orelse.push_back(parse_if_from_elif());
     }
     else if (check(Tok::KwElse)) {
@@ -806,20 +806,20 @@ StmtPtr Parser::parse_if() {
         if (check(Tok::KwIf)) {
             s->orelse.push_back(parse_if());
         } else {
-            expect(Tok::Colon, "tras 'else'");
+            expect(Tok::Colon, "after 'else'");
             s->orelse = parse_block();
         }
     }
     return s;
 }
 
-// Un `elif` es un `if` cuyo encabezado ya se consumio.
+// An `elif` is an `if` whose header has already been consumed.
 StmtPtr Parser::parse_if_from_elif() {
     auto s   = std::make_unique<Stmt>();
     s->kind  = StmtKind::If;
     s->loc   = advance().loc;                 // 'elif'
     s->value = parse_expr();
-    expect(Tok::Colon, "tras la condicion del elif");
+    expect(Tok::Colon, "after the elif condition");
     s->body = parse_block();
 
     skip_newlines();
@@ -829,7 +829,7 @@ StmtPtr Parser::parse_if_from_elif() {
         advance();
         if (check(Tok::KwIf)) s->orelse.push_back(parse_if());
         else {
-            expect(Tok::Colon, "tras 'else'");
+            expect(Tok::Colon, "after 'else'");
             s->orelse = parse_block();
         }
     }
@@ -841,7 +841,7 @@ StmtPtr Parser::parse_while() {
     s->kind = StmtKind::While;
     s->loc  = advance().loc;
     s->value = parse_expr();
-    expect(Tok::Colon, "tras la condicion del while");
+    expect(Tok::Colon, "after the while condition");
     s->body = parse_block();
     return s;
 }
@@ -852,10 +852,10 @@ StmtPtr Parser::parse_for() {
     s->loc  = advance().loc;
     s->type = parse_type();
     if (check(Tok::Ident)) s->name = advance().text;
-    else                   error_here("se esperaba el nombre de la variable del bucle");
-    expect(Tok::KwIn, "en el bucle for");
+    else                   error_here("expected the loop variable name");
+    expect(Tok::KwIn, "in the for loop");
     s->target = parse_expr();
-    expect(Tok::Colon, "tras el iterable del for");
+    expect(Tok::Colon, "after the for iterable");
     s->body = parse_block();
     return s;
 }
@@ -865,7 +865,7 @@ StmtPtr Parser::parse_require() {
     s->kind = StmtKind::Require;
     s->loc  = advance().loc;
     s->value = parse_expr();
-    if (!expect(Tok::KwElse, "en 'require ... else ...'")) return s;
+    if (!expect(Tok::KwElse, "in 'require ... else ...'")) return s;
     s->target = parse_expr();
     return s;
 }
@@ -874,21 +874,21 @@ StmtPtr Parser::parse_try() {
     auto s  = std::make_unique<Stmt>();
     s->kind = StmtKind::Try;
     s->loc  = advance().loc;
-    expect(Tok::Colon, "tras 'try'");
+    expect(Tok::Colon, "after 'try'");
     s->body = parse_block();
     skip_newlines();
-    if (!expect(Tok::KwCatch, "tras el bloque try")) return s;
+    if (!expect(Tok::KwCatch, "after the try block")) return s;
     if (check(Tok::Ident)) s->name = advance().text;
-    expect(Tok::Colon, "tras 'catch'");
+    expect(Tok::Colon, "after 'catch'");
     s->orelse = parse_block();
     return s;
 }
 
-// ─── Tipos ───────────────────────────────────────────────────────────────────
+// ─── Types ───────────────────────────────────────────────────────────────────
 
-// Distingue `List<string> xs = ...` (declaracion) de `a < b` (expresion).
-// Un tipo es: un identificador o palabra de tipo, opcionalmente con <...> y
-// '?', seguido de un identificador.
+// Tells `List<string> xs = ...` (a declaration) from `a < b` (an expression).
+// A type is: an identifier or type keyword, optionally with <...> and '?',
+// followed by an identifier.
 bool Parser::looks_like_type() const {
     if (!check(Tok::Ident) && !check(Tok::KwVoid)) return false;
 
@@ -914,7 +914,7 @@ TypeRef Parser::parse_type() {
     if (check(Tok::KwVoid)) { advance(); t.name = "void"; return t; }
 
     if (!check(Tok::Ident)) {
-        error_here("se esperaba un tipo");
+        error_here("expected a type");
         return t;
     }
     t.name = advance().text;
@@ -923,14 +923,14 @@ TypeRef Parser::parse_type() {
         do {
             t.args.push_back(parse_type());
         } while (match(Tok::Comma));
-        // El lexer nunca fusiona '>>', asi que cada nivel cierra con su propio Gt.
-        expect(Tok::Gt, "al cerrar los parametros del tipo");
+        // The lexer never merges '>>', so every level closes with its own Gt.
+        expect(Tok::Gt, "closing the type parameters");
     }
     if (match(Tok::Question)) t.optional = true;
     return t;
 }
 
-// ─── Expresiones ─────────────────────────────────────────────────────────────
+// ─── Expressions ─────────────────────────────────────────────────────────────
 
 ExprPtr Parser::make(ExprKind k, SourceLoc loc) {
     auto e  = std::make_unique<Expr>();
@@ -949,7 +949,7 @@ ExprPtr Parser::parse_ternary() {
     auto e = make(ExprKind::Ternary, loc);
     e->object = std::move(cond);
     e->lhs    = parse_expr();
-    expect(Tok::Colon, "en el operador ternario");
+    expect(Tok::Colon, "in the ternary operator");
     e->rhs    = parse_expr();
     return e;
 }
@@ -1035,7 +1035,7 @@ ExprPtr Parser::parse_product() {
 }
 
 ExprPtr Parser::parse_unary() {
-    // ++x / --x : incrementa y da el valor YA incrementado.
+    // ++x / --x : increments and yields the ALREADY incremented value.
     if (check(Tok::PlusPlus) || check(Tok::MinusMinus)) {
         bool      up  = peek().is(Tok::PlusPlus);
         SourceLoc loc = advance().loc;
@@ -1043,7 +1043,7 @@ ExprPtr Parser::parse_unary() {
         e->text = up ? "+" : "-";
         e->lhs  = parse_unary();
         if (e->lhs && !assignable(*e->lhs))
-            diags_.error(loc, "'++' y '--' solo se aplican a una variable o a un campo");
+            diags_.error(loc, "'++' and '--' only apply to a variable or a field");
         return e;
     }
     if (check(Tok::Minus)) {
@@ -1059,12 +1059,12 @@ ExprPtr Parser::parse_postfix() {
     ExprPtr e = parse_primary();
 
     while (true) {
-        // x++ / x-- : incrementa y da el valor ANTERIOR.
+        // x++ / x-- : increments and yields the PREVIOUS value.
         if (check(Tok::PlusPlus) || check(Tok::MinusMinus)) {
             bool      up  = peek().is(Tok::PlusPlus);
             SourceLoc loc = advance().loc;
             if (e && !assignable(*e))
-                diags_.error(loc, "'++' y '--' solo se aplican a una variable o a un campo");
+                diags_.error(loc, "'++' and '--' only apply to a variable or a field");
             auto step  = make(ExprKind::PostStep, loc);
             step->text = up ? "+" : "-";
             step->lhs  = std::move(e);
@@ -1075,10 +1075,10 @@ ExprPtr Parser::parse_postfix() {
             SourceLoc loc = advance().loc;
             auto m = make(ExprKind::Member, loc);
             m->object = std::move(e);
-            // Tras un punto, una palabra reservada es solo un nombre: `state.get`
-            // y `log.error` no tienen por que chocar con `get` y `error`.
+            // After a dot, a reserved word is just a name: `state.get` and
+            // `log.error` need not clash with `get` and `error`.
             if (check(Tok::Ident) || !peek().text.empty()) m->text = advance().text;
-            else error_here("se esperaba un nombre tras '.'");
+            else error_here("expected a name after '.'");
             e = std::move(m);
         }
         else if (check(Tok::LParen)) {
@@ -1089,19 +1089,19 @@ ExprPtr Parser::parse_postfix() {
             while (!check(Tok::RParen) && !check(Tok::EndOfFile)) {
                 Arg a;
                 a.loc = peek().loc;
-                // Argumento con nombre: IDENT '=' expr
+                // Named argument: IDENT '=' expr
                 if (check(Tok::Ident) && peek(1).is(Tok::Assign)) {
                     a.name = advance().text;
                     advance();
                     seen_named = true;
                 } else if (seen_named) {
-                    error_here("los argumentos posicionales van antes que los nombrados");
+                    error_here("positional arguments come before named ones");
                 }
                 a.value = parse_expr();
                 c->args.push_back(std::move(a));
                 if (!match(Tok::Comma)) break;
             }
-            expect(Tok::RParen, "al cerrar la llamada");
+            expect(Tok::RParen, "closing the call");
             e = std::move(c);
         }
         else if (check(Tok::LBracket)) {
@@ -1109,7 +1109,7 @@ ExprPtr Parser::parse_postfix() {
             auto ix = make(ExprKind::Index, loc);
             ix->object = std::move(e);
             ix->lhs    = parse_expr();
-            expect(Tok::RBracket, "al cerrar el indice");
+            expect(Tok::RBracket, "closing the index");
             e = std::move(ix);
         }
         else break;
@@ -1152,8 +1152,8 @@ ExprPtr Parser::parse_primary() {
             return e;
         }
 
-        // Palabras que son a la vez clave y objeto reservado dentro de un
-        // handler: `sse.send(...)`, `ws.recv()`, `error.message`.
+        // Words that are both a keyword and a reserved object inside a handler:
+        // `sse.send(...)`, `ws.recv()`, `error.message`.
         case Tok::KwSse: case Tok::KwWs: case Tok::KwError: {
             auto e = make(ExprKind::Ident, advance().loc);
             e->text = prev().text;
@@ -1169,7 +1169,7 @@ ExprPtr Parser::parse_primary() {
         case Tok::LParen: {
             advance();
             ExprPtr inner = parse_expr();
-            expect(Tok::RParen, "al cerrar el parentesis");
+            expect(Tok::RParen, "closing the parenthesis");
             return inner;
         }
 
@@ -1179,7 +1179,7 @@ ExprPtr Parser::parse_primary() {
                 e->items.push_back(parse_expr());
                 if (!match(Tok::Comma)) break;
             }
-            expect(Tok::RBracket, "al cerrar la lista");
+            expect(Tok::RBracket, "closing the list");
             return e;
         }
 
@@ -1188,17 +1188,17 @@ ExprPtr Parser::parse_primary() {
             while (!check(Tok::RBrace) && !check(Tok::EndOfFile)) {
                 DictEntry entry;
                 entry.key = parse_expr();
-                expect(Tok::Colon, "entre la clave y el valor del diccionario");
+                expect(Tok::Colon, "between the dictionary key and value");
                 entry.value = parse_expr();
                 e->entries.push_back(std::move(entry));
                 if (!match(Tok::Comma)) break;
             }
-            expect(Tok::RBrace, "al cerrar el diccionario");
+            expect(Tok::RBrace, "closing the dictionary");
             return e;
         }
 
         default: {
-            error_here(std::string("se esperaba una expresion, pero hay '") +
+            error_here(std::string("expected an expression, but there is '") +
                        tok_name(t.kind) + "'");
             auto e = make(ExprKind::NullLit, t.loc);
             advance();

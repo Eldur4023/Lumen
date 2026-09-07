@@ -25,8 +25,8 @@ TcpServer::TcpServer(const std::string& host, uint16_t port,
     , conn_count_(conn_count ? std::move(conn_count)
                              : std::make_shared<std::atomic<int>>(0))
 {
-    // Usamos IPv4 cuando el host lo indica (0.0.0.0 o IP v4)
-    // y IPv6 solo cuando se pide explícitamente (::)
+    // IPv4 is used when the host says so (0.0.0.0 or a v4 IP)
+    // and IPv6 only when explicitly asked for (::)
     bool use_ipv6 = (host == "::" || host.find(':') != std::string::npos);
     int family    = use_ipv6 ? AF_INET6 : AF_INET;
 

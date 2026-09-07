@@ -2,12 +2,12 @@ app:
     port 8790
 
 class Alta:
-    string nombre
-    int    edad
+    string name
+    int    age
 
     validate:
-        nombre != ""   "nombre: obligatorio"
-        edad >= 18     "edad: tienes que ser mayor de edad"
+        name != ""   "name: required"
+        age >= 18     "age: must be of age"
 
 class Punto:
     int x
@@ -16,7 +16,7 @@ class Punto:
     fn int cuadrado():
         return this.x * this.x + this.y * this.y
 
-    fn string etiqueta(string prefijo = "P"):
+    fn string label(string prefijo = "P"):
         return prefijo + "(" + str(this.x) + "," + str(this.y) + ")"
 
 fn int doble(int x):
@@ -33,16 +33,16 @@ fn int infinita(int n):
 get endpoint("/__ping__"):
     return { "ok": true }
 
-post endpoint("/alta", Alta a):
-    return { "creado": a.nombre }.status(201)
+post endpoint("/add", Alta a):
+    return { "creado": a.name }.status(201)
 
 get endpoint("/punto/:x/:y", int x, int y):
     Punto p = Punto(x, y)
     return { "cuadrado": p.cuadrado() }
 
-get endpoint("/etiqueta/:x/:y", int x, int y):
+get endpoint("/label/:x/:y", int x, int y):
     Punto p = Punto(x, y)
-    return { "una": p.etiqueta(), "otra": p.etiqueta("Q") }
+    return { "one": p.label(), "other": p.label("Q") }
 
 get endpoint("/doble/:n", int n):
     return { "r": doble(n) }
@@ -54,4 +54,4 @@ get endpoint("/infinita"):
     return { "r": infinita(1) }
 
 on error 422:
-    return { "cuantos": len(error.messages), "detalles": error.messages }
+    return { "count": len(error.messages), "details": error.messages }

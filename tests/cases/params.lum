@@ -1,0 +1,45 @@
+# Parameter binding matrix: origin (path / query / multipart) x type
+# (scalar, optional, File, List<File>) x presence (missing, empty, mistyped).
+#
+# It exists because the multipart bug -- a text parameter always empty on a
+# request with files -- is caught by no test that exercises query and
+# multipart separately.  It only shows up when the two live on the SAME
+# route, which is exactly the pattern the project documents (file +
+# title/album in the same form) and that nobody had tested that way.
+
+app:
+    port 8079
+
+get endpoint("/path/:id", int id):
+    return { "id": id }
+
+get endpoint("/query", string q, int n = 5):
+    return { "q": q, "n": n }
+
+# The exact case of the bug: a text field next to a file.
+post endpoint("/mp/one", File f, string title):
+    return { "title": title, "filename": f.filename }
+
+# The four scalar types that exist, all as text fields of a form with
+# files.
+post endpoint("/mp/types", File f, string s, int n, bool b):
+    return { "s": s, "n": n, "b": b }
+
+# With List<File>, not just File.
+post endpoint("/mp/list", List<File> fs, string album):
+    return { "album": album, "n": len(fs) }
+
+# If it arrives neither in the query nor in the form, the default value still
+# holds -- the fix cannot have broken that path.
+post endpoint("/mp/default", File f, string label = "no-label"):
+    return { "label": label }
+
+# Same name in the query AND in the form's text field: the query wins, being
+# the pre-existing rule and not a new surprise.
+post endpoint("/mp/prioridad", File f, string origin):
+    return { "origin": origin }
+
+# A mistyped scalar inside multipart has to give 400, just as in the query --
+# the new binding cannot skip the type validation.
+post endpoint("/mp/bad", File f, int n):
+    return { "n": n }

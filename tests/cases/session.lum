@@ -2,21 +2,21 @@ app:
     port 8790
 
     session:
-        secret "secreto-de-pruebas-suficientemente-largo"
+        secret "secreto-de-tests-suficientemente-length"
         secure false
 
     jwt:
-        secret "secreto-jwt-de-pruebas"
-        issuer "pruebas"
+        secret "secreto-jwt-de-tests"
+        issuer "tests"
 
 get endpoint("/__ping__"):
     return { "ok": true }
 
 get endpoint("/quien"):
-    return { "usuario": session.usuario, "rol": session.rol }
+    return { "user": session.user, "role": session.role }
 
 group("/admin"):
-    require session.rol == "admin" else status(403)
+    require session.role == "admin" else status(403)
 
     get endpoint("/panel"):
         return { "panel": true }

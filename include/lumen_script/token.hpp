@@ -4,8 +4,8 @@
 
 namespace lumen_script {
 
-// Posicion en el fuente.  `file` apunta a una cadena que vive en el SourceFile,
-// asi que un Token es barato de copiar.
+// Position in the source.  `file` points at a string that lives in the
+// SourceFile, so a Token is cheap to copy.
 struct SourceLoc {
     const std::string* file = nullptr;
     int line = 0;   // 1-indexado
@@ -23,7 +23,7 @@ enum class Tok {
     KwImport, KwClass, KwFn, KwApp, KwGroup, KwEndpoint, KwOn, KwError,
     KwOrigins, KwValidate, KwStatic, KwSpa,
 
-    // Metodos de ruta
+    // Metodos de path
     KwGet, KwPost, KwPut, KwPatch, KwDelete, KwAny, KwSse, KwWs,
 
     // Sentencias
@@ -46,13 +46,13 @@ const char* tok_name(Tok t);
 
 struct Token {
     Tok         kind = Tok::EndOfFile;
-    std::string text;    // lexema; para String ya viene con los escapes resueltos
+    std::string text;    // lexeme; for String the escapes are already resolved
     SourceLoc   loc;
 
     bool is(Tok t) const { return kind == t; }
 };
 
-// Devuelve el Tok de palabra reservada para `s`, o Tok::Ident si no lo es.
+// Returns the reserved-word Tok for `s`, or Tok::Ident if it is not one.
 Tok keyword_or_ident(std::string_view s);
 
 } // namespace lumen_script

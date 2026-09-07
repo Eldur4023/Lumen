@@ -1,153 +1,153 @@
-# Lumen — Guía del desarrollador
+# Lumen — Developer guide
 
-> Referencia práctica de Lumen Script, el lenguaje que interpreta Lumen 2.0. La gramática formal
-> está en [LUMEN_SCRIPT-GRAMMAR.md](LUMEN_SCRIPT-GRAMMAR.md); las decisiones de diseño y sus motivos, en
-> [README.md](README.md#decisiones-de-diseño).
+> A practical reference for Lumen Script, the language Lumen runs. The formal grammar is in
+> [LUMEN_SCRIPT-GRAMMAR.md](LUMEN_SCRIPT-GRAMMAR.md); the design decisions and their reasons,
+> in [README.md](README.md#design-decisions).
 
-## Índice
+## Contents
 
-1. [Poner en marcha](#1-poner-en-marcha)
-2. [Estructura de un proyecto](#2-estructura-de-un-proyecto)
-3. [El bloque `app:`](#3-el-bloque-app)
-4. [Rutas](#4-rutas)
-5. [Parámetros](#5-parámetros)
-6. [Clases y validación](#6-clases-y-validación)
-7. [Respuestas](#7-respuestas)
-8. [Grupos y guardas](#8-grupos-y-guardas)
-9. [Sesión](#9-sesión)
+1. [Getting started](#1-getting-started)
+2. [Project layout](#2-project-layout)
+3. [The `app:` block](#3-the-app-block)
+4. [Routes](#4-routes)
+5. [Parameters](#5-parameters)
+6. [Classes and validation](#6-classes-and-validation)
+7. [Responses](#7-responses)
+8. [Groups and guards](#8-groups-and-guards)
+9. [Session](#9-session)
 10. [JWT](#10-jwt)
-11. [Asincronía](#11-asincronía)
-12. [Base de datos](#12-base-de-datos)
+11. [Async](#11-async)
+12. [Databases](#12-databases)
 13. [Server-Sent Events](#13-server-sent-events)
 14. [WebSockets](#14-websockets)
-15. [Estado compartido](#15-estado-compartido)
-16. [Subida de ficheros](#16-subida-de-ficheros)
-17. [Manejadores de error](#17-manejadores-de-error)
-18. [Funciones](#18-funciones)
-19. [El lenguaje](#19-el-lenguaje)
-20. [Referencia de builtins](#20-referencia-de-builtins)
-21. [Errores frecuentes](#21-errores-frecuentes)
-22. [Cómo funciona por dentro](#22-cómo-funciona-por-dentro)
+15. [Shared state](#15-shared-state)
+16. [File uploads](#16-file-uploads)
+17. [Error handlers](#17-error-handlers)
+18. [Functions](#18-functions)
+19. [The language](#19-the-language)
+20. [Builtin reference](#20-builtin-reference)
+21. [Common errors](#21-common-errors)
+22. [How it works inside](#22-how-it-works-inside)
 
 ---
 
-## 1. Poner en marcha
+## 1. Getting started
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
-Requiere Linux (epoll, `sendfile(2)`, `SO_REUSEPORT`), CMake 3.20+ y C++20. El primer
-`configure` no necesita red: no se baja nada.
+Requires Linux (epoll, `sendfile(2)`, `SO_REUSEPORT`), CMake 3.20+ and C++20. The first
+`configure` needs no network: nothing is downloaded.
 
-Opcional pero recomendado: `sudo apt install libjemalloc-dev`. Con varios event loops y un
-pool de base de datos, el `malloc` de glibc serializa en sus arenas; cambiarlo vale más que
-cualquier optimización del código en respuestas JSON grandes. Si está, `cmake` lo enlaza
-solo; si no, compila igual y lo dice.
+Optional but recommended: `sudo apt install libjemalloc-dev`. With several event loops and a
+database pool, glibc's `malloc` serializes on its arenas; swapping it is worth more than any
+code optimization on large JSON responses. If it is there, `cmake` links it automatically; if
+not, it builds anyway and says so.
 
-El argumento decide qué se compila, sin sorpresas:
+The argument decides what gets compiled, with no surprises:
 
-| Invocación | Qué compila |
+| Invocation | What it compiles |
 |---|---|
-| `lumen app.lum` | Solo ese fichero |
-| `lumen a.lum b.lum` | Solo esos dos |
-| `lumen ./mi-app` | Todos los `.lum` del directorio, recursivamente |
+| `lumen app.lum` | Just that file |
+| `lumen a.lum b.lum` | Just those two |
+| `lumen ./my-app` | Every `.lum` in the directory, recursively |
 
-| Opción | |
+| Option | |
 |---|---|
-| `--check` | Compila y sale, sin arrancar |
-| `--port N` | Sobrescribe el puerto del bloque `app:` |
-| `--no-watch` | No vigila cambios |
-| `--verbose` | Registra por consola cada petición que llega. Cuesta ~25% del rendimiento, así que no viene puesto |
-| `--autotest` | Al arrancar y en cada recarga, recorre los endpoints |
-| `--autotest=all` | Incluye también POST/PUT/PATCH/DELETE |
+| `--check` | Compile and exit, without starting |
+| `--port N` | Override the port from the `app:` block |
+| `--no-watch` | Do not watch for changes |
+| `--verbose` | Log every incoming request to the console. It costs ~25% of the throughput, so it is off by default |
+| `--autotest` | Walk the endpoints on startup and on every reload |
+| `--autotest=all` | Also include POST/PUT/PATCH/DELETE |
 
-### Auto-prueba
+### Self-test
 
-Con `--autotest`, tras arrancar y tras **cada recarga con éxito**, Lumen se pega a sí mismo
-por HTTP y recorre las rutas del módulo:
+With `--autotest`, after startup and after **every successful reload**, Lumen talks to itself
+over HTTP and walks the module's routes:
 
 ```
-cambios detectados: recompilando
-recargado: 11 ruta(s) — 4 declarativa(s), 7 con logica
-autotest: probando 11 ruta(s)
-  ok        GET    /usuarios/1                       200  0ms
-  ERROR     GET    /rota                             500  0ms
-  rechazada GET    /admin/panel                      403  0ms
-  flujo     GET    /eventos                          200  0ms
-  omitida   WS     /chat   (necesita handshake de WebSocket)
-autotest: 8 ok, 2 rechazadas, 1 con error, 1 omitidas
+changes detected: recompiling
+reloaded: 11 route(s) — 4 declarative, 7 with logic
+autotest: probing 11 route(s)
+  ok        GET    /users/1                          200  0ms
+  ERROR     GET    /broken                           500  0ms
+  rejected  GET    /admin/panel                      403  0ms
+  stream    GET    /events                           200  0ms
+  skipped   WS     /chat   (needs a WebSocket handshake)
+autotest: 8 ok, 2 rejected, 1 with an error, 1 skipped
 ```
 
-No comprueba lógica de negocio: busca **que ningún handler se rompa** después de un cambio.
-Por eso un `5xx` es lo único que cuenta como error — un `4xx` puede ser el comportamiento
-correcto de una guarda o de una validación.
+It does not check business logic: it looks for **no handler breaking** after a change. That
+is why a `5xx` is the only thing that counts as an error — a `4xx` can be the correct
+behaviour of a guard or a validation.
 
-Los parámetros de ruta se rellenan por tipo (`:id` de tipo `int` → `1`), y con
-`--autotest=all` el cuerpo se sintetiza a partir de la clase que la ruta espera.
+Route parameters are filled in by type (an `:id` of type `int` → `1`), and with
+`--autotest=all` the body is synthesized from the class the route expects.
 
-**Sobre los efectos secundarios:** probar un endpoint *ejecuta su handler*. Un `DELETE`
-haría su trabajo de verdad en cada recarga, así que por defecto solo se recorren `GET`,
-`HEAD` y `SSE`. Incluir el resto es una decisión de quien lanza el binario, no del binario.
+**On side effects:** probing an endpoint *runs its handler*. A `DELETE` would really do its
+work on every reload, so by default only `GET`, `HEAD` and `SSE` are walked. Including the
+rest is a decision of whoever launches the binary, not of the binary.
 
-El watcher vigila exactamente el conjunto que se compiló. Al guardar, recompila y sustituye
-el módulo. **Si el fichero nuevo no compila, se sigue sirviendo el anterior** y el error se
-imprime con fichero, línea y columna.
+The watcher watches exactly the set that was compiled. On save, it recompiles and replaces
+the module. **If the new file does not compile, the previous one keeps serving** and the
+error is printed with file, line and column.
 
 ---
 
-### Pruebas del propio Lumen
+### Lumen's own tests
 
 ```bash
 cd build && ctest --output-on-failure
-# o directamente:
+# or directly:
 tests/run_tests.sh ~/lumen-build/lumen
 ```
 
-246 pruebas en seis suites:
+246 tests in six suites:
 
-| suite | qué cubre | |
+| suite | what it covers | |
 |---|---|---|
-| `regresion` | el binario por el socket, con `.lum` reales | 79 |
-| `plantillas` | compilar y renderizar, en proceso | 48 |
-| `sqlite` | tipos, límites y caché de sentencias | 37 |
-| `postgres` | tipos, marcadores, transacciones y concurrencia con contenido comprobado | 34 |
-| `mysql` | ídem, más el byte nulo dentro de un texto | 29 |
-| `marcadores` | la traducción de `?` a `$1` | 19 |
+| `regression` | the binary over the socket, with real `.lum` files | 79 |
+| `templates` | compiling and rendering, in process | 48 |
+| `sqlite` | types, limits and the statement cache | 37 |
+| `postgres` | types, placeholders, transactions and concurrency with checked content | 34 |
+| `mysql` | the same, plus the null byte inside a text | 29 |
+| `placeholders` | the translation of `?` to `$1` | 19 |
 
-Las de `mysql` y `postgres` necesitan un servidor y **se saltan solas** si no lo hay; las
-instrucciones para montarlo están en la cabecera de cada guion. La de `sqlite` crea su
-propio esquema y corre siempre. La suite no enlaza nada del proyecto: prueba lo que se despliega,
-no una versión instrumentada de ello.
+The `mysql` and `postgres` ones need a server and **skip themselves** if there is none; the
+instructions for setting one up are in each script's header. The `sqlite` one creates its own
+schema and always runs. The suite links nothing from the project: it tests what gets
+deployed, not an instrumented version of it.
 
 ---
 
-## 2. Estructura de un proyecto
+## 2. Project layout
 
 ```
-mi-app/
-  app.lum           configuración
-  rutas/
-    publico.lum
+my-app/
+  app.lum           configuration
+  routes/
+    public.lum
     admin.lum
-  templates/         plantillas de Lumen Script
-  public/            estáticos
+  templates/         Lumen Script templates
+  public/            static files
 ```
 
-El orden entre ficheros es indiferente: la compilación es en dos pasadas, primero se
-recogen las declaraciones y después se resuelven los nombres. Una clase puede usarse antes
-de declararse, y estar en otro fichero.
+The order between files does not matter: compilation runs in two passes, first the
+declarations are collected and then the names are resolved. A class can be used before it is
+declared, and can live in another file.
 
 ---
 
-## 3. El bloque `app:`
+## 3. The `app:` block
 
-Puede estar en cualquier fichero, pero **solo una vez**.
+It can be in any file, but **only once**.
 
 ```lum
 app:
-    name      "Mi aplicación"
+    name      "My application"
     version   "1.0.0"
     port      8080
     templates "./templates"
@@ -155,9 +155,9 @@ app:
     static "/static" -> "./public"
     static "/"       -> "./dist" spa
 
-    docs                      # /openapi.json y /docs
+    docs                      # /openapi.json and /docs
     health                    # /health
-    metrics                   # /metrics, formato Prometheus
+    metrics                   # /metrics, Prometheus format
 
     session:
         secret  env("SESSION_SECRET")
@@ -166,316 +166,317 @@ app:
 
     jwt:
         secret env("JWT_SECRET")
-        issuer "mi-app"
+        issuer "my-app"
 ```
 
-`env("VAR")` se resuelve **al compilar**. Es la forma de que un secreto no acabe escrito en
-el `.lum`.
+`env("VAR")` is resolved **at compile time**. It is how a secret avoids ending up written in
+the `.lum`.
 
-`spa` en un montaje estático hace que las rutas no encontradas caigan en `index.html`.
+`spa` on a static mount makes routes that are not found fall back to `index.html`.
 
 ---
 
-## 4. Rutas
+## 4. Routes
 
 ```lum
-get    endpoint("/ruta"):
-post   endpoint("/ruta"):
-put    endpoint("/ruta"):
-patch  endpoint("/ruta"):
-delete endpoint("/ruta"):
-any    endpoint("/ruta"):
-sse    endpoint("/ruta"):                       # flujo de eventos
-ws     endpoint("/ruta") origins("https://x"):  # WebSocket
+get    endpoint("/path"):
+post   endpoint("/path"):
+put    endpoint("/path"):
+patch  endpoint("/path"):
+delete endpoint("/path"):
+any    endpoint("/path"):
+sse    endpoint("/path"):                       # event stream
+ws     endpoint("/path") origins("https://x"):  # WebSocket
 ```
 
-Patrones: `/usuarios/:id`, `/usuarios/{id}`, `/ficheros/*`.
+Patterns: `/users/:id`, `/users/{id}`, `/files/*`.
 
-### Los dos niveles de ruta
+### The two route levels
 
-Una ruta cuyo cuerpo se resuelve entero en compilación —un único `return` de un valor
-constante o de una llamada nativa con argumentos literales— se convierte en una **acción
-nativa** y no ejecuta ni un paso de bytecode:
+A route whose body is resolved entirely at compile time —a single `return` of a constant
+value or of a native call with literal arguments— becomes a **native action** and does not
+run a single bytecode step:
 
 ```lum
 get endpoint("/"):
-    return render("index.html")        # declarativa: cero bytecode
+    return render("index.html")        # declarative: zero bytecode
 ```
 
-El resto ejecuta bytecode. Al arrancar, el binario dice cuántas van por cada camino:
+The rest run bytecode. On startup, the binary says how many take each path:
 
 ```
-lumen: 3 fichero(s), 12 ruta(s) — 5 declarativa(s), 7 con logica
+lumen: 3 file(s), 12 route(s) — 5 declarative, 7 with logic
 ```
 
-Una ruta con guardas de grupo **nunca** es declarativa: la acción nativa no las ejecutaría.
+A route with group guards is **never** declarative: the native action would not run them.
 
 ---
 
-## 5. Parámetros
+## 5. Parameters
 
-Todo lo que el handler necesita se declara en la firma.
+Everything the handler needs is declared in the signature.
 
 ```lum
-get endpoint("/usuarios/:id", int id, int page = 1, string q):
+get endpoint("/users/:id", int id, int page = 1, string q):
     return { "id": id, "page": page, "q": q }
 ```
 
-| Forma | De dónde sale |
+| Form | Where it comes from |
 |---|---|
-| Nombre que aparece en el patrón | Segmento de la ruta |
-| Nombre que no aparece | Query string |
-| `= valor` | Valor por defecto si falta en la query |
-| Tipo que es una `class` | Cuerpo JSON, con validación |
-| `File` / `List<File>` | Partes multipart |
+| A name that appears in the pattern | Route segment |
+| A name that does not appear | Query string |
+| `= value` | Default value if missing from the query |
+| A type that is a `class` | JSON body, with validation |
+| `File` / `List<File>` | Multipart parts |
 
-Tipos escalares: `int`, `long`, `float`, `double`, `bool`, `string`.
+Scalar types: `int`, `long`, `float`, `double`, `bool`, `string`.
 
-**El compilador verifica las dos direcciones**: que cada `:nombre` del patrón tiene un
-parámetro que lo recoge, y que ningún parámetro de ruta sobra.
+**The compiler checks both directions**: that every `:name` in the pattern has a parameter
+that binds it, and that no route parameter is left over.
 
-Un valor que no encaja con su tipo es un **400**, no una excepción:
+A value that does not fit its type is a **400**, not an exception:
 
 ```json
-{"error":"parametro invalido","esperado":"int","param":"id","recibido":"abc"}
+{"error":"invalid parameter","expected":"int","param":"id","received":"abc"}
 ```
 
 ---
 
-## 6. Clases y validación
+## 6. Classes and validation
 
 ```lum
-class Usuario:
+class User:
     int     id
-    string  nombre
-    int     edad
-    string? contrasena          # ? = puede faltar
+    string  name
+    int     age
+    string? password            # ? = may be missing
 
     validate:
-        nombre != ""    "nombre: obligatorio"
-        edad >= 0       "edad: no puede ser negativa"
-        edad < 150      "edad: valor poco creible"
+        name != ""      "name: required"
+        age >= 0        "age: cannot be negative"
+        age < 150       "age: hardly believable value"
 ```
 
-Usada como parámetro, se enlaza al cuerpo:
+Used as a parameter, it binds to the body:
 
 ```lum
-post endpoint("/usuarios", Usuario u):
-    # Aquí `u` siempre es válido.
-    return { "creado": u.nombre }
+post endpoint("/users", User u):
+    # Here `u` is always valid.
+    return { "created": u.name }
 ```
 
-| Situación | Respuesta |
+| Situation | Response |
 |---|---|
-| Cuerpo que no es JSON | `400 {"error":"JSON invalido"}` |
-| Falta un campo obligatorio | `422` con `"campo: obligatorio"` |
-| Tipo equivocado | `422` con `"campo: se esperaba int"` |
-| Una regla de `validate` falla | `422` con su mensaje |
+| A body that is not JSON | `400 {"error":"invalid JSON"}` |
+| A required field is missing | `422` with `"field: required"` |
+| Wrong type | `422` with `"field: expected int"` |
+| A `validate` rule fails | `422` with its message |
 
-**Los mensajes salen todos a la vez**, no el primero. Y el handler no llega a ejecutarse.
+**Every message comes out at once**, not just the first. And the handler never runs.
 
-No hay coerción: `"30"` en un campo `int` es un 422, no se parsea.
+There is no coercion: `"30"` in an `int` field is a 422, it is not parsed.
 
-Las reglas de `validate` **se compilan**, así que un campo mal escrito en una regla es un
-error de compilación y no llega a producción:
+The `validate` rules **are compiled**, so a misspelled field in a rule is a compile error and
+never reaches production:
 
 ```
-./app.lum:9:9: error: 'nombrre' no esta declarada
+./app.lum:9:9: error: 'namme' is not declared
 ```
 
-### Constructores
+### Constructors
 
 ```lum
-class Punto:
+class Point:
     int x
     int y
 
-    Punto(int x):              # con cuerpo
+    Point(int x):              # with a body
         this.x = x
         this.y = 0
 
-    Punto(int x, int y)        # sin cuerpo: cada parámetro va a su campo
+    Point(int x, int y)        # without a body: each parameter goes to its field
 ```
 
-Se distinguen por el **número** de parámetros. Sin ninguno declarado, se ofrece uno con
-todos los campos en orden de declaración. Los campos que el constructor no toque valen
-`null`.
+They are told apart by the **number** of parameters. With none declared, one with every
+field in declaration order is offered. Fields the constructor does not touch are `null`.
 
-### Métodos
+### Methods
 
 ```lum
-class Punto:
+class Point:
     int x
     int y
 
-    fn int cuadrado():
+    fn int squared():
         return this.x * this.x + this.y * this.y
 
-    fn string etiqueta(string prefijo = "P"):
-        return prefijo + "(" + str(this.x) + "," + str(this.y) + ")"
+    fn string label(string prefix = "P"):
+        return prefix + "(" + str(this.x) + "," + str(this.y) + ")"
 
-    fn Punto desplazado(int dx, int dy):
-        return Punto(this.x + dx, this.y + dy)
+    fn Point moved(int dx, int dy):
+        return Point(this.x + dx, this.y + dy)
 ```
 
 ```lum
-Punto p = Punto(3, 4)
-p.cuadrado()            # 25
-p.etiqueta("Q")         # "Q(3,4)"
+Point p = Point(3, 4)
+p.squared()           # 25
+p.label("Q")          # "Q(3,4)"
 ```
 
-Métodos y constructores se compilan como funciones con `this` de primer parámetro, así que
-usan la misma pila de marcos y admiten recursión y valores por defecto igual que `fn`.
+Methods and constructors compile as functions with `this` as the first parameter, so they use
+the same frame stack and support recursion and default values just like `fn`.
 
-La llamada **se resuelve al compilar** a partir del tipo declarado del receptor, así que un
-método mal escrito no llega a producción:
+The call **is resolved at compile time** from the receiver's declared type, so a misspelled
+method never reaches production:
 
 ```
-./app.lum:8:20: error: 'P' no tiene un metodo 'triple'
+./app.lum:8:20: error: 'P' has no method 'triple'
 ```
 
-Una instancia construida y una enlazada del cuerpo de la petición son lo mismo: los métodos
-funcionan igual sobre las dos.
+An instance built by hand and one bound from the request body are the same thing: methods
+work the same on both.
 
 ---
 
-## 7. Respuestas
+## 7. Responses
 
-Todo sale por `return`. No hay objeto `response` que arrastrar.
+Everything goes out through `return`. There is no `response` object to carry around.
 
 ```lum
-return { "clave": "valor" }              # 200, JSON
+return { "key": "value" }                # 200, JSON
 return [1, 2, 3]                         # 200, JSON
-return render("pagina.html", k=v)        # HTML con plantillas de Lumen Script
-return text("hola")                      # text/plain
-return html("<h1>hola</h1>")             # text/html
+return render("page.html", k=v)          # HTML with Lumen Script templates
+return text("hello")                     # text/plain
+return html("<h1>hello</h1>")            # text/html
 return send_file("/var/f.pdf")           # sendfile(2)
-return redirect("/otro")                 # 302
-return redirect("/otro", 301)            # 301
-return status(204)                       # código sin cuerpo
+return redirect("/other")                # 302
+return redirect("/other", 301)           # 301
+return status(204)                       # status code, no body
 ```
 
-Un handler que no devuelve nada y no escribe respuesta produce **204**.
+A handler that returns nothing and writes no response produces **204**.
 
-### Encadenado
+### Chaining
 
 ```lum
 return { "id": 1 }.status(201)
-return { "a": 1 }.header("X-Cosa", "valor")
+return { "a": 1 }.header("X-Thing", "value")
 return render("x.html").status(203)
 
-return { "ok": true }.cookie("tema", "oscuro",
+return { "ok": true }.cookie("theme", "dark",
                              max_age=3600, http_only=false, same_site="strict")
 ```
 
-Opciones de `cookie`: `max_age`, `path`, `domain`, `secure`, `http_only`, `same_site`
-(`"lax"`, `"strict"`, `"none"`). Por defecto: `path=/`, `HttpOnly`, `SameSite=Lax`.
+`cookie` options: `max_age`, `path`, `domain`, `secure`, `http_only`, `same_site`
+(`"lax"`, `"strict"`, `"none"`). Defaults: `path=/`, `HttpOnly`, `SameSite=Lax`.
 
 ---
 
-## 8. Grupos y guardas
+## 8. Groups and guards
 
 ```lum
 group("/api/v1"):
     require jwt.valid else status(401)
 
-    get endpoint("/yo"):
+    get endpoint("/me"):
         return { "sub": jwt.claims["sub"] }
 
     group("/admin"):
-        require jwt.claims["rol"] == "admin" else status(403)
+        require jwt.claims["role"] == "admin" else status(403)
 
         get endpoint("/stats"):
-            return { "usuarios": state.get("usuarios", 0) }
+            return { "users": state.get("users", 0) }
 ```
 
-Los prefijos se concatenan y **las guardas se acumulan**: para llegar a `/api/v1/admin/stats`
-hay que pasar la del grupo padre y luego la propia.
+The prefixes are concatenated and **the guards accumulate**: to reach `/api/v1/admin/stats`
+you have to pass the parent group's and then its own.
 
-`require X else Y` es azúcar de `if not X: return Y`. Funciona en cualquier posición, no
-solo en un grupo. No hay concepto de middleware.
+`require X else Y` is sugar for `if not X: return Y`. It works anywhere, not only inside a
+group. There is no middleware concept.
 
-Las guardas van **antes** que las rutas dentro del bloque.
+Guards go **before** the routes inside the block.
 
 ---
 
-## 9. Sesión
+## 9. Session
 
-Cookie firmada con HMAC-SHA256, al estilo Flask. Sin estado en servidor.
+A cookie signed with HMAC-SHA256, Flask style. No server-side state.
 
 ```lum
-post endpoint("/login", Login datos):
-    session.usuario = datos.nombre
-    session.rol     = "admin"
+post endpoint("/login", Login data):
+    session.user = data.name
+    session.role = "admin"
     return redirect("/")
 
-get endpoint("/quien"):
-    return { "usuario": session.usuario, "rol": session.rol }
+get endpoint("/who"):
+    return { "user": session.user, "role": session.role }
 
 post endpoint("/logout"):
     session.clear()
     return redirect("/")
 ```
 
-`session.<lo-que-sea>` admite cualquier nombre: es un almacén, no un objeto de campos
-fijos. Un campo que no existe vale `null`.
+`session.<whatever>` accepts any name: it is a store, not an object with fixed fields. A
+field that does not exist is `null`.
 
-- Necesita `session: secret ...` en el bloque `app:`. Sin él, tocarla es un error de ejecución.
-- Va **`HttpOnly`** siempre; `Secure` según la configuración.
-- Solo se reescribe la cookie si el handler la modifica.
-- El contenido va **firmado pero no cifrado**: el usuario puede leerlo, solo no puede
-  falsificarlo. No guardes ahí nada que no pueda ver.
-- Una firma inválida deja la sesión vacía, nunca a medias.
+- It needs `session: secret ...` in the `app:` block. Without it, touching it is a runtime error.
+- It is always **`HttpOnly`**; `Secure` depends on the configuration.
+- The cookie is only rewritten if the handler modifies it.
+- The content is **signed but not encrypted**: the user can read it, they just cannot forge
+  it. Do not keep anything there they should not see.
+- An invalid signature leaves the session empty, never half-filled.
 
 ---
 
 ## 10. JWT
 
-HS256, verificado sobre la cabecera `Authorization: Bearer ...`.
+HS256, verified against the `Authorization: Bearer ...` header.
 
 ```lum
 group("/api"):
     require jwt.valid else status(401)
 
-    get endpoint("/yo"):
-        return { "sub": jwt.claims["sub"], "rol": jwt.claims["rol"] }
+    get endpoint("/me"):
+        return { "sub": jwt.claims["sub"], "role": jwt.claims["role"] }
 ```
 
-Se comprueban firma, `exp` e `iss` (si se configuró `issuer`). **Se rechaza cualquier `alg`
-que no sea HS256, incluido `none`**: aceptar el algoritmo que declara el propio token es la
-vulnerabilidad clásica de las librerías de JWT.
+Signature, `exp` and `iss` (if an `issuer` was configured) are checked. **Any `alg` other
+than HS256 is rejected, `none` included**: accepting the algorithm the token itself declares
+is the classic JWT library vulnerability.
 
-RS256 no está: requeriría criptografía asimétrica, y Lumen 2.0 no enlaza OpenSSL.
+RS256 is not there: it would require asymmetric cryptography, and Lumen does not link
+OpenSSL.
 
 ---
 
-## 11. Asincronía
+## 11. Async
 
 ```lum
-get endpoint("/lento/:ms", int ms):
+get endpoint("/slow/:ms", int ms):
     await sleep(ms)
-    return { "esperado": ms }
+    return { "waited": ms }
 ```
 
-`await` suspende el handler y devuelve el control al event loop. Ocho peticiones de 500 ms
-concurrentes tardan 500 ms, no cuatro segundos.
+`await` suspends the handler and hands control back to the event loop. Eight concurrent
+500 ms requests take 500 ms, not four seconds.
 
-`sleep()` despierta antes si el cliente se desconecta, y en ese caso el handler no continúa.
+`sleep()` wakes early if the client disconnects, and in that case the handler does not carry
+on.
 
-Reglas comprobadas al compilar:
+Rules checked at compile time:
 
-- Un builtin asíncrono **obliga** a `await`: `sleep(100)` a secas es un error.
-- Uno síncrono **lo prohíbe**: `await text("x")` es un error.
-- `await` solo se aplica a una llamada asíncrona: `await 5` es un error.
+- An asynchronous builtin **requires** `await`: a bare `sleep(100)` is an error.
+- A synchronous one **forbids** it: `await text("x")` is an error.
+- `await` only applies to an asynchronous call: `await 5` is an error.
 
-Asíncronos disponibles: `sleep(ms)` y `ws.recv()`.
+Available asynchronous builtins: `sleep(ms)` and `ws.recv()`.
 
 ---
 
-## 12. Base de datos
+## 12. Databases
 
-Tres módulos: `sqlite`, `postgres` y `mysql`. Se importan y se configuran; la conexión la
-gestionan ellos.
+Three modules: `sqlite`, `postgres` and `mysql`. You import and configure them; they manage
+the connection.
 
 ```lum
 import postgres
@@ -484,164 +485,166 @@ app:
     postgres:
         host     "127.0.0.1"
         port     5432
-        database "mi_app"
+        database "my_app"
         user     "lumen_script"
         password env("PG_PASSWORD")
         pool     4
 ```
 
-Cada módulo se compila solo si su cliente estaba presente al compilar Lumen. Si no,
-`import postgres` da un error al compilar el `.lum`, no un fallo raro en producción.
+Each module is only compiled if its client was present when Lumen was built. If not,
+`import postgres` gives an error when compiling the `.lum`, not a strange failure in
+production.
 
-### Configuración
+### Configuration
 
-| Módulo | Claves |
+| Module | Keys |
 |---|---|
-| `sqlite` | `file` (obligatoria), `pool`, `timeout_ms` |
-| `postgres` | `url`, o bien `host` / `port` / `database` (obligatoria) / `user` / `password`; `pool` |
+| `sqlite` | `file` (required), `pool`, `timeout_ms` |
+| `postgres` | `url`, or else `host` / `port` / `database` (required) / `user` / `password`; `pool` |
 | `mysql` | `host` / `port` / `database` / `user` / `password`; `pool` |
 
-`pool` es el número de conexiones, entre 1 y 64. Por defecto 4. Usa `env()` para las
-contraseñas: se resuelve al compilar y no queda escrita en el `.lum`.
+`pool` is the number of connections, between 1 and 64. Defaults to 4. Use `env()` for
+passwords: it is resolved at compile time and does not stay written in the `.lum`.
 
-### Consultar
+---
+
+### Querying
 
 ```lum
-get endpoint("/articulos"):
-    return await postgres.query("select id, titulo from articulos order by id")
+get endpoint("/articles"):
+    return await postgres.query("select id, title from articles order by id")
 
-get endpoint("/articulos/:id", int id):
-    List<Json> filas = await postgres.query("select titulo from articulos where id = ?", id)
-    if len(filas) == 0:
+get endpoint("/articles/:id", int id):
+    List<Json> rows = await postgres.query("select title from articles where id = ?", id)
+    if len(rows) == 0:
         return status(404)
-    return filas[0]
+    return rows[0]
 ```
 
-`query()` devuelve `List<Json>`: una lista de diccionarios, con los tipos del motor
-convertidos a los de Lumen Script —entero, decimal, booleano, cadena y `null`—.
+`query()` returns `List<Json>`: a list of dictionaries, with the engine's types converted to
+Lumen Script's —integer, decimal, boolean, string and `null`.
 
-Las columnas binarias —`BLOB` en sqlite y mysql— llegan en **base64**, no como cadena. No
-es una preferencia: un blob son bytes cualesquiera, y devolverlos como texto dejaba la
-respuesta sin ser UTF-8 válido, con lo que fallaba el cliente que la recibía en vez de la
-petición. En postgres un `bytea` llega en el hexadecimal de libpq (`h656c6c6f`).
+Binary columns —`BLOB` in sqlite and mysql— arrive in **base64**, not as a string. It is not
+a preference: a blob is arbitrary bytes, and returning them as text left the response not
+valid UTF-8, so the client receiving it failed rather than the request. In postgres a `bytea`
+arrives in libpq's hex form (`\x68656c6c6f`).
 
 ```lum
-post endpoint("/articulos", Articulo a):
-    int filas = await sqlite.exec(
-        "insert into articulos (titulo, vistas) values (?, ?)", a.titulo, a.vistas)
+post endpoint("/articles", Article a):
+    int rows = await sqlite.exec(
+        "insert into articles (title, views) values (?, ?)", a.title, a.views)
     int id = await sqlite.last_id()
     return { "id": id }.status(201)
 ```
 
-`exec()` devuelve el número de filas afectadas. `last_id()` devuelve el último id
-autogenerado **en sqlite y mysql**.
+`exec()` returns the number of affected rows. `last_id()` returns the last auto-generated id
+**in sqlite and mysql**.
 
-**Postgres no lo tiene**, y el módulo lo dice en vez de inventárselo: ahí el id se pide en
-la propia consulta, que además es más fiable porque no depende de qué conexión atendió el
-insert.
+**Postgres does not have it**, and the module says so instead of making one up: there the id
+is asked for in the query itself, which is more reliable anyway because it does not depend on
+which connection served the insert.
 
 ```lum
-post endpoint("/articulos", Articulo a):
-    List<Json> filas = await postgres.query(
-        "insert into articulos (titulo, vistas) values (?, ?) returning id",
-        a.titulo, a.vistas)
-    return filas[0].status(201)
+post endpoint("/articles", Article a):
+    List<Json> rows = await postgres.query(
+        "insert into articles (title, views) values (?, ?) returning id",
+        a.title, a.views)
+    return rows[0].status(201)
 ```
 
-**Los parámetros van siempre aparte, nunca concatenados.** Concatenar la consulta a mano es
-la única forma de abrirse a una inyección, y el lenguaje no te la pone fácil.
+**Parameters always travel separately, never concatenated.** Concatenating the query by hand
+is the only way to open yourself to an injection, and the language does not make it easy.
 
-El marcador es **`?` en los tres motores**. Postgres numera los suyos —`$1`, `$2`…— pero de
-eso se encarga su driver, así que la misma consulta vale para sqlite, mysql y postgres sin
-tocar una letra:
+The placeholder is **`?` in all three engines**. Postgres numbers its own —`$1`, `$2`…— but
+its driver takes care of that, so the same query works on sqlite, mysql and postgres without
+changing a letter:
 
 ```lum
-await sqlite.query(  "select titulo from articulos where id = ?", id)
-await mysql.query(   "select titulo from articulos where id = ?", id)
-await postgres.query("select titulo from articulos where id = ?", id)
+await sqlite.query(  "select title from articles where id = ?", id)
+await mysql.query(   "select title from articles where id = ?", id)
+await postgres.query("select title from articles where id = ?", id)
 ```
 
-Tres detalles de la traducción, que solo importan en postgres:
+Three details of the translation, which only matter in postgres:
 
-- Una consulta escrita con `$1` sale intacta, así que el código anterior a esto sigue
-  funcionando.
-- Un `?` dentro de una cadena, de un identificador entrecomillado, de un comentario o de un
-  bloque `$$…$$` no es un marcador y no se toca.
-- `?` es además el operador de JSONB de postgres —`datos ? 'clave'`—. Si la consulta **no
-  lleva parámetros** no se traduce nada y el operador funciona tal cual; si los lleva, se
-  escribe `??` para decir «este es el operador, no un marcador».
+- A query written with `$1` comes out untouched, so code written before this keeps working.
+- A `?` inside a string, a quoted identifier, a comment or a `$$…$$` block is not a
+  placeholder and is left alone.
+- `?` is also postgres's JSONB operator —`data ? 'key'`. If the query carries **no
+  parameters** nothing is translated and the operator works as is; if it does carry them,
+  write `??` to say "this is the operator, not a placeholder".
 
-Mezclar `?` y `$1` en la misma consulta es un error, porque la numeración chocaría.
+Mixing `?` and `$1` in the same query is an error, because the numbering would clash.
 
-### Transacciones
+### Transactions
 
 ```lum
-post endpoint("/transfiere"):
+post endpoint("/transfer"):
     await sqlite.begin()
-    await sqlite.exec("update cuentas set saldo = saldo - 30 where id = 1")
-    await sqlite.exec("update cuentas set saldo = saldo + 30 where id = 2")
+    await sqlite.exec("update accounts set balance = balance - 30 where id = 1")
+    await sqlite.exec("update accounts set balance = balance + 30 where id = 2")
     await sqlite.commit()
     return { "ok": true }
 ```
 
-`begin()` fija la conexión: todo lo que venga después en esa petición va por la misma, y
-`commit()` o `rollback()` la sueltan. Si el handler termina —o revienta— con una
-transacción abierta, Lumen hace `ROLLBACK` y lo avisa por consola. Sin eso, la siguiente
-petición que cogiera esa conexión del pool heredaría el estado.
+`begin()` pins the connection: everything that follows in that request goes through the same
+one, and `commit()` or `rollback()` release it. If the handler ends —or blows up— with a
+transaction open, Lumen issues a `ROLLBACK` and warns on the console. Without that, the next
+request to take that connection from the pool would inherit the state.
 
-### Errores
+### Errors
 
-Un error del motor no revienta el handler: llega como un diccionario con `error`.
+An engine error does not blow up the handler: it arrives as a dictionary with `error`.
 
 ```lum
-get endpoint("/malo"):
-    Json r = await sqlite.query("select * from no_existe")
-    return r          # { "error": "no such table: no_existe" }
+get endpoint("/bad"):
+    Json r = await sqlite.query("select * from does_not_exist")
+    return r          # { "error": "no such table: does_not_exist" }
 ```
 
-### Por qué no bloquea
+### Why it does not block
 
-Los clientes de sqlite, libpq y libmysqlclient son síncronos. Cada módulo mantiene un pool
-de hilos con **una conexión por trabajador**; el `await` encola el trabajo, suelta el event
-loop y lo retoma cuando el hilo termina. Ningún `query()` para el event loop, que es lo que
-haría que todo el argumento de eficiencia se cayera.
+The sqlite, libpq and libmysqlclient clients are synchronous. Each module keeps a thread pool
+with **one connection per worker**; `await` queues the work, releases the event loop and
+picks it back up when the thread finishes. No `query()` stops the event loop, which is what
+would make the whole efficiency argument collapse.
 
 ---
 
 ## 13. Server-Sent Events
 
 ```lum
-sse endpoint("/metricas/:cada", int cada):
+sse endpoint("/metrics/:every", int every):
     int tick = 0
-    sse.send("snapshot", "{\"arranque\":true}")
+    sse.send("snapshot", "{\"startup\":true}")
 
     while sse.open:
-        await sleep(cada)
+        await sleep(every)
         tick = tick + 1
         sse.send("delta", "{\"tick\":" + str(tick) + "}", str(tick))
         if tick % 10 == 0:
             sse.ping("keepalive")
 ```
 
-| Llamada | Trama |
+| Call | Frame |
 |---|---|
-| `sse.send(datos)` | `data: ...` |
-| `sse.send(evento, datos)` | `event: ...` + `data: ...` |
-| `sse.send(evento, datos, id)` | añade `id:`, para reconexión con `Last-Event-ID` |
-| `sse.ping(texto)` | comentario `: ...`, ignorado por el navegador |
-| `sse.open` | falso cuando la conexión se cierra |
+| `sse.send(data)` | `data: ...` |
+| `sse.send(event, data)` | `event: ...` + `data: ...` |
+| `sse.send(event, data, id)` | adds `id:`, for reconnection with `Last-Event-ID` |
+| `sse.ping(text)` | a `: ...` comment, ignored by the browser |
+| `sse.open` | false when the connection closes |
 
-El flujo se abre antes de ejecutar el handler y se cierra al terminar. No hay respuesta
-final que devolver.
+The stream is opened before the handler runs and closed when it ends. There is no final
+response to return.
 
 ---
 
 ## 14. WebSockets
 
 ```lum
-ws endpoint("/eco") origins("https://miapp.com", "http://localhost:5173"):
+ws endpoint("/echo") origins("https://myapp.com", "http://localhost:5173"):
     int n = 0
-    ws.send("bienvenido")
+    ws.send("welcome")
 
     while ws.open:
         string msg = await ws.recv()
@@ -649,129 +652,127 @@ ws endpoint("/eco") origins("https://miapp.com", "http://localhost:5173"):
             break
 
         n = n + 1
-        if msg == "adios":
-            ws.send("cerrando tras " + str(n) + " mensajes")
+        if msg == "bye":
+            ws.send("closing after " + str(n) + " messages")
             ws.close()
             break
 
-        ws.send("eco " + str(n) + ": " + msg)
+        ws.send("echo " + str(n) + ": " + msg)
 ```
 
-`await ws.recv()` devuelve el texto del mensaje, o `null` cuando la conexión se cierra.
+`await ws.recv()` returns the message text, or `null` when the connection closes.
 
-**`origins(...)` es obligatorio**, y su ausencia es error de compilación. Los navegadores no
-aplican la política de mismo origen al handshake de WebSocket: sin lista blanca, cualquier
-web puede abrir la conexión desde el navegador de tu usuario y heredar sus cookies. Un
-origen fuera de la lista recibe `403`.
+**`origins(...)` is required**, and leaving it out is a compile error. Browsers do not apply
+the same-origin policy to the WebSocket handshake: without an allowlist, any site can open
+the connection from your user's browser and inherit their cookies. An origin outside the list
+gets a `403`.
 
 ---
 
-## 15. Estado compartido
+## 15. Shared state
 
 ```lum
-get endpoint("/visitas"):
-    return { "n": state.incr("visitas") }
+get endpoint("/visits"):
+    return { "n": state.incr("visits") }
 
-get endpoint("/contador"):
-    return { "n": state.get("visitas", 0) }
+get endpoint("/counter"):
+    return { "n": state.get("visits", 0) }
 ```
 
 | | |
 |---|---|
-| `state.incr(clave)` / `state.incr(clave, n)` | Suma y devuelve el valor nuevo |
-| `state.decr(clave)` / `state.decr(clave, n)` | Resta |
-| `state.get(clave)` / `state.get(clave, defecto)` | Lee |
-| `state.set(clave, valor)` | Escribe |
-| `state.remove(clave)` | Borra |
+| `state.incr(key)` / `state.incr(key, n)` | Adds and returns the new value |
+| `state.decr(key)` / `state.decr(key, n)` | Subtracts |
+| `state.get(key)` / `state.get(key, default)` | Reads |
+| `state.set(key, value)` | Writes |
+| `state.remove(key)` | Deletes |
 
-Es la **única** vía de estado común entre los event loops: cada VM tiene su pila y su heap y
-no comparte nada. Por eso expone operaciones y no propiedades — `state.x = state.x + 1`
-sería una carrera entre la lectura y la escritura.
+It is the **only** shared-state path between the event loops: each VM has its own stack and
+heap and shares nothing. That is why it exposes operations and not properties —
+`state.x = state.x + 1` would be a race between the read and the write.
 
-Vive en memoria del proceso: se pierde al reiniciar, y no se comparte entre máquinas.
+It lives in process memory: it is lost on restart, and is not shared between machines.
 
 ---
 
-## 16. Subida de ficheros
+## 16. File uploads
 
 ```lum
-post endpoint("/avatar", File imagen):
-    require imagen.content_type.starts_with("image/") else status(415)
-    require imagen.size <= 5 * 1024 * 1024            else status(413)
-    string nombre = imagen.save("./subidas")
-    return { "url": "/static/subidas/" + nombre }
+post endpoint("/avatar", File image):
+    require image.content_type.starts_with("image/") else status(415)
+    require image.size <= 5 * 1024 * 1024             else status(413)
+    string name = image.save("./uploads")
+    return { "url": "/static/uploads/" + name }
 
-post endpoint("/galeria", List<File> fotos):
-    List<string> nombres = []
-    for File f in fotos:
-        nombres.add(f.save("./subidas"))
-    return { "nombres": nombres }
+post endpoint("/gallery", List<File> photos):
+    List<string> names = []
+    for File f in photos:
+        names.add(f.save("./uploads"))
+    return { "names": names }
 ```
 
-Un `File` tiene `name`, `filename`, `content_type` y `size`, y el método `save(directorio)`,
-que devuelve el nombre con el que se guardó.
+A `File` has `name`, `filename`, `content_type` and `size`, plus the method
+`save(directory)`, which returns the name it was saved under.
 
-`save()` se queda solo con el componente de fichero del nombre: un `filename` con `..` o
-absoluto no puede escapar del directorio de destino.
+`save()` keeps only the file component of the name: a `filename` with `..` or an absolute one
+cannot escape the target directory.
 
-Con `File` (no `List<File>`), la ausencia del fichero es un `422`. Con `List<File>`, una
-lista vacía.
+With `File` (not `List<File>`), a missing file is a `422`. With `List<File>`, an empty list.
 
 ---
 
-## 17. Manejadores de error
+## 17. Error handlers
 
 ```lum
 on error 404:
-    return render("404.html", ruta=request.path, metodo=request.method)
+    return render("404.html", path=request.path, method=request.method)
 
 on error 403:
-    return { "error": "no puedes entrar aqui", "codigo": error.code }
+    return { "error": "you cannot come in here", "code": error.code }
 
 on error:
     log.error(error.message)
     return render("500.html")
 ```
 
-En un `on error 422`, `error.messages` trae la lista completa de mensajes de validación —
-vacía si el 422 no vino de validar un cuerpo:
+In an `on error 422`, `error.messages` carries the complete list of validation messages —
+empty if the 422 did not come from validating a body:
 
 ```lum
 on error 422:
-    return { "detalles": error.messages }
+    return { "details": error.messages }
 ```
 
-Sin código, es el manejador global. **Solo cubre 400–599**: con un 2xx el handler de la ruta
-ya ha escrito la respuesta, y sustituirla sería un filtro de respuesta — es decir,
-middleware, que Lumen 2.0 delega al proxy a propósito.
+Without a code, it is the global handler. **It only covers 400–599**: with a 2xx the route's
+handler has already written the response, and replacing it would be a response filter — that
+is, middleware, which Lumen delegates to the proxy on purpose.
 
-El código de estado se conserva. Si el manejador no escribe nada, se mantiene el cuerpo por
-defecto.
+The status code is preserved. If the handler writes nothing, the default body is kept.
 
 ---
 
-## 18. Funciones
+## 18. Functions
 
 ```lum
-fn int doble(int x):
+fn int double(int x):
     return x * 2
 
-fn string saluda(string nombre, string tratamiento = "hola"):
-    return tratamiento + ", " + nombre
+fn string greet(string name, string greeting = "hello"):
+    return greeting + ", " + name
 
-fn bool es_correo(string s):
+fn bool is_email(string s):
     return s.contains("@") and s.contains(".")
 ```
 
-El orden de declaración no importa: una función puede llamar a otra declarada más abajo, o
-en otro fichero. La recursión funciona, con un tope de 200 llamadas anidadas — pasarse da
-un error del lenguaje, no agota la memoria del proceso.
+Declaration order does not matter: a function can call another declared further down, or in
+another file. Recursion works, with a cap of 200 nested calls — going over gives a language
+error, it does not exhaust the process memory.
 
-Los parámetros admiten valor por defecto, y los que faltan se rellenan en la llamada. Un
-parámetro sin defecto no puede ir después de uno que lo tiene.
+Parameters accept default values, and the missing ones are filled in at the call site. A
+parameter without a default cannot come after one that has one.
 
-Una función sin `return` devuelve `null`. Un error dentro de ella **lo puede capturar quien
-la llama**:
+A function without `return` returns `null`. An error inside it **can be caught by the
+caller**:
 
 ```lum
 fn int divide(int a, int b):
@@ -781,72 +782,72 @@ get endpoint("/x"):
     try:
         return { "r": divide(1, 0) }
     catch e:
-        return { "fallo": e.message }
+        return { "failure": e.message }
 ```
 
-También se pueden usar dentro de un bloque `validate:`:
+They can also be used inside a `validate:` block:
 
 ```lum
-class Registro:
-    string correo
+class Signup:
+    string email
 
     validate:
-        es_correo(correo)   "correo: formato invalido"
+        is_email(email)   "email: invalid format"
 ```
 
-Declarar una función con el nombre de un builtin es un error de compilación.
+Declaring a function with a builtin's name is a compile error.
 
 ---
 
-## 19. El lenguaje
+## 19. The language
 
-### Tipos
+### Types
 
 ```
-int  long  float  double  bool  string        primitivos, en minúscula
-Json  List<T>  Dict<K,V>  File                clases nativas, en mayúscula
+int  long  float  double  bool  string        primitives, lowercase
+Json  List<T>  Dict<K,V>  File                native classes, uppercase
 ```
 
-`T?` marca que el valor puede faltar. Los genéricos son **borrados**: el checker los verifica
-y desaparecen antes del bytecode. No hay clases genéricas de usuario.
+`T?` marks that the value may be missing. Generics are **erased**: the checker verifies them
+and they disappear before the bytecode. There are no user-defined generic classes.
 
-### Cadenas de varias líneas
+### Multi-line strings
 
-Tres comillas, para SQL o HTML sin pelearse con los saltos de línea:
+Three quotes, for SQL or HTML without fighting the line breaks:
 
 ```lum
 get endpoint("/posts"):
     return await sqlite.query("""
-        select id, titulo
+        select id, title
         from posts
-        order by fecha desc
+        order by date desc
         """)
 ```
 
-El margen no forma parte de la cadena: es indentación del fichero, no del texto. Se quita
-un salto de línea justo detrás de la apertura, la línea del cierre si va sola, y la sangría
-**común** al resto — con lo que la sangría relativa entre líneas se conserva. Lo de arriba
-vale exactamente `select id, titulo\nfrom posts\norder by fecha desc`.
+The margin is not part of the string: it is the file's indentation, not the text's. A line
+break right after the opening is removed, the closing line if it stands alone, and the
+indentation **common** to the rest — which keeps the relative indentation between lines. The
+above is exactly `select id, title\nfrom posts\norder by date desc`.
 
-Los escapes son los mismos que en una cadena normal: `\n`, `\t`, `\r`, `\0`, `\"`, `\\`.
+The escapes are the same as in a normal string: `\n`, `\t`, `\r`, `\0`, `\"`, `\\`.
 
-### Veracidad
+### Truthiness
 
-Son **falsos** `null`, `false`, `0`, `0.0`, `""`, y la lista y el diccionario vacíos. Es la
-regla de Python.
+**False** are `null`, `false`, `0`, `0.0`, `""`, and the empty list and dictionary. It is
+Python's rule.
 
-No es coerción: no hay conversión de tipos dentro de los operadores.
+It is not coercion: there is no type conversion inside the operators.
 
 ```lum
 1 + "1"     # error
 0 == "0"    # false
-"n = " + str(n)     # así se concatena un número
+"n = " + str(n)     # this is how you concatenate a number
 ```
 
-Una trampa heredada de Python: con un valor opcional, `if x:` no distingue "vale cero" de
-"no venía". Para presencia, `x == null`.
+A trap inherited from Python: with an optional value, `if x:` does not tell "it is zero" from
+"it did not arrive". For presence, use `x == null`.
 
-### Sentencias
+### Statements
 
 ```lum
 int n = 5
@@ -864,7 +865,7 @@ while n > 0:
 
 for int x in [1, 2, 3]:
     ...
-for string k in miDiccionario:      # recorre las claves
+for string k in myDictionary:      # walks the keys
     ...
 
 require n > 0 else status(400)
@@ -876,136 +877,135 @@ catch e:
 
 break
 continue
-return valor
+return value
 ```
 
-`for` recorre listas y las claves de un diccionario. `try/catch` se resuelve con una tabla
-de rangos calculada al compilar, así que un `return` o un `break` dentro del `try` no dejan
-un manejador colgado. El error llega al `catch` como un valor con `message`.
+`for` walks lists and a dictionary's keys. `try/catch` is resolved with a range table
+computed at compile time, so a `return` or a `break` inside the `try` does not leave a
+handler dangling. The error reaches the `catch` as a value with `message`.
 
-### Expresiones
+### Expressions
 
-Precedencia, de menor a mayor: `?:` · `or` · `and` · `not` · `==` `!=` · `<` `<=` `>` `>=` ·
-`+` `-` · `*` `/` `%` · `-` unario · `.` `()` `[]`.
+Precedence, lowest to highest: `?:` · `or` · `and` · `not` · `==` `!=` · `<` `<=` `>` `>=` ·
+`+` `-` · `*` `/` `%` · unary `-` · `.` `()` `[]`.
 
 ```lum
-string rol = edad >= 18 ? "adulto" : "menor"
+string role = age >= 18 ? "adult" : "minor"
 ```
 
 ---
 
-## 20. Referencia de builtins
+## 20. Builtin reference
 
-### Funciones
+### Functions
 
 | | |
 |---|---|
-| `text(v)` `html(v)` `json(v)` | Escriben la respuesta |
-| `render(plantilla, k=v, ...)` | Renderiza una plantilla de Lumen Script |
-| `status(código)` `redirect(destino[, código])` `send_file(ruta)` | |
-| `len(v)` | Tamaño de string, List o Dict |
-| `str(v)` `int(v)` | Conversión explícita |
-| `header(nombre[, defecto])` | Cabecera de la petición |
-| `query(nombre[, defecto])` | Parámetro de query |
-| `cookie(nombre[, defecto])` | Cookie de la petición |
-| `form(nombre[, defecto])` | Campo de un formulario `urlencoded` |
-| `await sleep(ms)` | Suspende |
+| `text(v)` `html(v)` `json(v)` | Write the response |
+| `render(template, k=v, ...)` | Renders a Lumen Script template |
+| `status(code)` `redirect(target[, code])` `send_file(path)` | |
+| `len(v)` | Size of a string, List or Dict |
+| `str(v)` `int(v)` | Explicit conversion |
+| `header(name[, default])` | Request header |
+| `query(name[, default])` | Query parameter |
+| `cookie(name[, default])` | Request cookie |
+| `form(name[, default])` | Field of a `urlencoded` form |
+| `await sleep(ms)` | Suspends |
 
-### Objetos reservados
+### Reserved objects
 
-| Objeto | Miembros | Dónde |
+| Object | Members | Where |
 |---|---|---|
-| `request` | `path` `method` `ip` | Cualquier handler |
-| `session` | cualquier campo, `clear()` | Cualquier handler |
-| `jwt` | `valid` `claims` | Cualquier handler |
-| `state` | `incr` `decr` `get` `set` `remove` | Cualquier handler |
-| `log` | `info` `warn` `error` | En todas partes |
-| `sse` | `send` `ping` `open` | Rutas `sse` |
-| `ws` | `send` `recv` `open` `close` | Rutas `ws` |
-| `error` | `code` `message` `messages` | Bloques `on error` |
-| `sqlite` `postgres` `mysql` | `query` `exec` `begin` `commit` `rollback`; `last_id` solo en sqlite y mysql | Con `import` y su bloque en `app:` |
+| `request` | `path` `method` `ip` | Any handler |
+| `session` | any field, `clear()` | Any handler |
+| `jwt` | `valid` `claims` | Any handler |
+| `state` | `incr` `decr` `get` `set` `remove` | Any handler |
+| `log` | `info` `warn` `error` | Everywhere |
+| `sse` | `send` `ping` `open` | `sse` routes |
+| `ws` | `send` `recv` `open` `close` | `ws` routes |
+| `error` | `code` `message` `messages` | `on error` blocks |
+| `sqlite` `postgres` `mysql` | `query` `exec` `begin` `commit` `rollback`; `last_id` in sqlite and mysql only | With `import` and its block in `app:` |
 
-Usar uno fuera de su contexto es error de compilación. Todos los métodos de un módulo de
-base de datos son asíncronos: se llaman con `await`.
+Using one outside its context is a compile error. Every method of a database module is
+asynchronous: they are called with `await`.
 
-### Métodos por tipo
+### Methods by type
 
-| Receptor | Métodos |
+| Receiver | Methods |
 |---|---|
-| Cualquiera | `status(código)` `header(k, v)` `cookie(k, v, ...)` |
+| Any | `status(code)` `header(k, v)` `cookie(k, v, ...)` |
 | `string` | `starts_with` `ends_with` `contains` `upper` `lower` `trim` |
 | `List` | `add(v)` |
-| `Dict` | `has(clave)` `keys()` |
-| `File` | `save(directorio)` |
+| `Dict` | `has(key)` `keys()` |
+| `File` | `save(directory)` |
 
-Cuando el tipo del receptor se conoce al compilar —un parámetro declarado, una variable con
-tipo, un literal— el nombre y el número de argumentos se comprueban **ahí**, no al ejecutar:
+When the receiver's type is known at compile time —a declared parameter, a typed variable, a
+literal— the name and the argument count are checked **there**, not at run time:
 
 ```
-error: los valores de tipo string no tienen el metodo 'mayusculas';
-       tienen status, header, cookie, starts_with, ends_with, contains, upper, lower, trim
+error: values of type string have no method 'mayusculas';
+       it has status, header, cookie, starts_with, ends_with, contains, upper, lower, trim
 ```
 
-La comprobación sigue por la cadena, porque cada método sabe lo que devuelve:
-`s.upper().recortar()` también falla al compilar. Lo mismo con los campos de una clase:
-`p.noexiste` dice qué campos tiene `p` en vez de devolver `null` en silencio.
+The check continues down the chain, because every method knows what it returns:
+`s.upper().recortar()` also fails at compile time. The same goes for a class's fields:
+`p.noexiste` says which fields `p` has instead of silently returning `null`.
 
-Esto llega también **dentro de las plantillas**, porque `render()` le pasa los tipos de sus
-argumentos al compilador de plantillas: `{{ quien.mayusculas() }}` es un error de
-`lumen --check`, con el fichero y la línea de la plantilla.
+This reaches **inside the templates** too, because `render()` passes its argument types to
+the template compiler: `{{ who.mayusculas() }}` is a `lumen --check` error, with the
+template's file and line.
 
-Donde el tipo no se conoce —la variable de un `{% for %}`, un campo de un `Json`— no se
-comprueba nada y el despacho sigue siendo en ejecución, como antes.
+Where the type is not known —the variable of a `{% for %}`, a field of a `Json`— nothing is
+checked and dispatch stays at run time, as before.
 
 ---
 
-## 21. Errores frecuentes
+## 21. Common errors
 
-| Mensaje | Qué pasa |
+| Message | What is happening |
 |---|---|
-| `el patron declara ':id' pero ningun parametro lo recoge` | Falta el parámetro en la firma |
-| `'sleep()' es asincrono: hay que escribir 'await sleep(...)'` | Falta el `await` |
-| `'text()' no es asincrono: sobra el 'await'` | Sobra el `await` |
-| `'sse' solo existe dentro de una ruta sse` | Objeto reservado fuera de contexto |
-| `una ruta ws necesita origins(...)` | Falta la lista blanca de orígenes |
-| `no se puede sumar int y string` | Operación entre tipos distintos |
-| `la sesion no esta configurada` | Falta `session: secret ...` en `app:` |
-| `'X' no esta declarada` | Nombre desconocido, también dentro de `validate` |
+| `the pattern declares ':id' but no parameter binds it` | The parameter is missing from the signature |
+| `'sleep()' is asynchronous: you must write 'await sleep(...)'` | The `await` is missing |
+| `'text()' is not asynchronous: the 'await' is unnecessary` | The `await` is redundant |
+| `'sse' only exists inside an sse route` | A reserved object out of context |
+| `a ws route needs origins(...)` | The origin allowlist is missing |
+| `cannot add int and string` | An operation between different types |
+| `the session is not configured` | `session: secret ...` is missing from `app:` |
+| `'X' is not declared` | An unknown name, inside `validate` too |
 
-Todos salen con fichero, línea, columna y un cursor bajo la posición exacta.
+They all come out with file, line, column and a cursor under the exact position.
 
 ---
 
-## 22. Cómo funciona por dentro
+## 22. How it works inside
 
 ```
-lumen ./app  →  lex → parse → check → emitir
+lumen ./app  →  lex → parse → check → emit
                  ↓
-              tabla de rutas + bytecode   (una vez, no por petición)
+              route table + bytecode   (once, not per request)
                  ↓
-              N hilos: event loop + VM propio, SO_REUSEPORT
+              N threads: event loop + its own VM, SO_REUSEPORT
 ```
 
-**Compilación única.** Lexer, parser, análisis semántico y emisión ocurren al arrancar y una
-vez por cada cambio de fichero. Nunca por petición.
+**One compilation.** Lexer, parser, semantic analysis and emission happen at startup and once
+per file change. Never per request.
 
-**Dos niveles.** Las rutas declarativas son entradas en el radix tree con una acción nativa:
-cero pasos interpretados. Las demás ejecutan bytecode que solo hace pegamento — el trabajo
-real (parseo HTTP, routing, I/O de fichero, plantillas, JSON) siempre es C++ nativo.
+**Two levels.** Declarative routes are entries in the radix tree with a native action: zero
+interpreted steps. The rest run bytecode that only does glue — the real work (HTTP parsing,
+routing, file I/O, templates, JSON) is always native C++.
 
-**El VM no sabe esperar.** Al llegar a una llamada asíncrona recoge los argumentos y se
-detiene; el handler, que ya es una corrutina, hace el `co_await` de verdad sobre el motor y
-lo reanuda con el resultado. Por eso el VM tiene pila y locales propios en vez de usar la de
-C++: es lo que permite detenerse a mitad.
+**The VM does not know how to wait.** When it reaches an asynchronous call it gathers the
+arguments and stops; the handler, which is already a coroutine, does the real `co_await` on
+the engine and resumes it with the result. That is why the VM has its own stack and locals
+instead of using C++'s: it is what allows stopping halfway.
 
-**Un VM por petición en vuelo**, alojado en el marco de la corrutina del handler. Los chunks
-que no pueden suspenderse —y eso se sabe al compilar— reutilizan uno por hilo y se ahorran
-las reservas.
+**One VM per in-flight request**, held in the handler's coroutine frame. Chunks that cannot
+suspend —and that is known at compile time— reuse one per thread and save the allocations.
 
-**Recarga.** El módulo tiene su propio router; el motor solo lleva una entrada comodín que
-delega. Cambiar de versión es publicar un `shared_ptr`: sin `dlopen`, sin `.so`, sin
-reiniciar. Si la versión nueva no compila, no se publica.
+**Reload.** The module has its own router; the engine only carries a wildcard entry that
+delegates. Switching version is publishing a `shared_ptr`: no `dlopen`, no `.so`, no restart.
+If the new version does not compile, it is not published.
 
-**Tope de pasos.** Un bucle infinito en un `.lum` corta con un error en vez de clavar un
-hilo del event loop, que se llevaría por delante todas las conexiones de ese core. El
-contador se reinicia en cada suspensión, para que un bucle de SSE legítimo pueda vivir horas.
+**Step cap.** An infinite loop in a `.lum` is cut with an error instead of pinning an event
+loop thread, which would take down every connection on that core. The counter resets on every
+suspension, so a legitimate SSE loop can live for hours.

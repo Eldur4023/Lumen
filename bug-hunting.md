@@ -1,340 +1,322 @@
 # Bug hunting
 
-> Registro de los fallos reales que ha sacado probar Lumen contra su propio motor —no
-> contra una versión instrumentada, no solo compilar— y de cómo se buscaron. Existe porque
-> el patrón se repite demasiado como para no llevar cuenta: **compilar y enlazar no prueba
-> nada de lo que importa.** Un módulo que no se ha ejecutado contra su motor no está escrito,
-> está esbozado.
+> A log of the real failures that came out of running Lumen against its own engine —not
+> against an instrumented version, not just compiling— and of how they were hunted down. It
+> exists because the pattern repeats too often not to keep track: **compiling and linking
+> proves nothing that matters.** A module that has not been run against its engine is not
+> written, it is sketched.
 >
-> Formato de cada entrada: qué se sospechaba, cómo se forzó, qué salió, el arreglo. Sin eso,
-> "se encontró un bug" no es información — es la parte fácil.
+> Format of every entry: what was suspected, how it was forced, what came out, the fix.
+> Without that, "a bug was found" is not information — it is the easy part.
 
 ---
 
-## Metodología
+## Method
 
-Ordenada por lo que ha dado resultado hasta ahora, no por elegancia:
+Ordered by what has produced results so far, not by elegance:
 
-1. **Ejecutar contra el motor real, no contra un doble.** Los tres módulos de base de datos
-   compilaban y enlazaban sin decir nada durante meses; los cuatro fallos de MySQL, el de
-   postgres y el de sqlite solo aparecieron al lanzarlos contra un servidor de verdad.
-2. **Aserciones sobre la forma de la salida, no solo el código de estado.** Un `200` con un
-   cuerpo que ningún cliente puede parsear es peor que un error, porque el fallo aparece lejos
-   de su origen. Comprobar "¿es JSON válido de verdad?" cazó tres bugs distintos (NaN de
-   postgres, BLOB de sqlite y mysql, UTF-8 roto) que un test de solo-el-código-200 no ve.
-3. **Sanitizadores, no solo pruebas funcionales.** TSan encontró la carrera de los búferes de
-   *bind* compartidos entre workers del pool (406 apariciones en el informe) y la del apagado
-   tocando los loops de otros hilos (14 apariciones) — ninguna de las dos se manifestaba en
-   una ejecución normal.
-4. **Leer el código sospechando, no confiando en el comentario de al lado.** El bug de
-   multipart y el de `env()` salieron de auditar código, no de que algo fallara en
-   producción — y el primero llevaba documentado como si funcionara desde el propio ejemplo
-   del proyecto.
-5. **Matriz sistemática de combinaciones**, en vez de fiarse de que "ya hay tests de eso". El
-   punto 6 de esta lista.
-6. **Fuzzing** — pendiente. Todo lo de arriba es adversarial dirigido por una persona; lo que
-   no se le ha ocurrido a nadie probar, ninguno de estos métodos lo encuentra.
+1. **Run against the real engine, not against a double.** The three database modules
+   compiled and linked without a word for months; the four MySQL failures, the postgres one
+   and the sqlite one only showed up when they were fired at a real server.
+2. **Assert on the shape of the output, not just on the status code.** A `200` with a body
+   no client can parse is worse than an error, because the failure shows up far from its
+   origin. Checking "is this really valid JSON?" caught three separate bugs (postgres NaN,
+   sqlite and mysql BLOBs, broken UTF-8) that a status-code-only test does not see.
+3. **Sanitizers, not just functional tests.** TSan found the race on the *bind* buffers
+   shared between pool workers (406 appearances in the report) and the one where shutdown
+   touched other threads' loops (14 appearances) — neither of them showed up in a normal run.
+4. **Read the code suspecting it, not trusting the comment next to it.** The multipart bug
+   and the `env()` one came out of auditing code, not from something failing in production —
+   and the first one had been documented as if it worked, in the project's own example.
+5. **A systematic matrix of combinations**, instead of trusting that "there are already
+   tests for that". Point 6 of this list.
+6. **Fuzzing** — pending. Everything above is adversarial thinking driven by a person; what
+   nobody thought to try, none of these methods finds.
 
 ---
 
-## Registro
+## Log
 
-### 2026-08-31 — postgres y mysql, a la altura de sqlite: lo que faltaba y lo que no aplicaba
+### 2026-08-31 — postgres and mysql brought up to sqlite's level: what was missing and what did not apply
 
-`sqlite` tenía tres cosas que las otras dos baterías no: comprobación de JSON
-válido en la fila de tipos, un caso de byte NUL dentro de un texto, y una
-prueba de concurrencia que compara el *contenido* de cada respuesta, no solo
-el código. Antes de copiar sin más, se leyó el driver de cada motor para
-saber cuáles de esas tres aplican de verdad — copiar un test que no puede
-fallar nunca no es cobertura, es ruido.
+`sqlite` had three things the other two batteries did not: a valid-JSON check on the types
+row, a case with a NUL byte inside a text, and a concurrency test that compares the
+*content* of each response, not just the code. Before copying them over, each engine's
+driver was read to find out which of the three really apply — copying a test that can never
+fail is not coverage, it is noise.
 
-**Se aplicó:**
+**Applied:**
 
-- **La concurrencia con contenido comprobado, en las dos.** Es la más
-  importante de las tres: es exactamente la forma que tenía el fallo real de
-  los búferes de *bind* compartidos en MySQL —una petición contestando con la
-  fila de otra—, y la prueba de antes solo miraba el código `200`. Con el
-  bug ya arreglado no iba a fallar hoy, pero si alguien lo regresara sin
-  querer, la prueba de antes no se habría enterado.
-- **`json_valido` en `/tipos`, en las dos.** `sqlite` ya lo tenía; faltaba en
-  postgres y mysql, justo en la ruta que trae el tipo binario de cada motor
-  —`bytea`, `BLOB`— que es exactamente el que ya rompió el JSON una vez.
-- **El byte NUL dentro de un texto, en mysql.** Se leyó `db_mysql.cpp` antes
-  de escribir nada: el valor se construye con
-  `std::string(bufs[i].data(), std::min(lens[i], bufs[i].size()))`, que ya es
-  seguro con bytes NUL de por medio — el arreglo del truncamiento de 1023
-  bytes de esta misma sesión ya cubría esto de paso. No había ningún fallo
-  que cazar, pero tampoco ninguna prueba que impidiera que alguien lo
-  rompiera al tocar ese código sin saber por qué importa.
-- **El valor del `bytea` de postgres, comprobado por primera vez.** La
-  columna llevaba sembrada en el esquema desde que existe la batería, pero
-  nadie afirmaba nada sobre ella — salía en el JSON de `/tipos` sin que
-  ningún test la mirara. Sale como el hexadecimal propio de postgres
-  (`\x68656c6c6f`), no como base64: libpq se lo entrega ya así y el driver no
-  lo toca, así que es JSON-seguro de casualidad y no por diseño — la razón
-  exacta que ya cita `README.md`. Ahora hay una prueba que lo afirma en vez
-  de darlo por sabido.
+- **Concurrency with checked content, in both.** It is the most important of the three: it
+  is exactly the shape the real shared *bind* buffer failure in MySQL had —one request
+  answering with another's row— and the earlier test only looked at the `200` code. With the
+  bug already fixed it was not going to fail today, but if someone regressed it by accident,
+  the earlier test would never have noticed.
+- **`json_valid` on `/types`, in both.** `sqlite` already had it; postgres and mysql did
+  not, on exactly the route that carries each engine's binary type —`bytea`, `BLOB`— which
+  is precisely the one that already broke the JSON once.
+- **The NUL byte inside a text, in mysql.** `db_mysql.cpp` was read before writing anything:
+  the value is built with `std::string(bufs[i].data(), std::min(lens[i], bufs[i].size()))`,
+  which is already safe with NUL bytes in the middle — the 1023-byte truncation fix from this
+  same session already covered this in passing. There was no failure to catch, but there was
+  no test either to stop someone breaking it while touching that code without knowing why it
+  matters.
+- **The value of postgres's `bytea`, checked for the first time.** The column had been seeded
+  in the schema since the battery existed, but nobody asserted anything about it — it came
+  out in the `/types` JSON without any test looking at it. It comes out as postgres's own hex
+  (`\x68656c6c6f`), not as base64: libpq already hands it over that way and the driver does
+  not touch it, so it is JSON-safe by accident and not by design — the exact reason
+  `README.md` already cites. Now there is a test asserting it instead of taking it as known.
 
-**Se descartó, con el motivo comprobado, no supuesto:**
+**Discarded, with the reason checked rather than assumed:**
 
-- **La caché de sentencias preparadas.** `sqlite` reutiliza una sentencia
-  preparada entre llamadas —de ahí su prueba de que un `NULL` no se quede
-  pegado del turno anterior—, pero ni `db_postgres.cpp`
-  (`PQexecParams` directo, sin `PQprepare`) ni `db_mysql.cpp`
-  (`mysql_stmt_init` + `mysql_stmt_prepare` en cada llamada) cachean nada: no
-  hay sentencia que reutilizar, así que no hay riesgo que probar.
-- **`NaN`/`Infinity` en mysql.** Comprobado contra un servidor real:
-  `select 1e308 * 10` da `ERROR 1690: DOUBLE value is out of range`. Bajo
-  `STRICT_TRANS_TABLES` —el modo por defecto— MySQL rechaza el valor antes de
-  que llegue a existir; el bug que sí tiene postgres no tiene equivalente
-  aquí.
+- **The prepared statement cache.** `sqlite` reuses a prepared statement between calls
+  —hence its test that a `NULL` does not stay stuck from the previous turn— but neither
+  `db_postgres.cpp` (`PQexecParams` directly, no `PQprepare`) nor `db_mysql.cpp`
+  (`mysql_stmt_init` + `mysql_stmt_prepare` on every call) caches anything: there is no
+  statement to reuse, so there is no risk to test.
+- **`NaN`/`Infinity` in mysql.** Checked against a real server: `select 1e308 * 10` gives
+  `ERROR 1690: DOUBLE value is out of range`. Under `STRICT_TRANS_TABLES` —the default mode—
+  MySQL rejects the value before it comes into existence; the bug postgres does have has no
+  equivalent here.
 
-`mysql` pasa de 26 a 29 pruebas; `postgres`, de 32 a 34. Total del proyecto:
-246.
+`mysql` goes from 26 to 29 tests; `postgres`, from 32 to 34. Project total: 246.
 
 ---
 
-### 2026-08-31 — Primera campaña de fuzzing: lexer/parser/checker, HTTP y multipart
+### 2026-08-31 — First fuzzing campaign: lexer/parser/checker, HTTP and multipart
 
-Sin libFuzzer —este toolchain es GCC, y `-fsanitize=fuzzer` es un builtin de
-clang; instalarlo solo para esto habría sido una dependencia nueva para un
-problema que se resuelve sin ella—. En su lugar, `fuzz/chaos.hpp`: mutación
-"tonta" sin guía por cobertura (bit-flips, bytes al azar, inserciones,
-borrados, empalmes) sobre semillas reales, un proceso hijo por caso para que
-un `abort()` de ASan/UBSan tumbe solo ese caso. Detalle completo en
+Without libFuzzer —this toolchain is GCC, and `-fsanitize=fuzzer` is a clang builtin;
+installing clang just for this would have been a new dependency for a problem that can be
+solved without one. In its place, `fuzz/chaos.hpp`: "dumb" mutation with no coverage guidance
+(bit flips, random bytes, insertions, deletions, splices) over real seeds, one child process
+per case so that an ASan/UBSan `abort()` takes down only that case. Full detail in
 [fuzz/README.md](fuzz/README.md).
 
-Tres objetivos, cada uno con `lumen_script`/`lumen` recompilados enteros bajo
-`-fsanitize=address,undefined` —no solo el arnés, o el sanitizador no ve nada
-del código real—:
+Three targets, each with `lumen_script`/`lumen` rebuilt in full under
+`-fsanitize=address,undefined` —not just the harness, or the sanitizer sees nothing of the
+real code:
 
-| Objetivo | Casos | Fallos |
+| Target | Cases | Failures |
 |---|---:|---:|
-| Lexer + parser + checker (`lumen_script::compile()`, el mismo camino que `--check`) | 100.000 | 0 |
-| Parser HTTP (llhttp de por medio, `HttpParser::feed()`) | 100.000 | 0 |
-| Parser multipart (`parse_multipart()`) | 100.000 | 0 |
+| Lexer + parser + checker (`lumen_script::compile()`, the same path as `--check`) | 100,000 | 0 |
+| HTTP parser (llhttp involved, `HttpParser::feed()`) | 100,000 | 0 |
+| Multipart parser (`parse_multipart()`) | 100,000 | 0 |
 
-**Ningún crash, ningún cuelgue, en 300.000 casos.** Es una noticia real, no un
-placebo: los tres objetivos estaban genuinamente sin fuzzear antes de hoy, y
-el `alarm()` por caso sí habría cazado un bucle que no termina, no solo una
-corrupción de memoria.
+**No crash, no hang, in 300,000 cases.** That is real news, not a placebo: the three targets
+were genuinely unfuzzed before today, and the per-case `alarm()` would indeed have caught a
+loop that never ends, not only a memory corruption.
 
-**Lo que esto NO cubre, para no leerlo como más de lo que es:** sin guía por
-cobertura, la mutación tiende a quedarse cerca de las semillas —19 ficheros
-`.lum` de `tests/casos` y media docena de peticiones HTTP escritas a mano—,
-así que caminos de código que ninguna semilla toca casi no se visitan.
-Tampoco prueba nada semánticamente *válido pero incorrecto* —un caso que
-compila y no debería, o que compila a lo que no toca—, solo lo que cuelga o
-corrompe memoria. Y no fuzzea los tres módulos de base de datos ni el motor
-de plantillas todavía.
+**What this does NOT cover, so it is not read as more than it is:** without coverage
+guidance, mutation tends to stay near the seeds —19 `.lum` files from `tests/cases` and half
+a dozen hand-written HTTP requests— so code paths no seed touches are hardly visited. It also
+tests nothing semantically *valid but wrong* —a case that compiles and should not, or that
+compiles to the wrong thing— only what hangs or corrupts memory. And it does not fuzz the
+three database modules or the template engine yet.
 
 ---
 
-### 2026-08-31 — La matriz de enlace de parámetros entra en el repo, con control negativo
+### 2026-08-31 — The parameter binding matrix enters the repo, with a negative control
 
-Consecuencia directa de la entrada de multipart de más abajo: el bug real es exactamente lo
-que una matriz sistemática —origen (ruta / query / multipart) × tipo (escalar, `File`,
-`List<File>`) × presencia (falta, mal tipado, en dos sitios a la vez)— habría encontrado sin
-que nadie tuviera que sospechar de `save(dir)` primero. `tests/casos/parametros.lum` y once
-casos nuevos en `tests/run_tests.sh` la cubren: texto junto a un fichero, los cuatro tipos
-escalares como campo de formulario, texto junto a `List<File>`, el valor por defecto cuando
-el campo falta en los dos sitios, la prioridad de la query sobre el formulario, y un escalar
-mal tipado dentro de multipart.
+A direct consequence of the multipart entry further down: the real bug is exactly what a
+systematic matrix —origin (path / query / multipart) × type (scalar, `File`, `List<File>`) ×
+presence (missing, mistyped, in two places at once)— would have found without anyone having
+to suspect `save(dir)` first. `tests/cases/params.lum` and eleven new cases in
+`tests/run_tests.sh` cover it: text next to a file, the four scalar types as a form field,
+text next to a `List<File>`, the default value when the field is missing in both places, the
+priority of the query over the form, and a mistyped scalar inside multipart.
 
-**Control negativo**, para no dar por bueno "la prueba pasa" sin más: se reconstruyó el
-binario con el `project.cpp` de antes del arreglo y se corrió solo esta sección contra él.
-Fallaron exactamente las seis pruebas que tocan el patrón del bug —texto con fichero, los
-tres tipos escalares, texto con `List<File>`— y ninguna otra; las que no dependen del enlace
-nuevo (contar ficheros, caer al defecto, prioridad de la query) seguían pasando, como debía
-ser. La suite mide lo que dice medir.
+**Negative control**, so that "the test passes" is not taken at face value: the binary was
+rebuilt with the `project.cpp` from before the fix and only this section was run against it.
+Exactly the six tests that touch the bug's pattern failed —text with a file, the three scalar
+types, text with `List<File>`— and no others; the ones that do not depend on the new binding
+(counting files, falling back to the default, query priority) kept passing, as they should.
+The suite measures what it says it measures.
 
-`regresion` pasa de 68 a 79 pruebas; el total del proyecto, de 230 a 241.
+`regression` goes from 68 to 79 tests; the project total, from 230 to 241.
 
 ---
 
-### 2026-08-31 — Los parámetros de texto nunca llegaban en `multipart/form-data`
+### 2026-08-31 — Text parameters never arrived in `multipart/form-data`
 
-**Se sospechaba** tras auditar `save(dir)`: el argumento del directorio no se sanea, solo el
-nombre del fichero subido, así que si una app construye `dir` a partir de un parámetro de
-texto del propio formulario (`imagen.save("./uploads/" + album)`, el patrón que documenta el
-propio proyecto), ese parámetro podría ser un vector de *path traversal*.
+**Suspected** after auditing `save(dir)`: the directory argument is not sanitized, only the
+uploaded file name, so if an app builds `dir` from a text parameter of the form itself
+(`image.save("./uploads/" + album)`, the pattern the project itself documents), that
+parameter could be a *path traversal* vector.
 
-**Se forzó** montando esa ruta exacta y subiendo un fichero con `curl -F`, variando el orden
-de los campos.
+**Forced** by setting up that exact route and uploading a file with `curl -F`, varying the
+order of the fields.
 
-**Salió** algo peor que lo que se buscaba: `album` llegaba **siempre vacío**, con o sin
-intento de traversal, en cualquier orden. `prepare_args()` solo miraba la *query string* para
-un parámetro escalar; nunca las partes de texto de un cuerpo multipart. `form()` tampoco
-servía de rescate — solo lee `application/x-www-form-urlencoded`. No había ninguna forma de
-leer un campo de texto de un formulario con ficheros.
+**What came out** was worse than what was being looked for: `album` arrived **always empty**,
+with or without a traversal attempt, in any order. `prepare_args()` only looked at the
+*query string* for a scalar parameter; never at the text parts of a multipart body. `form()`
+was no rescue either — it only reads `application/x-www-form-urlencoded`. There was no way at
+all to read a text field of a form with files.
 
-**Arreglo:** antes de caer al valor por defecto, se busca en las partes del multipart una con
-ese nombre y `filename` vacío (`src/lumen_script/project.cpp`, `prepare_args`). La *query string*
-sigue teniendo prioridad si el nombre aparece en los dos sitios.
+**Fix:** before falling back to the default value, the multipart parts are searched for one
+with that name and an empty `filename` (`src/lumen_script/project.cpp`, `prepare_args`). The
+*query string* still takes priority if the name appears in both places.
 
 ```
-POST /avatar  (multipart: imagen=<fichero>, titulo=vacío)
-→ antes:  {"titulo":""}          # siempre, pasara lo que pasara
-→ ahora:  422 "titulo: obligatorio"   # si el handler lo valida, ahora puede
+POST /avatar  (multipart: image=<file>, title=empty)
+→ before:  {"title":""}          # always, whatever happened
+→ now:     422 "title: required" # if the handler validates it, now it can
 ```
 
 ---
 
-### 2026-08-31 — `env("VAR")` sobre una variable inexistente, sin ningún aviso
+### 2026-08-31 — `env("VAR")` on a non-existent variable, with no warning at all
 
-**Se sospechaba** que un despliegue que olvida `SESSION_SECRET` fallaría en abierto: secreto
-vacío, cookies firmables por cualquiera.
+**Suspected** that a deployment forgetting `SESSION_SECRET` would fail open: empty secret,
+cookies signable by anyone.
 
-**Se forzó** compilando un `app:` con `session: secret env("NO_EXISTE")` y mirando qué pasaba
-al usar `session.*`.
+**Forced** by compiling an `app:` with `session: secret env("DOES_NOT_EXIST")` and watching
+what happened when using `session.*`.
 
-**Salió** que el temor concreto era infundado —`secret.empty()` se trata exactamente igual
-que "`session:` no configurado en absoluto", así que falla **cerrado**: toda operación de
-sesión da error, `jwt.valid` siempre `false`— pero el diagnóstico real quedaba escondido: en
-vez de un error claro al arrancar, lo que aparecía era *"la sesión no está configurada"* en
-cada petición, sin mencionar la variable de entorno que faltaba.
+**What came out** was that the specific fear was unfounded —`secret.empty()` is treated
+exactly like "`session:` not configured at all", so it fails **closed**: every session
+operation errors, `jwt.valid` is always `false`— but the real diagnosis stayed hidden: instead
+of a clear error at startup, what appeared was *"the session is not configured"* on every
+request, with no mention of the missing environment variable.
 
-**Arreglo:** aviso a `stderr` con fichero:línea:columna en el momento de compilar
-(`src/lumen_script/parser.cpp`), sin bloquear la compilación —`.lum` no tiene por qué conocer el
-entorno de despliegue final, y `--check` debe poder correr sin él.
+**Fix:** a warning on `stderr` with file:line:column at compile time
+(`src/lumen_script/parser.cpp`), without blocking compilation —a `.lum` has no business
+knowing the final deployment environment, and `--check` must be able to run without it.
 
 ```
-lumen: aviso: app.lum:4:20: la variable de entorno 'SESSION_SECRET'
-no esta definida; se usa "" en su lugar
+lumen: warning: app.lum:4:20: the environment variable 'SESSION_SECRET'
+is not defined; using "" instead
 ```
 
 ---
 
-### 2026-08-31 — Un cuerpo de más de 16 MB daba `400`, no `413`
+### 2026-08-31 — A body over 16 MB gave `400`, not `413`
 
-**Se encontró** leyendo el parser HTTP: `kMaxBodySize` (16 MB, incluidas las subidas
-multipart) existía y funcionaba, pero cualquier violación de límite del parser —cuerpo
-demasiado grande incluida— se traducía en un `400 Bad Request` genérico. El código 413 ya
-estaba en la tabla de razones de `Response`, sin usar para este caso.
+**Found** while reading the HTTP parser: `kMaxBodySize` (16 MB, multipart uploads included)
+existed and worked, but any parser limit violation —an oversized body included— was turned
+into a generic `400 Bad Request`. Code 413 was already in `Response`'s reason table, unused
+for this case.
 
-**Arreglo:** el parser distingue el motivo exacto (`HttpParser::body_too_large()`); la
-conexión responde `413 Content Too Large` específicamente para ese caso
+**Fix:** the parser distinguishes the exact reason (`HttpParser::body_too_large()`); the
+connection replies `413 Content Too Large` specifically for that case
 (`src/http/http_parser.{hpp,cpp}`, `src/http/http_connection.cpp`).
 
 ---
 
-### 2026-08-31 — El tope de pasos del VM no ve un bucle que se suspende sin avanzar
+### 2026-08-31 — The VM step cap does not see a loop that suspends without advancing
 
-**Se encontró** leyendo el comentario del propio límite: se reinicia en cada suspensión, a
-propósito, para que un SSE legítimo pueda vivir horas. Pero eso deja un hueco que el
-comentario no cubre: `while true: await sleep(0)` se suspende y reanuda sin acumular pasos
-entre dos suspensiones, así que el tope nunca lo ve. Un solo cliente podría fijar un hilo
-entero reprogramando un temporizador de 0 ms sin parar.
+**Found** while reading the comment on the limit itself: it resets on every suspension, on
+purpose, so a legitimate SSE can live for hours. But that leaves a gap the comment does not
+cover: `while true: await sleep(0)` suspends and resumes without accumulating steps between
+two suspensions, so the cap never sees it. A single client could pin a whole thread by
+rescheduling a 0 ms timer without stopping.
 
-**Arreglo:** piso de 1 ms en todo `sleep()`, en los tres sitios donde el motor reanuda un
-handler —ruta normal, SSE, WS— (`src/lumen_script/project.cpp`, `clamp_sleep_ms`). No lo impide del
-todo, pero lo acota a ~1000 reanudaciones/s por conexión en vez de tantas como el
-planificador quiera dar. Verificado que no toca el caso legítimo: `sleep(500)` sigue tardando
-500 ms exactos; `sleep(0)` pasa de 0 a ~1,3 ms.
-
----
-
-### 2026-08-31 — El propio arnés de benchmark medía tres servidores a la vez
-
-No es un bug de Lumen — de la medida. Se deja registrado porque el método que lo destapó es
-el mismo de esta lista: no confiar en que un proceso muerto por `pkill` esté realmente
-muerto.
-
-**Salió al auditar** un `mezcla con escrituras` con 2.173 respuestas `500` que no cuadraban
-con nada. Resultó ser `SO_REUSEPORT`: dos binarios de una prueba A/B anterior seguían vivos
-en el mismo puerto —58 minutos después—, repartiéndose conexiones con el que se creía estar
-midiendo, sin dar ningún error visible.
-
-Segunda vuelta: arreglado el `pkill`, apareció `database disk image is malformed`. El
-apagado ordenado de Lumen **deja de escuchar antes de terminar de drenar**, y el arnés
-restauraba `datos.db` en cuanto el puerto quedaba libre, sobrescribiendo el fichero bajo un
-proceso que todavía lo tenía abierto.
-
-**Arreglo (en el arnés, fuera del repo):** matar por *puerto*, no por nombre de proceso —
-`pkill` no alcanzaba dos binarios con nombre distinto sirviendo lo mismo—, esperar con
-`kill -0` a que el PID desaparezca de verdad, y restaurar la base con `rm` + `mv` atómico en
-vez de `cp` en el sitio.
+**Fix:** a 1 ms floor on every `sleep()`, in the three places where the engine resumes a
+handler —normal route, SSE, WS— (`src/lumen_script/project.cpp`, `clamp_sleep_ms`). It does
+not prevent it entirely, but it bounds it to ~1000 resumptions/s per connection instead of as
+many as the scheduler cares to give. Verified not to touch the legitimate case: `sleep(500)`
+still takes exactly 500 ms; `sleep(0)` goes from 0 to ~1.3 ms.
 
 ---
 
-### 2026-08-31 — MySQL: cuatro fallos que solo se veían al ejecutarlo
+### 2026-08-31 — The benchmark harness itself was measuring three servers at once
 
-Compilaba y enlazaba desde hacía tiempo; nunca se había lanzado contra un servidor real hasta
-esta ronda.
+Not a Lumen bug — a measurement one. It is logged because the method that exposed it is the
+same one as the rest of this list: not trusting that a process killed by `pkill` is really
+dead.
 
-1. **Las transacciones no abrían.** `BEGIN` no es preparable por el protocolo de sentencias
-   preparadas de MySQL (error 1295); el error se descartaba en silencio, así que `ROLLBACK`
-   devolvía éxito sin haber deshecho nada. Arreglo: `mysql_real_query` para sentencias sin
-   parámetros.
-2. **Truncamiento silencioso a partir de 1023 bytes.** Faltaba
-   `mysql_stmt_attr_set(STMT_ATTR_UPDATE_MAX_LENGTH)` + `mysql_stmt_store_result()` antes de
-   leer `field.max_length`.
-3. **`BIGINT UNSIGNED` grande se clavaba en `INT64_MAX`.** El valor sin signo no se
-   distinguía del con signo al convertir.
-4. **Búferes de *bind* compartidos entre los N workers del pool.** Solo visible con
-   ThreadSanitizer: 406 apariciones del fichero en los informes de carrera, cero después de
-   mover el estado de *bind* a variables locales por llamada.
+**It came out while auditing** a `mixed with writes` run with 2,173 `500` responses that
+matched nothing. It turned out to be `SO_REUSEPORT`: two binaries from an earlier A/B test
+were still alive on the same port —58 minutes later— splitting connections with the one that
+was supposedly being measured, without any visible error.
 
----
+Second round: with `pkill` fixed, `database disk image is malformed` appeared. Lumen's
+orderly shutdown **stops listening before it finishes draining**, and the harness restored
+`tests-suite.db` as soon as the port was free, overwriting the file underneath a process that
+still had it open.
 
-### 2026-08-31 — Postgres: `NaN`/`Infinity` rompían el JSON de salida
-
-**La misma batería, pasada a postgres**, sacó un fallo que no era del módulo sino del
-serializador: postgres admite `NaN` e `Infinity` en un `double precision` y salían escritos
-tal cual —`{"d":inf}`—, que ningún cliente JSON sabe leer. Arreglo: se escriben como `null`,
-igual que `JSON.stringify`. De paso se corrigió la guía, que prometía un `last_id()` que
-postgres no tiene —el driver ya lo rechazaba con un mensaje correcto; era la documentación la
-que mentía.
+**Fix (in the harness, outside the repo):** kill by *port*, not by process name — `pkill` did
+not reach two binaries with different names serving the same thing — wait with `kill -0` for
+the PID to really disappear, and restore the database with `rm` + an atomic `mv` instead of
+`cp` in place.
 
 ---
 
-### 2026-08-31 — sqlite y MySQL: un `BLOB` no es texto
+### 2026-08-31 — MySQL: four failures that only showed up when it was run
 
-El tercero de la misma familia: un `BLOB` se devolvía como cadena, así que sus bytes crudos
-rompían la validez UTF-8 de la respuesta entera. Arreglo: base64 en los dos motores.
-Postgres se libraba por casualidad —libpq entrega `bytea` ya en hexadecimal.
+It had compiled and linked for a long time; it had never been fired at a real server until
+this round.
 
-Los tres fallos de esta y las dos entradas anteriores comparten un patrón: **el módulo
-contestaba `200` con un cuerpo que ningún cliente puede leer.** No falla la petición, falla
-quien la recibe, lejos del origen — por eso merece la pena forzarlo a propósito y no confiar
-en que "si compiló y dio 200, está bien".
-
----
-
-### 2026-08-31 — UTF-8 inválido alcanzable desde la red por tres vías
-
-Se creía un caso raro de sqlite; resultó alcanzable desde cuerpo JSON, *query* y cabeceras.
-Un cliente mandaba un byte suelto y Lumen contestaba `200` con una respuesta que el propio
-cliente no podía leer. Arreglo: una pasada de validación en la salida, aparte del bucle de
-escapado existente, con el mismo atajo de ASCII de 8 bytes para no pagar el coste en el caso
-común. Medido con tres repeticiones alternadas: **+0,1 % en un JSON de 57 KB y −1,5 % en el
-detalle de 2 KB** — las primeras medidas de una sola pasada decían −5,9 % / −10,1 % y eran
-ruido de medición, no el coste real.
+1. **Transactions did not open.** `BEGIN` is not preparable over MySQL's prepared statement
+   protocol (error 1295); the error was silently discarded, so `ROLLBACK` returned success
+   without having undone anything. Fix: `mysql_real_query` for statements with no parameters.
+2. **Silent truncation past 1023 bytes.** `mysql_stmt_attr_set(STMT_ATTR_UPDATE_MAX_LENGTH)`
+   + `mysql_stmt_store_result()` were missing before reading `field.max_length`.
+3. **A large `BIGINT UNSIGNED` got pinned at `INT64_MAX`.** The unsigned value was not told
+   apart from the signed one when converting.
+4. **`bind` buffers shared between the N pool workers.** Only visible with ThreadSanitizer:
+   406 appearances of the file in the race reports, zero after moving the *bind* state into
+   locals per call.
 
 ---
 
-### 2026-08-31 — El apagado ordenado tocaba los loops de otros hilos
+### 2026-08-31 — Postgres: `NaN`/`Infinity` broke the outgoing JSON
 
-Encontrado con ThreadSanitizer: 14 apariciones del fichero en los informes de carrera durante
-el apagado con conexiones abiertas. Arreglo: cada hilo deja de aceptar mirando solo su propio
-estado.
+**The same battery, run against postgres**, produced a failure that was not the module's but
+the serializer's: postgres accepts `NaN` and `Infinity` in a `double precision` and they came
+out written as such —`{"d":inf}`— which no JSON client can read. Fix: they are written as
+`null`, just like `JSON.stringify`. The guide was corrected in passing too, as it promised a
+`last_id()` postgres does not have — the driver already rejected it with a correct message;
+it was the documentation that was lying.
 
 ---
 
-## Pendiente
+### 2026-08-31 — sqlite and MySQL: a `BLOB` is not text
 
-- **Fuzzear los módulos de base de datos y el motor de plantillas.** Los tres objetivos de
-  hoy no los cubren — ver el resultado de la campaña, arriba.
-- **Más semillas para `fuzz_lenguaje`.** Sin guía por cobertura, la mutación no se aleja
-  mucho de las 19 que tiene hoy (`tests/casos`); los programas completos de
-  `LUMEN_SCRIPT-GRAMMAR.md` u otras construcciones raras servirían de semilla adicional.
-- **Repetir la campaña de vez en cuando, no una sola vez.** Sin cobertura no hay "ya está
-  fuzzeado" — cada corrida nueva visita un camino distinto por puro azar.
-- **La precisión de `numeric` en postgres.** `t_numeric` se guardó como
-  `12345678901234.1234567890` y salió `12345678901234.123`: el OID 1700 se convierte con
-  `strtod`, que es `double`, no precisión arbitraria. Es una simplificación conocida —hay
-  un tipo `float`/`double` en Lumen Script y no uno decimal—, no un fallo de conversión, pero
-  tampoco está documentada como límite en ningún sitio.
-- **Los ejemplos de la documentación, compilados y ejecutados en CI.** El bug de multipart
-  llevaba documentado como si funcionara desde el propio ejemplo del proyecto — nadie lo
-  había vuelto a compilar desde que se escribió.
+The third of the same family: a `BLOB` was returned as a string, so its raw bytes broke the
+UTF-8 validity of the whole response. Fix: base64 in both engines. Postgres got away with it
+by accident — libpq hands `bytea` over already in hex.
+
+The three failures in this and the two previous entries share a pattern: **the module
+answered `200` with a body no client can read.** The request does not fail, the receiver
+does, far from the origin — which is why it is worth forcing on purpose instead of trusting
+that "if it compiled and gave 200, it is fine".
+
+---
+
+### 2026-08-31 — Invalid UTF-8 reachable from the network by three routes
+
+It was thought to be a rare sqlite case; it turned out to be reachable from the JSON body,
+the *query* and the headers. A client sent a stray byte and Lumen answered `200` with a
+response that same client could not read. Fix: a validation pass on the way out, separate
+from the existing escaping loop, with the same 8-byte ASCII shortcut so the common case pays
+nothing. Measured with three alternating repetitions: **+0.1% on a 57 KB JSON and −1.5% on
+the 2 KB detail** — the first single-pass measurements said −5.9% / −10.1% and were
+measurement noise, not the real cost.
+
+---
+
+### 2026-08-31 — The orderly shutdown touched other threads' loops
+
+Found with ThreadSanitizer: 14 appearances of the file in the race reports during shutdown
+with open connections. Fix: each thread stops accepting by looking only at its own state.
+
+---
+
+## Pending
+
+- **Fuzz the database modules and the template engine.** Today's three targets do not cover
+  them — see the campaign result, above.
+- **More seeds for `fuzz_language`.** Without coverage guidance, mutation does not stray far
+  from the 19 it has today (`tests/cases`); the complete programs in
+  `LUMEN_SCRIPT-GRAMMAR.md` or other odd constructs would serve as extra seeds.
+- **Repeat the campaign now and then, not once.** Without coverage there is no "it is already
+  fuzzed" — every new run visits a different path by pure chance.
+- **`numeric` precision in postgres.** `t_numeric` was stored as
+  `12345678901234.1234567890` and came out `12345678901234.123`: OID 1700 is converted with
+  `strtod`, which is `double`, not arbitrary precision. It is a known simplification —there is
+  a `float`/`double` type in Lumen Script and no decimal one— not a conversion bug, but it is
+  not documented as a limit anywhere either.
+- **The documentation examples, compiled and run in CI.** The multipart bug had been
+  documented as if it worked, in the project's own example — nobody had recompiled it since
+  it was written.

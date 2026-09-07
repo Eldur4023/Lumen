@@ -74,7 +74,7 @@ std::string sha256(std::string_view data) {
     size_t full = len / kBlock;
     for (size_t i = 0; i < full; ++i) compress(h, p + i * kBlock);
 
-    // Relleno: 0x80, ceros, y la longitud en bits como big-endian de 64 bits.
+    // Padding: 0x80, zeros, and the length in bits as a 64-bit big-endian.
     uint8_t tail[128] = {};
     size_t  rest      = len % kBlock;
     std::memcpy(tail, p + full * kBlock, rest);
@@ -99,7 +99,7 @@ std::string sha256(std::string_view data) {
 }
 
 std::string hmac_sha256(std::string_view key, std::string_view message) {
-    // RFC 2104: una clave mas larga que el bloque se sustituye por su hash.
+    // RFC 2104: a key longer than the block is replaced by its hash.
     std::string k(key);
     if (k.size() > kBlock) k = sha256(k);
     k.resize(kBlock, '\0');
@@ -116,7 +116,7 @@ std::string hmac_sha256(std::string_view key, std::string_view message) {
     return sha256(outer);
 }
 
-// ─── Base64url (RFC 4648 §5, sin relleno) ────────────────────────────────────
+// ─── Base64url (RFC 4648 §5, no padding) ─────────────────────────────────────
 
 namespace {
 constexpr char kAlphabet[] =
@@ -199,7 +199,7 @@ bool base64url_decode(std::string_view text, std::string& out) {
     uint32_t acc = 0;
     int      bits = 0;
     for (char c : text) {
-        if (c == '=') break;              // relleno tolerado, aunque no se emite
+        if (c == '=') break;              // padding tolerated, though it is not emitted
         int d = decode_char(c);
         if (d < 0) return false;
         acc  = (acc << 6) | static_cast<uint32_t>(d);

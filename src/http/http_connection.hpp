@@ -56,11 +56,11 @@ private:
     static constexpr size_t    kMaxPendingBuf = 64 * 1024;  // 64 KB pipelined
 
     // Un handler sincrono responde DENTRO de parser_.feed(): llhttp llama a
-    // on_message_complete, que dispatch()a, y la respuesta se escribe entera
-    // antes de que el callback devuelva HPE_PAUSED.  Si el cierre de ciclo
-    // corriera ahi, haria resume() sobre una pausa que aun no existe y la
-    // conexion se quedaria pausada para siempre.  Asi que se aplaza hasta que
-    // feed() retorna y la pausa ya esta puesta.
+    // on_message_complete, which dispatches, and the response is written in
+    // full before the callback returns HPE_PAUSED.  If the cycle close ran
+    // there, it would resume() a pause that does not exist yet and the
+    // connection would stay paused forever.  So it is deferred until feed()
+    // returns and the pause is in place.
     bool in_parser_     = false;
     bool cycle_pending_ = false;
 
@@ -89,8 +89,8 @@ private:
     void do_sendfile();
     void on_write_complete();
 
-    // Cierre del ciclo de respuesta: resume el parser, reproduce lo que hubiera
-    // llegado por pipelining, rearma el temporizador de cabeceras y EPOLLIN.
+    // Response cycle close: resumes the parser, replays anything that arrived
+    // by pipelining, rearms the header timer and EPOLLIN.
     void finish_cycle();
 
     // Begin writing `data`; buffers any unsent remainder and arms EPOLLOUT.

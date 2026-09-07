@@ -11,12 +11,12 @@ namespace lumen_script {
 
 namespace {
 
-// Driver de SQLite.
+// SQLite driver.
 //
-// Cada worker abre su propia conexion al mismo fichero.  SQLite serializa las
-// escrituras internamente, asi que varias conexiones concurrentes son seguras;
-// lo que se activa es WAL, que permite leer mientras otro escribe en vez de
-// bloquear a todo el mundo.
+// Each worker opens its own connection to the same file.  SQLite serializes
+// writes internally, so several concurrent connections are safe; what is
+// enabled is WAL, which allows reading while another writes instead of
+// blocking everyone.
 class SqliteDriver : public DbDriver {
 public:
     const char* name() const override { return "sqlite"; }
@@ -25,7 +25,7 @@ public:
                    std::string& error) override {
         auto it = options.find("file");
         if (it == options.end() || it->second.empty()) {
-            error = "sqlite: falta 'file' en el bloque de configuracion";
+            error = "sqlite: missing 'file' in the configuration block";
             return false;
         }
         file_ = it->second;
@@ -34,7 +34,7 @@ public:
         if (p != options.end()) {
             long n = std::strtol(p->second.c_str(), nullptr, 10);
             if (n < 1 || n > 64) {
-                error = "sqlite: 'pool' tiene que estar entre 1 y 64";
+                error = "sqlite: 'pool' must be between 1 and 64";
                 return false;
             }
             set_pool_size(static_cast<size_t>(n));
@@ -49,28 +49,28 @@ public:
     }
 
     bool open(size_t worker, std::string& error) override {
-        if (worker >= conns_.size()) { error = "sqlite: worker fuera de rango"; return false; }
+        if (worker >= conns_.size()) { error = "sqlite: worker out of range"; return false; }
         if (conns_[worker]) return true;
 
         sqlite3* db = nullptr;
         int rc = sqlite3_open_v2(file_.c_str(), &db,
                                  SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
         if (rc != SQLITE_OK) {
-            error = std::string("sqlite: no se puede abrir '") + file_ + "': " +
+            error = std::string("sqlite: cannot open '") + file_ + "': " +
                     (db ? sqlite3_errmsg(db) : sqlite3_errstr(rc));
             if (db) sqlite3_close(db);
             return false;
         }
 
-        // WAL: lecturas concurrentes con una escritura en curso.  Sin esto, con
-        // varios workers cualquier escritura bloquearia todas las lecturas.
+        // WAL: concurrent reads with a write in progress.  Without this, with
+        // several workers any write would block every read.
         char* msg = nullptr;
         sqlite3_exec(db, "PRAGMA journal_mode=WAL", nullptr, nullptr, &msg);
         if (msg) sqlite3_free(msg);
         sqlite3_exec(db, "PRAGMA foreign_keys=ON", nullptr, nullptr, &msg);
         if (msg) sqlite3_free(msg);
 
-        // Espera en vez de fallar cuando otra conexion tiene el fichero.
+        // Waits instead of failing when another connection holds the file.
         sqlite3_busy_timeout(db, busy_timeout_);
 
         conns_[worker] = db;
@@ -91,25 +91,25 @@ public:
             if (rc == SQLITE_DONE) break;
             if (rc != SQLITE_ROW) {
                 error = std::string("sqlite: ") + sqlite3_errmsg(conns_[worker]);
-                soltar(stmt, cacheada);
+                release(stmt, cacheada);
                 return false;
             }
             Value::Dict row;
-            // El numero de columnas se sabe: sin esto el diccionario crecia a
-            // saltos y eran cinco realojos por fila.
-            row.reservar(static_cast<size_t>(cols));
+            // The column count is known: without this the dictionary grew in
+            // steps and it was five reallocations per row.
+            row.reserve(static_cast<size_t>(cols));
             for (int i = 0; i < cols; ++i) {
                 const char* col = sqlite3_column_name(stmt, i);
-                // Sin el ternario: mezclarlo con std::to_string obligaba a
-                // construir un std::string temporal en CADA columna de CADA fila
-                // solo para volver a leerlo como string_view.
+                // No ternary: mixing it with std::to_string forced building a
+                // temporary std::string on EVERY column of EVERY row just to
+                // read it back as a string_view.
                 if (col) row[std::string_view(col)]  = column_value(stmt, i);
                 else     row[std::to_string(i)]      = column_value(stmt, i);
             }
             rows.push_back(Value::dict(std::move(row)));
         }
 
-        soltar(stmt, cacheada);
+        release(stmt, cacheada);
         out = Value::list(std::move(rows));
         return true;
     }
@@ -123,17 +123,17 @@ public:
         int rc = sqlite3_step(stmt);
         if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
             error = std::string("sqlite: ") + sqlite3_errmsg(conns_[worker]);
-            soltar(stmt, cacheada);
+            release(stmt, cacheada);
             return false;
         }
-        soltar(stmt, cacheada);
+        release(stmt, cacheada);
         affected = sqlite3_changes(conns_[worker]);
         return true;
     }
 
     bool last_insert_id(size_t worker, long long& id, std::string& error) override {
         if (worker >= conns_.size() || !conns_[worker]) {
-            error = "sqlite: sin conexion";
+            error = "sqlite: no connection";
             return false;
         }
         id = sqlite3_last_insert_rowid(conns_[worker]);
@@ -141,31 +141,31 @@ public:
     }
 
     ~SqliteDriver() override {
-        // Las sentencias primero: sqlite3_close falla si quedan vivas.
-        for (auto& tabla : cache_)
-            for (auto& [_, stmt] : tabla) sqlite3_finalize(stmt);
+        // The statements first: sqlite3_close fails if any are still alive.
+        for (auto& table : cache_)
+            for (auto& [_, stmt] : table) sqlite3_finalize(stmt);
         for (auto* db : conns_) if (db) sqlite3_close(db);
     }
 
-    // Devuelve la sentencia al sitio del que salio.  Una cacheada se resetea
-    // —hay que hacerlo si o si: en modo WAL una sentencia a medio recorrer
-    // mantiene abierta su instantanea de lectura— y una suelta se destruye.
-    static void soltar(sqlite3_stmt* stmt, bool cacheada) {
+    // Returns the statement to where it came from.  A cached one is reset —it
+    // has to be: in WAL mode a half-walked statement keeps its read snapshot
+    // open— and a one-off one is destroyed.
+    static void release(sqlite3_stmt* stmt, bool cacheada) {
         if (!stmt) return;
         if (cacheada) { sqlite3_reset(stmt); sqlite3_clear_bindings(stmt); }
         else          sqlite3_finalize(stmt);
     }
 
 private:
-    // Sentencias preparadas, por conexion.
+    // Prepared statements, per connection.
     //
-    // Las consultas de un .lum son literales del fuente, asi que el juego es
-    // cerrado y pequeno.  Sin esto SQLite parseaba y planificaba el mismo SELECT
-    // decenas de miles de veces por segundo.
+    // The queries of a .lum are source literals, so the set is closed and
+    // small.  Without this SQLite parsed and planned the same SELECT tens of
+    // thousands of times per second.
     //
-    // Con el tope lleno, una consulta nueva se prepara y se destruye como antes:
-    // nunca se echa a una que ya esta dentro.  Asi, quien construya SQL a mano
-    // no puede reventar la memoria ni desalojar las buenas.
+    // With the cap full, a new query is prepared and destroyed as before: one
+    // already inside is never evicted.  That way, whoever builds SQL by hand
+    // cannot blow up the memory or evict the good ones.
     static constexpr size_t kMaxSentencias = 128;
 
     std::string           file_;
@@ -173,14 +173,14 @@ private:
     std::vector<sqlite3*> conns_;
     std::vector<std::unordered_map<std::string, sqlite3_stmt*>> cache_;
 
-    // Los parametros van SIEMPRE por bind, nunca concatenados: es lo que hace
-    // imposible la inyeccion de SQL desde Lumen Script.
+    // Parameters ALWAYS go through bind, never concatenated: that is what makes
+    // SQL injection impossible from Lumen Script.
     bool prepare(size_t worker, const std::string& sql, const std::vector<Value>& args,
                  sqlite3_stmt** out, bool* cacheada, std::string& error) {
         sqlite3* db = conns_[worker];
-        auto&    tabla = cache_[worker];
+        auto&    table = cache_[worker];
 
-        if (auto it = tabla.find(sql); it != tabla.end()) {
+        if (auto it = table.find(sql); it != table.end()) {
             *out      = it->second;
             *cacheada = true;
             sqlite3_reset(*out);
@@ -190,15 +190,15 @@ private:
                 error = std::string("sqlite: ") + sqlite3_errmsg(db);
                 return false;
             }
-            *cacheada = tabla.size() < kMaxSentencias;
-            if (*cacheada) tabla.emplace(sql, *out);
+            *cacheada = table.size() < kMaxSentencias;
+            if (*cacheada) table.emplace(sql, *out);
         }
 
         int expected = sqlite3_bind_parameter_count(*out);
         if (expected != static_cast<int>(args.size())) {
-            error = "sqlite: la consulta tiene " + std::to_string(expected) +
-                    " parametro(s) y se pasaron " + std::to_string(args.size());
-            soltar(*out, *cacheada);
+            error = "sqlite: the query has " + std::to_string(expected) +
+                    " parameter(s) but " + std::to_string(args.size()) + " were passed";
+            release(*out, *cacheada);
             *out = nullptr;
             return false;
         }
@@ -217,9 +217,9 @@ private:
                                        static_cast<int>(s.size()), SQLITE_TRANSIENT);
             }
             if (rc != SQLITE_OK) {
-                error = std::string("sqlite: al enlazar el parametro ") +
+                error = std::string("sqlite: while binding parameter ") +
                         std::to_string(idx) + ": " + sqlite3_errmsg(db);
-                soltar(*out, *cacheada);
+                release(*out, *cacheada);
                 *out = nullptr;
                 return false;
             }
@@ -233,11 +233,11 @@ private:
             case SQLITE_INTEGER: return Value::integer(sqlite3_column_int64(stmt, i));
             case SQLITE_FLOAT:   return Value::real(sqlite3_column_double(stmt, i));
 
-            // Un BLOB no es texto: son bytes cualesquiera.  Devolverlos como
-            // cadena dejaba la respuesta sin ser UTF-8 valido —un x'FF' se
-            // colaba crudo— y entonces el fallo no es de la peticion sino del
-            // cliente que la recibe, que es peor porque aparece lejos.
-            // Base64 es como se mete un binario en un JSON.
+            // A BLOB is not text: it is arbitrary bytes.  Returning them as a
+            // string left the response not valid UTF-8 —an x'FF' slipped through
+            // raw— and then the failure is not the request's but the client's
+            // that receives it, which is worse because it shows up far away.
+            // Base64 is how a binary goes into a JSON.
             case SQLITE_BLOB: {
                 const void* p = sqlite3_column_blob(stmt, i);
                 int         n = sqlite3_column_bytes(stmt, i);

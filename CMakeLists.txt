@@ -10,56 +10,56 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "Lumen requiere Linux: usa epoll, sendfile(2) y SO_REUSEPORT.")
+    message(FATAL_ERROR "Lumen requires Linux: it uses epoll, sendfile(2) and SO_REUSEPORT.")
 endif()
 
-option(LUMEN_IO_URING "Backend io_uring en lugar de epoll (Linux 5.1+)" OFF)
-option(LUMEN_EXAMPLES "Compilar los ejemplos de examples/"              ON)
+option(LUMEN_IO_URING "io_uring backend instead of epoll (Linux 5.1+)" OFF)
+option(LUMEN_EXAMPLES "Build the examples in examples/"                 ON)
 
-# Arneses de fuzzing manuales -- ver fuzz/chaos.hpp para el motivo de no usar
-# libFuzzer (necesita clang; este toolchain es gcc).  Apagado por defecto: no
-# es parte de la build normal ni de ctest, se lanza a mano.
-option(LUMEN_FUZZ "Compilar los arneses de fuzzing de fuzz/" OFF)
+# Manual fuzzing harnesses -- see fuzz/chaos.hpp for why libFuzzer is not used
+# (it needs clang; this toolchain is gcc).  Off by default: it is not part of the
+# normal build or of ctest, it is launched by hand.
+option(LUMEN_FUZZ "Build the fuzzing harnesses in fuzz/" OFF)
 
-# Modulos de persistencia.  Cada uno se compila solo si su cliente esta
-# presente: `import sqlite` en un binario sin el da un error claro al compilar
-# el .lum, no un fallo raro en produccion.
+# Persistence modules.  Each one builds only if its client is present: `import
+# sqlite` in a binary without it gives a clear error when compiling the .lum, not
+# a strange failure in production.
 option(LUMEN_SQLITE   "Modulo sqlite"                                   ON)
 option(LUMEN_POSTGRES "Modulo postgres (libpq)"                         ON)
 option(LUMEN_MYSQL    "Modulo mysql (libmysqlclient)"                   ON)
 
-# ── Dependencias del sistema ──────────────────────────────────────────────────
-# Lumen 2.0 no enlaza OpenSSL, nghttp2 ni zlib: TLS, HTTP/2 y compresion son
-# cosa del reverse proxy.  Solo hacen falta hilos.
+# ── System dependencies ───────────────────────────────────────────────────────
+# Lumen links neither OpenSSL, nghttp2 nor zlib: TLS, HTTP/2 and compression are
+# the reverse proxy's business.  Only threads are needed.
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
 # ── jemalloc ──────────────────────────────────────────────────────────────────
-# Con varios event loops y un pool de base de datos, el malloc de glibc se
-# convierte en el cuello de botella: sus arenas se serializan y el mutex se come
-# el 20% del tiempo.  Medido sobre respuestas JSON grandes, 8 cores:
+# With several event loops and a database pool, glibc's malloc becomes the
+# bottleneck: its arenas serialize and the mutex eats 20% of the time.  Measured
+# on large JSON responses, 8 cores:
 #
 #   /articulos?size=100 (57 KB)   18.782 -> 29.802 req/s   +59%
 #   /articulos?page=3   (11 KB)   49.051 -> 65.307 req/s   +33%
 #
-# Es opcional: si no esta, se compila igual y se sigue usando el de glibc.
-option(LUMEN_JEMALLOC "Enlazar jemalloc si esta disponible" ON)
+# It is optional: without it the build proceeds and glibc's is used.
+option(LUMEN_JEMALLOC "Link jemalloc if available" ON)
 set(LUMEN_ALLOC "")
 if(LUMEN_JEMALLOC)
     find_library(JEMALLOC_LIB NAMES jemalloc)
     if(JEMALLOC_LIB)
         set(LUMEN_ALLOC ${JEMALLOC_LIB})
-        message(STATUS "asignador: jemalloc (${JEMALLOC_LIB})")
+        message(STATUS "allocator: jemalloc (${JEMALLOC_LIB})")
     else()
-        message(STATUS "asignador: glibc — instala libjemalloc-dev para el de verdad")
+        message(STATUS "allocator: glibc — install libjemalloc-dev for the real one")
     endif()
 endif()
 
-# Sin dependencias que traer de la red: llhttp esta vendorizado y todo lo demas
-# —JSON, plantillas, criptografia— es de casa.
+# No dependencies to fetch from the network: llhttp is vendored and everything
+# else —JSON, templates, cryptography— is built in-house.
 #
-# ── third_party (vendorizado, sin red durante cmake) ──────────────────────────
+# ── third_party (vendored, no network during cmake) ───────────────────────────
 add_library(lumen_llhttp STATIC
     third_party/llhttp/src/api.c
     third_party/llhttp/src/http.c
@@ -68,7 +68,7 @@ add_library(lumen_llhttp STATIC
 target_include_directories(lumen_llhttp PUBLIC third_party/llhttp/include)
 set_target_properties(lumen_llhttp PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# ── Biblioteca principal ──────────────────────────────────────────────────────
+# ── Main library ──────────────────────────────────────────────────────────────
 set(LUMEN_SOURCES
     src/app.cpp
     src/router.cpp
@@ -103,7 +103,7 @@ endif()
 
 target_compile_options(lumen PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
-# ── Lumen Script: frontend del lenguaje ───────────────────────────────────────────────
+# ── Lumen Script: the language frontend ───────────────────────────────────────
 add_library(lumen_script STATIC
     src/lumen_script/token.cpp
     src/lumen_script/diagnostic.cpp
@@ -113,7 +113,7 @@ add_library(lumen_script STATIC
     src/lumen_script/db.cpp
     src/lumen_script/value.cpp
     src/lumen_script/json_parse.cpp
-    src/lumen_script/plantilla.cpp
+    src/lumen_script/template.cpp
     src/lumen_script/natives.cpp
     src/lumen_script/emitter.cpp
     src/lumen_script/vm.cpp
@@ -131,9 +131,9 @@ if(LUMEN_SQLITE)
         target_compile_definitions(lumen_script PRIVATE LUMEN_SQLITE)
         target_include_directories(lumen_script PRIVATE ${SQLITE3_INC})
         target_link_libraries(lumen_script PRIVATE ${SQLITE3_LIB})
-        message(STATUS "modulo sqlite: activado")
+        message(STATUS "sqlite module: enabled")
     else()
-        message(STATUS "modulo sqlite: OMITIDO (falta libsqlite3-dev)")
+        message(STATUS "sqlite module: SKIPPED (libsqlite3-dev missing)")
     endif()
 endif()
 
@@ -145,9 +145,9 @@ if(LUMEN_POSTGRES)
         target_compile_definitions(lumen_script PRIVATE LUMEN_POSTGRES)
         target_include_directories(lumen_script PRIVATE ${PQ_INC})
         target_link_libraries(lumen_script PRIVATE ${PQ_LIB})
-        message(STATUS "modulo postgres: activado")
+        message(STATUS "postgres module: enabled")
     else()
-        message(STATUS "modulo postgres: OMITIDO (falta libpq-dev)")
+        message(STATUS "postgres module: SKIPPED (libpq-dev missing)")
     endif()
 endif()
 
@@ -159,88 +159,88 @@ if(LUMEN_MYSQL)
         target_compile_definitions(lumen_script PRIVATE LUMEN_MYSQL)
         target_include_directories(lumen_script PRIVATE ${MYSQL_INC})
         target_link_libraries(lumen_script PRIVATE ${MYSQL_LIB})
-        message(STATUS "modulo mysql: activado")
+        message(STATUS "mysql module: enabled")
     else()
-        message(STATUS "modulo mysql: OMITIDO (falta libmysqlclient-dev)")
+        message(STATUS "mysql module: SKIPPED (libmysqlclient-dev missing)")
     endif()
 endif()
 target_compile_options(lumen_script PRIVATE -Wall -Wextra)
 
-# El binario de Lumen 2.0.
+# The Lumen binary.
 add_executable(lumen-bin src/lumen_script/main.cpp)
 set_target_properties(lumen-bin PROPERTIES OUTPUT_NAME lumen)
 target_link_libraries(lumen-bin PRIVATE lumen_script)
 
-# Herramientas de desarrollo del frontend.
+# Frontend development tools.
 add_executable(dump_tokens src/lumen_script/tools/dump_tokens.cpp)
 target_link_libraries(dump_tokens PRIVATE lumen_script)
 
 add_executable(crypto_check src/lumen_script/tools/crypto_check.cpp)
 target_link_libraries(crypto_check PRIVATE lumen_script)
 
-# ── Pruebas ───────────────────────────────────────────────────────────────────
-# La suite es un script que ejerce el binario por el socket, tal y como se usa.
-# No enlaza nada del proyecto, asi que prueba lo que se despliega y no una
-# version instrumentada de ello.
+# ── Tests ─────────────────────────────────────────────────────────────────────
+# The suite is a script that drives the binary over the socket, the way it is
+# used.  It links nothing from the project, so it tests what gets deployed and
+# not an instrumented version of it.
 enable_testing()
 
-# Las plantillas se prueban aparte y en proceso: compilar y renderizar no pasa
-# por el socket, asi que el guion de regresion no llega ahi.
-add_executable(prueba_plantillas tests/plantillas.cpp)
-target_link_libraries(prueba_plantillas PRIVATE lumen_script)
-add_test(NAME plantillas COMMAND prueba_plantillas)
+# Templates are tested separately and in process: compiling and rendering do not
+# go through the socket, so the regression script cannot reach them.
+add_executable(test_templates tests/templates.cpp)
+target_link_libraries(test_templates PRIVATE lumen_script)
+add_test(NAME templates COMMAND test_templates)
 
-# El traductor de marcadores de postgres es una funcion pura: se prueba sin
-# servidor incluyendo el .cpp del driver, para probar EL codigo y no una copia.
+# The postgres placeholder translator is a pure function: it is tested without a
+# server by including the driver's .cpp, to test THE code and not a copy.
 if(LUMEN_POSTGRES AND PQ_INC AND PQ_LIB)
-    add_executable(prueba_marcadores tests/marcadores.cpp)
-    target_include_directories(prueba_marcadores PRIVATE ${PQ_INC})
-    target_link_libraries(prueba_marcadores PRIVATE lumen_script ${PQ_LIB})
-    add_test(NAME marcadores COMMAND prueba_marcadores)
+    add_executable(test_placeholders tests/placeholders.cpp)
+    target_include_directories(test_placeholders PRIVATE ${PQ_INC})
+    target_link_libraries(test_placeholders PRIVATE lumen_script ${PQ_LIB})
+    add_test(NAME placeholders COMMAND test_placeholders)
 endif()
 
-add_test(NAME regresion
+add_test(NAME regression
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tests.sh $<TARGET_FILE:lumen-bin>
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
-set_tests_properties(regresion PROPERTIES TIMEOUT 300)
+set_tests_properties(regression PROPERTIES TIMEOUT 300)
 
-# El modulo de mysql necesita un servidor, asi que su suite se salta sola —codigo
-# 77— cuando no lo hay, en vez de poner en rojo una maquina donde no aplica.
-# Las instrucciones para montar el entorno estan en la cabecera del guion.
+# The mysql module needs a server, so its suite skips itself —code 77— when
+# there is none, instead of turning a machine where it does not apply red.
+# The instructions for setting the environment up are in the script's header.
 add_test(NAME mysql
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_mysql.sh $<TARGET_FILE:lumen-bin>
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 set_tests_properties(mysql PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
 
-# La bateria de tipos de sqlite no necesita servidor —el esquema lo crea el
-# propio .lum— asi que corre siempre.
+# The sqlite type battery needs no server —the schema is created by the .lum
+# itself— so it always runs.
 add_test(NAME sqlite
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_sqlite.sh $<TARGET_FILE:lumen-bin>
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 set_tests_properties(sqlite PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
 
-# Idem para postgres.
+# Same for postgres.
 add_test(NAME postgres
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_postgres.sh $<TARGET_FILE:lumen-bin>
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 set_tests_properties(postgres PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
 
 # ── Fuzzing ───────────────────────────────────────────────────────────────────
-# Sin flags de sanitizador aqui a proposito: para que ASan/UBSan sirvan de algo
-# tienen que instrumentar tambien lumen_script/lumen, no solo estos dos .cpp, asi que
-# van en CMAKE_CXX_FLAGS de la configuracion entera -- ver fuzz/README.md.
-# Cada caso corre en un hijo (fuzz/chaos.hpp): un abort de sanitizador tumba
-# solo ese hijo, la campana sigue.
+# No sanitizer flags here on purpose: for ASan/UBSan to be worth anything they
+# have to instrument lumen_script/lumen too, not just these two .cpp files, so
+# they go in CMAKE_CXX_FLAGS for the whole configuration -- see fuzz/README.md.
+# Each case runs in a child (fuzz/chaos.hpp): a sanitizer abort takes down
+# only that child, the campaign carries on.
 if(LUMEN_FUZZ)
-    add_executable(fuzz_lenguaje fuzz/fuzz_lenguaje.cpp)
-    target_link_libraries(fuzz_lenguaje PRIVATE lumen_script)
+    add_executable(fuzz_language fuzz/fuzz_language.cpp)
+    target_link_libraries(fuzz_language PRIVATE lumen_script)
 
     add_executable(fuzz_http fuzz/fuzz_http.cpp)
     target_include_directories(fuzz_http PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(fuzz_http PRIVATE lumen_script)
 endif()
 
-# ── Ejemplos ──────────────────────────────────────────────────────────────────
+# ── Examples ──────────────────────────────────────────────────────────────────
 if(LUMEN_EXAMPLES AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/examples)
     file(GLOB LUMEN_EXAMPLE_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/examples/*.cpp)
     foreach(src ${LUMEN_EXAMPLE_SRCS})

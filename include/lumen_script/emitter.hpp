@@ -10,93 +10,93 @@
 
 namespace lumen_script {
 
-// Traduce el cuerpo de una ruta a bytecode.
+// Translates the body of a route into bytecode.
 //
-// Resuelve los nombres a ranuras locales en tiempo de compilacion, asi que el
-// VM nunca busca una variable por nombre: LoadLocal es un indice directo.
-// Lo que el emisor necesita saber de una funcion de usuario para poder
-// llamarla: donde esta y que argumentos admite.
+// It resolves names to local slots at compile time, so the VM never looks a
+// variable up by name: LoadLocal is a direct index.
+// What the emitter needs to know about a user function in order to call it:
+// where it is and what arguments it takes.
 struct FnSig {
     size_t index    = 0;
-    size_t required = 0;                    // parametros sin valor por defecto
-    std::vector<const Expr*> defaults;      // uno por parametro; nulo si no tiene
+    size_t required = 0;                    // parameters without a default value
+    std::vector<const Expr*> defaults;      // one per parameter; null if it has none
 };
 using FunctionSigs = std::map<std::string, FnSig>;
 
-// Lo que el emisor necesita saber de una clase para construirla y llamar a sus
-// metodos.  Ambos se compilan a funciones con `this` como primer parametro.
+// What the emitter needs to know about a class to build it and call its
+// methods.  Both compile to functions with `this` as the first parameter.
 struct ClassSig {
     std::map<std::string, FnSig> methods;
-    std::map<size_t, size_t>     ctors;    // numero de parametros -> indice
+    std::map<size_t, size_t>     ctors;    // number of parameters -> index
     std::vector<std::string>     fields;
 };
 using ClassSigs = std::map<std::string, ClassSig>;
 
-struct Plantilla;
+struct Template;
 
-// Un nombre visible dentro de una expresion suelta, con su tipo declarado.
+// A name visible inside a standalone expression, with its declared type.
 //
-// El tipo puede ir vacio y entonces no se comprueba nada sobre el: es lo que
-// pasa con la variable de un {% for %}, cuyo tipo depende de lo que lleve
-// dentro la lista.
-struct NombreTipado {
-    std::string nombre;
-    std::string tipo;
+// The type may be empty, and then nothing is checked about it: that is what
+// happens with the variable of a {% for %}, whose type depends on what the
+// list carries.
+struct TypedName {
+    std::string name;
+    std::string type;
 
-    // Sin tipo es el caso normal, asi que se escribe solo el nombre.  El
-    // literal necesita su propio constructor: de const char* a NombreTipado
-    // hay dos conversiones y el compilador solo hace una.
-    NombreTipado(std::string n, std::string t = {})
-        : nombre(std::move(n)), tipo(std::move(t)) {}
-    NombreTipado(const char* n) : nombre(n) {}
+    // No type is the normal case, so only the name is written.  The literal
+    // needs its own constructor: from const char* to TypedName there are two
+    // conversions and the compiler only does one.
+    TypedName(std::string n, std::string t = {})
+        : name(std::move(n)), type(std::move(t)) {}
+    TypedName(const char* n) : name(n) {}
 };
 
-// Donde estan las plantillas y donde se guardan ya compiladas.
+// Where the templates are and where they are stored once compiled.
 //
-// Cuando el emisor ve un render("x.html", k=v) con el nombre literal, compila
-// la plantilla AHI MISMO contra esas claves.  Por eso una errata dentro de un
-// {{ }} sale en `lumen --check` y no cuando alguien pide la pagina.
-struct PlantillaCtx {
+// When the emitter sees a render("x.html", k=v) with a literal name, it
+// compiles the template RIGHT THERE against those keys.  That is why a typo
+// inside a {{ }} shows up in `lumen --check` and not when someone loads the page.
+struct TemplateCtx {
     std::string             dir;
-    std::vector<Plantilla>* tabla = nullptr;
+    std::vector<Template>* table = nullptr;
 };
 
 class Emitter {
 public:
-    // `functions` mapea nombre de funcion de usuario a su indice en la tabla
-    // del modulo.  Se resuelve al emitir, asi que el VM no busca por nombre.
+    // `functions` maps a user function name to its index in the module table.
+    // It is resolved while emitting, so the VM never looks one up by name.
     explicit Emitter(DiagnosticBag& diags, const FunctionSigs* functions = nullptr,
                      const ClassSigs* classes = nullptr,
                      const std::set<std::string>* imports = nullptr,
-                     PlantillaCtx* plantillas = nullptr)
+                     TemplateCtx* templates = nullptr)
         : diags_(diags), functions_(functions), classes_(classes), imports_(imports),
-          plantillas_(plantillas) {}
+          templates_(templates) {}
 
-    // Los parametros de la ruta ocupan las primeras ranuras, en orden.
-    // Devuelve false si algo del cuerpo no se puede compilar todavia.
+    // The route parameters take the first slots, in order.
+    // Returns false if something in the body cannot be compiled yet.
     bool emit_route(const RouteDecl& route, Chunk& out);
 
-    // Cuerpo de una funcion de usuario.
+    // Body of a user function.
     bool emit_function(const FnDecl& fn, Chunk& out);
 
-    // Metodo y constructor: se compilan como funciones con `this` de primer
-    // parametro, asi que reusan la pila de marcos del VM sin nada especial.
+    // Method and constructor: they compile as functions with `this` as the
+    // first parameter, so they reuse the VM frame stack with nothing special.
     bool emit_method(const std::string& cls, const FnDecl& m, Chunk& out);
     bool emit_ctor(const std::string& cls, const std::vector<std::string>& fields,
                    const CtorDecl& ct, Chunk& out);
 
-    // Compila una expresion suelta con `names` ya declarados como locales, en
-    // ese orden.  Lo usan las reglas de `validate` —cada una se convierte en un
-    // chunk diminuto que recibe los campos y devuelve un booleano— y las
-    // expresiones de dentro de un {{ }} en una plantilla.
+    // Compiles a standalone expression with `names` already declared as locals,
+    // in that order.  Used by the `validate` rules —each one becomes a tiny
+    // chunk that takes the fields and returns a boolean— and by the expressions
+    // inside a {{ }} in a template.
     //
-    // Los tipos viajan con los nombres para que `nombre.mayusculas()` se pueda
-    // rechazar aqui: sin ellos el emisor no sabe que `nombre` es un string y
-    // la errata se descubre en produccion.
-    bool emit_condition(const Expr& e, const std::vector<NombreTipado>& names,
+    // The types travel with the names so that `name.mayusculas()` can be
+    // rejected here: without them the emitter does not know `name` is a string
+    // and the typo is discovered in production.
+    bool emit_condition(const Expr& e, const std::vector<TypedName>& names,
                         Chunk& out);
 
-    // Cuerpo de un `on error`: sin parametros, con el objeto `error` disponible.
+    // Body of an `on error`: no parameters, with the `error` object available.
     bool emit_error_handler(const ErrorDecl& decl, Chunk& out);
 
 private:
@@ -104,23 +104,23 @@ private:
     const FunctionSigs*                  functions_ = nullptr;
     const ClassSigs*                     classes_   = nullptr;
     const std::set<std::string>*         imports_   = nullptr;
-    PlantillaCtx*                        plantillas_ = nullptr;
+    TemplateCtx*                        templates_ = nullptr;
     Chunk*         chunk_ = nullptr;
     bool           failed_ = false;
 
-    // Metodo de la ruta que se esta compilando: permite rechazar `sse.*` fuera
-    // de una ruta sse al compilar, en vez de dejarlo para runtime.
+    // Method of the route being compiled: lets `sse.*` be rejected outside an
+    // sse route at compile time, instead of leaving it to runtime.
     std::string route_method_;
 
-    // El tipo declarado se guarda para poder resolver `u.metodo()` en
-    // compilacion: en runtime una instancia es un Dict y no se distinguiria.
+    // The declared type is kept so `u.method()` can be resolved at compile
+    // time: at runtime an instance is a Dict and would be indistinguishable.
     struct Local { std::string name; int depth; std::string type; };
     std::vector<Local> locals_;
     int                scope_depth_ = 0;
 
-    // Saltos pendientes del bucle en curso.  Los dos se parchean al cerrarlo:
-    // en un `for` el destino de `continue` es el incremento, que todavia no se
-    // ha emitido cuando aparece el `continue` dentro del cuerpo.
+    // Pending jumps of the loop in progress.  Both are patched when it closes:
+    // in a `for` the target of `continue` is the increment, which has not been
+    // emitted yet when the `continue` appears inside the body.
     struct LoopCtx {
         std::vector<size_t> breaks;
         std::vector<size_t> continues;
@@ -133,10 +133,11 @@ private:
                        const std::string& type = {});
     const std::string& local_type(const std::string& name) const;
 
-    // Cierto solo si se PUEDE demostrar que la expresion es de tipo int.  Ante
-    // la duda dice que no: especializar de menos solo deja codigo generico,
-    // especializar de mas seria un error.
-    bool es_int(const Expr& e) const;
+    // True only if the expression CAN be proven to be of type int.  When in
+    // doubt it says no: under-specializing just leaves generic code,
+    // over-specializing would be a bug.
+    bool is_int_expr(const Expr& e) const;
+    static void flatten_concat(const Expr& e, std::vector<const Expr*>& out);
     int  resolve_local(const std::string& name) const;
     void begin_scope();
     void end_scope();
@@ -144,18 +145,18 @@ private:
     void emit_block(const Block& body);
     void emit_stmt(const Stmt& s);
     void emit_expr(const Expr& e);
-    void emitir_render_compilado(const Expr& e);
-    // Tipo estatico de una expresion, o "" si no se puede saber.  Solo mira lo
-    // que es evidente sin inferencia: un literal, o una variable declarada.
-    std::string tipo_de(const Expr& e) const;
-    // Comprueba un metodo contra la lista cerrada del tipo del receptor.
-    // Devuelve false —y ya ha dado el error— si ese metodo no existe.
-    bool comprobar_metodo_builtin(const Expr& e);
-    // Idem para un campo, al leerlo y al escribirlo.
-    bool comprobar_campo(const Expr& objeto, const std::string& campo, SourceLoc loc);
+    void emit_compiled_render(const Expr& e);
+    // Static type of an expression, or "" if it cannot be known.  It only looks
+    // at the obvious, with no inference: a literal, or a declared variable.
+    std::string type_of(const Expr& e) const;
+    // Checks a method against the closed list for the receiver's type.
+    // Returns false —having already reported the error— if that method does not exist.
+    bool check_builtin_method(const Expr& e);
+    // Same for a field, both reading and writing it.
+    bool check_field(const Expr& object, const std::string& field, SourceLoc loc);
     void emit_call(const Expr& e, bool awaited);
-    // Metodo cuyo receptor no tiene tipo conocido al compilar: se apila y el
-    // despacho por tipo lo hace el VM.
+    // Method whose receiver has no known type at compile time: it is pushed and
+    // the VM does the dispatch by type.
     void emit_method_call_dynamic(const Expr& e);
 };
 

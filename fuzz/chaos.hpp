@@ -1,16 +1,16 @@
 #pragma once
 //
-// Arnes de fuzzing sin cobertura, sin libFuzzer: este toolchain no tiene clang
-// (libFuzzer es -fsanitize=fuzzer, un builtin de clang que gcc no tiene), y el
-// proyecto no baja herramientas de la red para compilar. Esto es lo simple que
-// funciona sin ninguna de las dos cosas: se muta una semilla valida a bocados
-// aleatorios y cada caso corre en un proceso hijo aparte, para que un cuelgue
-// o un abort de ASan/UBSan tumbe solo ese caso y la campana siga.
+// Fuzzing harness with no coverage and no libFuzzer: this toolchain has no
+// clang (libFuzzer is -fsanitize=fuzzer, a clang builtin gcc does not have),
+// and the project does not download tools from the network to build.  This is
+// the simple thing that works without either: a valid seed is mutated in
+// random bites and each case runs in its own child process, so that a hang or
+// an ASan/UBSan abort takes down only that case and the campaign carries on.
 //
-// No tiene guia por cobertura -- no sabe que caso llega mas lejos en el
-// codigo -- pero partir de semillas reales en vez de ruido puro compensa buena
-// parte de eso: la mayoria de mutaciones caen cerca de una entrada que ya
-// pasaba del lexer, así que llegan al parser, al checker, mas alla.
+// It has no coverage guidance -- it does not know which case reaches further
+// into the code -- but starting from real seeds instead of pure noise makes up
+// for a good part of that: most mutations land near an input that already got
+// past the lexer, so they reach the parser, the checker, and beyond.
 
 #include <chrono>
 #include <cstdio>
@@ -25,9 +25,9 @@ namespace chaos {
 
 using Reloj = std::chrono::steady_clock;
 
-// Un puñado de mutaciones por caso: bit-flip, byte al azar, insertar, borrar,
-// truncar, o empalmar con otra semilla. Nada elegante a proposito.
-inline std::string mutar(std::string s, const std::vector<std::string>& semillas,
+// A handful of mutations per case: bit flip, random byte, insert, delete,
+// truncate, or splice with another seed.  Nothing fancy, on purpose.
+inline std::string mutar(std::string s, const std::vector<std::string>& seeds,
                           std::mt19937& g) {
     if (s.empty()) s = " ";
     int pasadas = 1 + int(g() % 4);
@@ -61,12 +61,12 @@ inline std::string mutar(std::string s, const std::vector<std::string>& semillas
                 break;
             }
             case 5: {
-                if (!semillas.empty()) {
-                    const std::string& otra = semillas[g() % semillas.size()];
-                    if (!otra.empty() && !s.empty()) {
-                        size_t corte_a = g() % s.size();
-                        size_t corte_b = g() % otra.size();
-                        s = s.substr(0, corte_a) + otra.substr(corte_b);
+                if (!seeds.empty()) {
+                    const std::string& other = seeds[g() % seeds.size()];
+                    if (!other.empty() && !s.empty()) {
+                        size_t cut_a = g() % s.size();
+                        size_t cut_b = g() % other.size();
+                        s = s.substr(0, cut_a) + other.substr(cut_b);
                     }
                 }
                 break;
@@ -76,58 +76,58 @@ inline std::string mutar(std::string s, const std::vector<std::string>& semillas
     return s;
 }
 
-// Corre <objetivo> sobre <iteraciones> casos mutados de <semillas>, cada uno en
-// su propio hijo con un tope de tiempo. Devuelve cuantos casos fallaron (crash
-// o cuelgue); cada uno se vuelca a /tmp/<nombre>_fallo_N.bin para reproducirlo
+// Runs <target> over <iterations> mutated cases from <seeds>, each in its own
+// child with a time cap.  Returns how many cases failed (crash or hang); each
+// one is dumped to /tmp/<name>_fail_N.bin so it can be reproduced.
 // aparte.
 template <typename Fn>
-int correr(const char* nombre, int iteraciones, int limite_ms,
-           const std::vector<std::string>& semillas, Fn objetivo) {
+int run(const char* name, int iterations, int limit_ms,
+           const std::vector<std::string>& seeds, Fn target) {
     std::mt19937 g(std::random_device{}());
-    int fallos = 0;
+    int failures = 0;
     auto t0 = Reloj::now();
 
-    for (int i = 0; i < iteraciones; ++i) {
-        const std::string& base = semillas[g() % semillas.size()];
-        std::string caso = mutar(base, semillas, g);
+    for (int i = 0; i < iterations; ++i) {
+        const std::string& base = seeds[g() % seeds.size()];
+        std::string case_ = mutar(base, seeds, g);
 
         pid_t pid = fork();
         if (pid < 0) { std::perror("fork"); break; }
         if (pid == 0) {
-            alarm(static_cast<unsigned>((limite_ms + 999) / 1000));
-            objetivo(caso);
+            alarm(static_cast<unsigned>((limit_ms + 999) / 1000));
+            target(case_);
             _exit(0);
         }
 
-        int estado = 0;
-        waitpid(pid, &estado, 0);
+        int status = 0;
+        waitpid(pid, &status, 0);
 
-        bool crash = WIFSIGNALED(estado);
-        bool raro  = WIFEXITED(estado) && WEXITSTATUS(estado) != 0;
+        bool crash = WIFSIGNALED(status);
+        bool raro  = WIFEXITED(status) && WEXITSTATUS(status) != 0;
         if (crash || raro) {
-            ++fallos;
-            std::string ruta = std::string("/tmp/") + nombre + "_fallo_" +
-                                std::to_string(fallos) + ".bin";
-            if (FILE* f = std::fopen(ruta.c_str(), "wb")) {
-                std::fwrite(caso.data(), 1, caso.size(), f);
+            ++failures;
+            std::string path = std::string("/tmp/") + name + "_fail_" +
+                                std::to_string(failures) + ".bin";
+            if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(case_.data(), 1, case_.size(), f);
                 std::fclose(f);
             }
-            std::fprintf(stderr, "[%s] caso %d: %s (%d) -- guardado en %s\n", nombre, i,
-                          crash ? "señal" : "salida", crash ? WTERMSIG(estado) : WEXITSTATUS(estado),
-                          ruta.c_str());
+            std::fprintf(stderr, "[%s] case_ %d: %s (%d) -- guardado en %s\n", name, i,
+                          crash ? "signal" : "out", crash ? WTERMSIG(status) : WEXITSTATUS(status),
+                          path.c_str());
         }
 
         if (i > 0 && i % 5000 == 0) {
             double s = std::chrono::duration<double>(Reloj::now() - t0).count();
-            std::fprintf(stderr, "[%s] %d casos, %d fallos, %.0f casos/s\n", nombre, i, fallos,
+            std::fprintf(stderr, "[%s] %d casos, %d failures, %.0f casos/s\n", name, i, failures,
                           i / s);
         }
     }
 
     double s = std::chrono::duration<double>(Reloj::now() - t0).count();
-    std::fprintf(stderr, "[%s] fin: %d casos en %.1fs (%.0f/s), %d fallos\n", nombre, iteraciones,
-                  s, iteraciones / s, fallos);
-    return fallos;
+    std::fprintf(stderr, "[%s] fin: %d casos en %.1fs (%.0f/s), %d failures\n", name, iterations,
+                  s, iterations / s, failures);
+    return failures;
 }
 
 } // namespace chaos

@@ -17,32 +17,32 @@ namespace lumen_script {
 
 namespace {
 
-// ─── Cliente HTTP minimo ─────────────────────────────────────────────────────
+// ─── Minimal HTTP client ─────────────────────────────────────────────────────
 //
-// Se habla por el socket de verdad, no por dentro: asi la sonda recorre el
-// mismo camino que una peticion real —parser, router, middleware— y no solo el
+// It talks over the real socket, not internally: that way the probe walks the
+// same path as a real request —parser, router, middleware— and not just the
 // handler.
 
-struct Respuesta {
-    bool        conectado = false;
-    int         codigo    = 0;
+struct Response {
+    bool        connected = false;
+    int         code    = 0;
     long long   ms        = 0;
     size_t      bytes     = 0;
 };
 
-Respuesta pedir(uint16_t port, const std::string& metodo, const std::string& ruta,
-                const std::string& cuerpo, int timeout_ms, bool leer_flujo,
+Response pedir(uint16_t port, const std::string& method, const std::string& path,
+                const std::string& cuerpo, int timeout_ms, bool read_stream,
                 int stream_ms) {
-    Respuesta r;
+    Response r;
     auto t0 = std::chrono::steady_clock::now();
 
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return r;
 
     timeval tv{};
-    int espera = leer_flujo ? stream_ms : timeout_ms;
-    tv.tv_sec  = espera / 1000;
-    tv.tv_usec = (espera % 1000) * 1000;
+    int expects = read_stream ? stream_ms : timeout_ms;
+    tv.tv_sec  = expects / 1000;
+    tv.tv_usec = (expects % 1000) * 1000;
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -55,9 +55,9 @@ Respuesta pedir(uint16_t port, const std::string& metodo, const std::string& rut
         ::close(fd);
         return r;
     }
-    r.conectado = true;
+    r.connected = true;
 
-    std::string pet = metodo + " " + ruta + " HTTP/1.1\r\n"
+    std::string pet = method + " " + path + " HTTP/1.1\r\n"
                       "Host: 127.0.0.1\r\n"
                       "Connection: close\r\n"
                       "X-Lumen-Autotest: 1\r\n";
@@ -74,46 +74,46 @@ Respuesta pedir(uint16_t port, const std::string& metodo, const std::string& rut
         enviado += static_cast<size_t>(n);
     }
 
-    std::string recibido;
+    std::string received;
     char        buf[4096];
     for (;;) {
         ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
         if (n <= 0) break;
-        recibido.append(buf, static_cast<size_t>(n));
-        // De un flujo basta con la cabecera y algo de cuerpo: no termina nunca.
-        if (leer_flujo && recibido.size() > 64) break;
-        if (recibido.size() > 1u << 20) break;
+        received.append(buf, static_cast<size_t>(n));
+        // For a stream the header and some body are enough: it never ends.
+        if (read_stream && received.size() > 64) break;
+        if (received.size() > 1u << 20) break;
     }
     ::close(fd);
 
-    if (recibido.rfind("HTTP/1.1 ", 0) == 0)
-        r.codigo = std::atoi(recibido.c_str() + 9);
-    r.bytes = recibido.size();
+    if (received.rfind("HTTP/1.1 ", 0) == 0)
+        r.code = std::atoi(received.c_str() + 9);
+    r.bytes = received.size();
     r.ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now() - t0).count();
     return r;
 }
 
-// ─── Sintesis de valores ─────────────────────────────────────────────────────
+// ─── Value synthesis ─────────────────────────────────────────────────────────
 
-// Un valor plausible para un parametro, por tipo.  No pretende pasar las reglas
-// de `validate`: un 422 tambien es una respuesta valida y se informa como tal.
-std::string valor_para(const std::string& tipo) {
-    if (tipo == "int" || tipo == "long")     return "1";
-    if (tipo == "float" || tipo == "double") return "1.5";
-    if (tipo == "bool")                      return "true";
-    return "prueba";
+// A plausible value for a parameter, by type.  It does not aim to pass the
+// `validate` rules: a 422 is also a valid response and is reported as such.
+std::string value_for(const std::string& type) {
+    if (type == "int" || type == "long")     return "1";
+    if (type == "float" || type == "double") return "1.5";
+    if (type == "bool")                      return "true";
+    return "test";
 }
 
-std::string json_para(const std::string& tipo) {
-    if (tipo == "int" || tipo == "long")     return "1";
-    if (tipo == "float" || tipo == "double") return "1.5";
-    if (tipo == "bool")                      return "true";
-    return "\"prueba\"";
+std::string json_para(const std::string& type) {
+    if (type == "int" || type == "long")     return "1";
+    if (type == "float" || type == "double") return "1.5";
+    if (type == "bool")                      return "true";
+    return "\"test\"";
 }
 
-// Rellena :id / {id} y anade las query con valor.
-std::string ruta_concreta(const RouteDecl& r) {
+// Fills in :id / {id} and appends the query parameters with a value.
+std::string concrete_route(const RouteDecl& r) {
     std::string out;
     size_t i = 0;
     while (i < r.pattern.size()) {
@@ -122,14 +122,14 @@ std::string ruta_concreta(const RouteDecl& r) {
             char cierre = (c == '{') ? '}' : '/';
             size_t j = i + 1;
             while (j < r.pattern.size() && r.pattern[j] != cierre) ++j;
-            std::string nombre = r.pattern.substr(i + 1, j - i - 1);
+            std::string name = r.pattern.substr(i + 1, j - i - 1);
 
-            std::string tipo = "string";
-            for (const auto& p : r.params) if (p.name == nombre) tipo = p.type.name;
-            out += valor_para(tipo);
+            std::string type = "string";
+            for (const auto& p : r.params) if (p.name == name) type = p.type.name;
+            out += value_for(type);
             i = (c == '{') ? j + 1 : j;
         } else if (c == '*') {
-            out += "prueba";
+            out += "test";
             ++i;
         } else {
             out += c;
@@ -139,18 +139,18 @@ std::string ruta_concreta(const RouteDecl& r) {
     return out;
 }
 
-// Cuerpo JSON a partir de la clase que la ruta espera, si espera alguna.
-std::string cuerpo_para(const RouteDecl& r, const Program& programa) {
+// JSON body from the class the route expects, if it expects one.
+std::string body_for(const RouteDecl& r, const Program& programa) {
     for (const auto& p : r.params) {
         for (const auto& c : programa.classes) {
             if (c.name != p.type.name) continue;
             std::string j = "{";
-            bool primero = true;
+            bool first = true;
             for (const auto& f : c.fields) {
-                if (f.type.optional) continue;          // los opcionales se omiten
-                if (!primero) j += ",";
+                if (f.type.optional) continue;          // the optional ones are skipped
+                if (!first) j += ",";
                 j += "\"" + f.name + "\":" + json_para(f.type.name);
-                primero = false;
+                first = false;
             }
             return j + "}";
         }
@@ -158,16 +158,16 @@ std::string cuerpo_para(const RouteDecl& r, const Program& programa) {
     return {};
 }
 
-const char* veredicto(const Respuesta& r, bool flujo) {
-    if (!r.conectado)                 return "SIN CONEXION";
-    if (flujo && r.codigo == 200)     return "flujo";
-    if (r.codigo >= 500)              return "ERROR";
-    if (r.codigo >= 400)              return "rechazada";
-    if (r.codigo >= 200)              return "ok";
+const char* veredicto(const Response& r, bool stream) {
+    if (!r.connected)                 return "SIN CONEXION";
+    if (stream && r.code == 200)     return "stream";
+    if (r.code >= 500)              return "ERROR";
+    if (r.code >= 400)              return "rejected";
+    if (r.code >= 200)              return "ok";
     return "?";
 }
 
-bool metodo_seguro(const std::string& m) {
+bool safe_method(const std::string& m) {
     return m == "GET" || m == "HEAD" || m == "SSE";
 }
 
@@ -176,63 +176,63 @@ bool metodo_seguro(const std::string& m) {
 void run_autotest(const Module& mod, const AutotestOptions& opts) {
     if (!opts.enabled) return;
 
-    const auto& rutas = mod.program.routes;
-    if (rutas.empty()) return;
+    const auto& routes = mod.program.routes;
+    if (routes.empty()) return;
 
     std::ostringstream cab;
-    cab << "autotest: probando " << rutas.size() << " ruta(s)";
-    if (!opts.unsafe) cab << " (solo metodos seguros; --autotest=all incluye el resto)";
+    cab << "autotest: probando " << routes.size() << " path(s)";
+    if (!opts.unsafe) cab << " (safe methods only; --autotest=all includes the rest)";
     lumen::log().info(cab.str());
 
     int ok = 0, rechazadas = 0, errores = 0, omitidas = 0;
 
-    for (const auto& r : rutas) {
-        std::string metodo = r.method;
+    for (const auto& r : routes) {
+        std::string method = r.method;
 
-        if (metodo == "WS") {
+        if (method == "WS") {
             lumen::log().info("  omitida   WS   " + r.pattern +
-                               "   (necesita handshake de WebSocket)");
+                               "   (needs a WebSocket handshake)");
             ++omitidas;
             continue;
         }
-        if (!opts.unsafe && !metodo_seguro(metodo)) {
-            lumen::log().info("  omitida   " + metodo + "  " + r.pattern +
-                               "   (metodo con efectos)");
+        if (!opts.unsafe && !safe_method(method)) {
+            lumen::log().info("  omitida   " + method + "  " + r.pattern +
+                               "   (method with side effects)");
             ++omitidas;
             continue;
         }
 
-        bool flujo = (metodo == "SSE");
-        if (flujo || metodo == "*") metodo = "GET";
+        bool stream = (method == "SSE");
+        if (stream || method == "*") method = "GET";
 
-        std::string ruta   = ruta_concreta(r);
-        std::string cuerpo = metodo_seguro(r.method) ? std::string()
-                                                     : cuerpo_para(r, mod.program);
+        std::string path   = concrete_route(r);
+        std::string cuerpo = safe_method(r.method) ? std::string()
+                                                     : body_for(r, mod.program);
 
-        Respuesta res = pedir(opts.port, metodo, ruta, cuerpo,
-                              opts.timeout_ms, flujo, opts.stream_ms);
+        Response res = pedir(opts.port, method, path, cuerpo,
+                              opts.timeout_ms, stream, opts.stream_ms);
 
-        const char* v = veredicto(res, flujo);
+        const char* v = veredicto(res, stream);
         if      (std::strcmp(v, "ERROR") == 0 ||
                  std::strcmp(v, "SIN CONEXION") == 0) ++errores;
-        else if (std::strcmp(v, "rechazada") == 0)    ++rechazadas;
+        else if (std::strcmp(v, "rejected") == 0)    ++rechazadas;
         else                                          ++ok;
 
-        std::ostringstream linea;
-        linea << "  " << std::left << std::setw(10) << v
-              << std::setw(7) << metodo << std::setw(34) << ruta;
-        if (res.conectado) linea << res.codigo << "  " << res.ms << "ms";
-        linea << "";
-        lumen::log().info(linea.str());
+        std::ostringstream line;
+        line << "  " << std::left << std::setw(10) << v
+              << std::setw(7) << method << std::setw(34) << path;
+        if (res.connected) line << res.code << "  " << res.ms << "ms";
+        line << "";
+        lumen::log().info(line.str());
     }
 
     std::ostringstream fin;
     fin << "autotest: " << ok << " ok, " << rechazadas << " rechazadas, "
-        << errores << " con error";
+        << errores << " with an error";
     if (omitidas) fin << ", " << omitidas << " omitidas";
 
-    // Un 5xx es lo unico que significa "esto se ha roto": un 4xx puede ser el
-    // comportamiento correcto de una guarda o de una validacion.
+    // A 5xx is the only thing that means "this broke": a 4xx can be the correct
+    // behaviour of a guard or a validation.
     if (errores) lumen::log().error(fin.str());
     else         lumen::log().info(fin.str());
 }

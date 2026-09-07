@@ -31,16 +31,16 @@ public:
 
     // ── Cierre ───────────────────────────────────────────────────────────────
     //
-    // Se invoca una vez, en el hilo del event loop principal, cuando las
-    // conexiones ya estan drenadas pero ANTES de parar los loops.
+    // Invoked once, on the main event loop thread, when the connections are
+    // already drained but BEFORE stopping the loops.
     //
-    // Es el unico punto seguro para apagar cualquier cosa que tenga hilos
-    // propios posteando al loop —el pool de un modulo de base de datos, por
-    // ejemplo—: mientras corre, los loops siguen vivos, asi que un post() que
-    // llegue tarde todavia encuentra su destino.  Cuando vuelve, ya no puede
-    // quedar nadie posteando y parar los loops es seguro.
+    // It is the only safe point to shut down anything that has its own threads
+    // posting to the loop —a database module's pool, for instance—: while it
+    // runs, the loops are still alive, so a late post() still finds its
+    // destination.  When it returns, nobody can be posting any more and
+    // stopping the loops is safe.
     //
-    // Bloquea el cierre mientras dure, asi que debe terminar.
+    // It blocks the shutdown for as long as it lasts, so it must finish.
     App& on_before_stop(std::function<void()> fn) {
         before_stop_ = std::move(fn);
         return *this;
@@ -82,7 +82,7 @@ public:
         return *this;
     }
 
-    // Directorio donde se buscan los templates (default: "./templates")
+    // Directory where the templates are looked up (default: "./templates")
     App& set_templates(std::string dir) { templates_dir_ = std::move(dir); return *this; }
 
     // Override the title and version shown in /docs and /openapi.json.
@@ -131,12 +131,12 @@ public:
         return ws(std::move(path), std::forward<F>(fn), WSOptions{});
     }
 
-    // Construye el handler del upgrade sin registrarlo.  Lo usa ws() y tambien
-    // el frontend de Lumen Script, que tiene su propio router y necesita la misma
-    // logica de handshake sin pasar por el router del motor.
+    // Builds the upgrade handler without registering it.  Used by ws() and also
+    // by the Lumen Script frontend, which has its own router and needs the same
+    // handshake logic without going through the engine's router.
     //
-    // `fn` recibe la conexion ya establecida junto al Request y el Response de
-    // la peticion que la origino; tras el upgrade, el Response no debe tocarse.
+    // `fn` receives the established connection along with the Request and the
+    // Response of the originating request; after the upgrade, the Response
     template<typename F>
     static Handler make_ws_handler(F&& fn, WSOptions opts) {
         auto wrapper = [fn = std::forward<F>(fn), opts = std::move(opts)]

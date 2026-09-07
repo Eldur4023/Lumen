@@ -72,9 +72,9 @@ public:
         return ss.str();
     }
 
-    // Resumen de /health, ya en texto.  Son cuatro campos de tipos conocidos:
-    // montar un arbol JSON para esto era pasar por un intermediario que no
-    // aportaba nada.
+    // Summary of /health, already as text.  It is four fields of known types:
+    // building a JSON tree for this was going through a middleman that
+    // contributed nothing.
     std::string to_health_text() const {
         using Clock = std::chrono::steady_clock;
         double uptime = std::chrono::duration<double>(Clock::now() - started_at_).count();

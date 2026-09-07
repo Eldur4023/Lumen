@@ -1,7 +1,7 @@
 #include <lumen_script/emitter.hpp>
 #include <fstream>
 #include <filesystem>
-#include <lumen_script/plantilla.hpp>
+#include <lumen_script/template.hpp>
 #include <lumen_script/natives.hpp>
 
 #include <algorithm>
@@ -18,7 +18,7 @@ int Emitter::declare_local(const std::string& name, SourceLoc loc,
     for (auto it = locals_.rbegin(); it != locals_.rend(); ++it) {
         if (it->depth < scope_depth_) break;
         if (it->name == name) {
-            error(loc, "'" + name + "' ya esta declarada en este ambito");
+            error(loc, "'" + name + "' is already declared in this scope");
             return static_cast<int>(std::distance(locals_.begin(), it.base()) - 1);
         }
     }
@@ -37,16 +37,28 @@ const std::string& Emitter::local_type(const std::string& name) const {
     return kNone;
 }
 
-bool Emitter::es_int(const Expr& e) const {
+bool Emitter::is_int_expr(const Expr& e) const {
     switch (e.kind) {
         case ExprKind::IntLit: return true;
         case ExprKind::Ident:  return local_type(e.text) == "int";
         case ExprKind::Binary:
             if (e.text == "+" || e.text == "-" || e.text == "*")
-                return e.lhs && e.rhs && es_int(*e.lhs) && es_int(*e.rhs);
+                return e.lhs && e.rhs && is_int_expr(*e.lhs) && is_int_expr(*e.rhs);
             return false;
         default: return false;
     }
+}
+
+// Collects the operands of a '+' chain in evaluation order.  It only walks down
+// the left: the right-hand side enters as is, even if it is another '+' in
+// parentheses, so as not to reassociate what the parser already associated.
+void Emitter::flatten_concat(const Expr& e, std::vector<const Expr*>& out) {
+    if (e.kind == ExprKind::Binary && e.text == "+" && e.lhs && e.rhs) {
+        flatten_concat(*e.lhs, out);
+        out.push_back(e.rhs.get());
+        return;
+    }
+    out.push_back(&e);
 }
 
 int Emitter::resolve_local(const std::string& name) const {
@@ -59,8 +71,8 @@ void Emitter::begin_scope() { ++scope_depth_; }
 
 void Emitter::end_scope() {
     --scope_depth_;
-    // Las ranuras no se reciclan: el coste es una entrada mas en el vector de
-    // locales y a cambio los indices son estables, lo que simplifica el VM.
+    // Slots are not recycled: the cost is one more entry in the locals vector
+    // and in exchange the indices are stable, which simplifies the VM.
     while (!locals_.empty() && locals_.back().depth > scope_depth_)
         locals_.pop_back();
 }
@@ -75,10 +87,10 @@ bool Emitter::emit_route(const RouteDecl& route, Chunk& out) {
 
     for (const auto& p : route.params) declare_local(p.name, p.loc, p.type.name);
 
-    // Las guardas del grupo se emiten antes del cuerpo, de fuera hacia dentro:
-    // para llegar al handler hay que pasar primero la del grupo padre.  Cada
-    // una es el mismo `if not X: return Y` que `require`, asi que no hay
-    // concepto de middleware ni en el emisor ni en el VM.
+    // The group guards are emitted before the body, outside in: to reach the
+    // handler you must first pass the parent group's.  Each one is the same
+    // `if not X: return Y` as `require`, so there is no middleware concept in
+    // the emitter or in the VM.
     for (const auto& g : route.guards) {
         if (!g.condition || !g.otherwise) continue;
         emit_expr(*g.condition);
@@ -92,8 +104,8 @@ bool Emitter::emit_route(const RouteDecl& route, Chunk& out) {
 
     emit_block(route.body);
 
-    // Un handler que se cae por el final no devuelve nada: el motor respondera
-    // con lo que haya escrito un builtin, o 204 si no escribio nada.
+    // A handler that runs off the end returns nothing: the engine will reply
+    // with whatever a builtin wrote, or 204 if it wrote nothing.
     out.emit(Op::ReturnNull, route.loc);
     return !failed_;
 }
@@ -121,7 +133,7 @@ bool Emitter::emit_method(const std::string& cls, const FnDecl& m, Chunk& out) {
     loops_.clear();
     scope_depth_ = 0;
 
-    // `this` es simplemente el parametro 0.
+    // `this` is simply parameter 0.
     declare_local("this", m.loc, cls);
     for (const auto& p : m.params) declare_local(p.name, p.loc, p.type.name);
 
@@ -142,8 +154,8 @@ bool Emitter::emit_ctor(const std::string& cls, const std::vector<std::string>& 
     for (const auto& p : ct.params) declare_local(p.name, p.loc, p.type.name);
     int self = declare_local("this", ct.loc, cls);
 
-    // La instancia arranca con todos los campos declarados a null, para que
-    // acceder a uno que el constructor no toque de null y no falle.
+    // The instance starts with every declared field set to null, so reading one
+    // the constructor does not touch gives null instead of failing.
     for (const auto& f : fields) {
         chunk_->emit(Op::Const, ct.loc, chunk_->add_constant(Value::str(f)));
         chunk_->emit(Op::Const, ct.loc, chunk_->add_constant(Value::null()));
@@ -154,10 +166,10 @@ bool Emitter::emit_ctor(const std::string& cls, const std::vector<std::string>& 
     if (ct.has_body) {
         emit_block(ct.body);
     } else {
-        // Sin cuerpo: cada parametro va al campo de su mismo nombre.
+        // No body: each parameter goes to the field of the same name.
         for (const auto& p : ct.params) {
             if (std::find(fields.begin(), fields.end(), p.name) == fields.end()) {
-                error(p.loc, "'" + p.name + "' no es un campo de '" + cls + "'");
+                error(p.loc, "'" + p.name + "' is not a field of '" + cls + "'");
                 continue;
             }
             chunk_->emit(Op::LoadLocal, ct.loc, static_cast<uint32_t>(self));
@@ -173,7 +185,7 @@ bool Emitter::emit_ctor(const std::string& cls, const std::vector<std::string>& 
     return !failed_;
 }
 
-bool Emitter::emit_condition(const Expr& e, const std::vector<NombreTipado>& names,
+bool Emitter::emit_condition(const Expr& e, const std::vector<TypedName>& names,
                              Chunk& out) {
     chunk_        = &out;
     route_method_ = {};
@@ -182,7 +194,7 @@ bool Emitter::emit_condition(const Expr& e, const std::vector<NombreTipado>& nam
     loops_.clear();
     scope_depth_ = 0;
 
-    for (const auto& n : names) declare_local(n.nombre, e.loc, n.tipo);
+    for (const auto& n : names) declare_local(n.name, e.loc, n.type);
 
     emit_expr(e);
     out.emit(Op::Return, e.loc);
@@ -229,9 +241,9 @@ void Emitter::emit_stmt(const Stmt& s) {
         }
 
         case StmtKind::Assign: {
-            // `session.x = v` → __session_set("x", v).  Es la unica asignacion
-            // a un miembro que existe; el resto de objetos reservados son de
-            // solo lectura.
+            // `session.x = v` → __session_set("x", v).  It is the only assignment
+            // to a member that exists; the rest of the reserved objects are
+            // read-only.
             if (s.target->kind == ExprKind::Member &&
                 s.target->object->kind == ExprKind::Ident &&
                 s.target->object->text == "session" &&
@@ -246,7 +258,7 @@ void Emitter::emit_stmt(const Stmt& s) {
                 return;
             }
 
-            // `xs[0] = v` y `d["k"] = v`.
+            // `xs[0] = v` and `d["k"] = v`.
             if (s.target->kind == ExprKind::Index) {
                 emit_expr(*s.target->object);
                 emit_expr(*s.target->lhs);
@@ -256,9 +268,9 @@ void Emitter::emit_stmt(const Stmt& s) {
                 return;
             }
 
-            // `this.campo = v` y `objeto.campo = v`.
+            // `this.field = v` and `object.field = v`.
             if (s.target->kind == ExprKind::Member) {
-                if (!comprobar_campo(*s.target->object, s.target->text, s.loc)) return;
+                if (!check_field(*s.target->object, s.target->text, s.loc)) return;
                 emit_expr(*s.target->object);
                 emit_expr(*s.value);
                 chunk_->emit(Op::SetMember, s.loc,
@@ -268,12 +280,12 @@ void Emitter::emit_stmt(const Stmt& s) {
             }
 
             if (s.target->kind != ExprKind::Ident) {
-                error(s.loc, "solo se puede asignar a una variable o a un campo");
+                error(s.loc, "can only assign to a variable or a field");
                 return;
             }
             int slot = resolve_local(s.target->text);
             if (slot < 0) {
-                error(s.target->loc, "'" + s.target->text + "' no esta declarada");
+                error(s.target->loc, "'" + s.target->text + "' is not declared");
                 return;
             }
             emit_expr(*s.value);
@@ -304,7 +316,7 @@ void Emitter::emit_stmt(const Stmt& s) {
 
             loops_.push_back({});
             emit_block(s.body);
-            // En un while, `continue` vuelve a evaluar la condicion.
+            // In a while, `continue` re-evaluates the condition.
             for (size_t j : loops_.back().continues) chunk_->patch(j, start);
             chunk_->emit(Op::Jump, s.loc, static_cast<uint32_t>(start));
             chunk_->patch(to_end, chunk_->here());
@@ -314,8 +326,8 @@ void Emitter::emit_stmt(const Stmt& s) {
             break;
         }
 
-        // `require X else Y` es azucar de `if not X: return Y`.  Se emite tal
-        // cual: no hay opcode propio ni concepto de middleware en el VM.
+        // `require X else Y` is sugar for `if not X: return Y`.  It is emitted
+        // as such: no dedicated opcode and no middleware concept in the VM.
         case StmtKind::Require: {
             emit_expr(*s.value);
             size_t to_ok = chunk_->emit(Op::JumpIfFalse, s.loc);
@@ -328,19 +340,19 @@ void Emitter::emit_stmt(const Stmt& s) {
         }
 
         case StmtKind::Break:
-            if (loops_.empty()) { error(s.loc, "'break' fuera de un bucle"); return; }
+            if (loops_.empty()) { error(s.loc, "'break' outside a loop"); return; }
             loops_.back().breaks.push_back(chunk_->emit(Op::Jump, s.loc));
             break;
 
         case StmtKind::Continue:
-            if (loops_.empty()) { error(s.loc, "'continue' fuera de un bucle"); return; }
+            if (loops_.empty()) { error(s.loc, "'continue' outside a loop"); return; }
             loops_.back().continues.push_back(chunk_->emit(Op::Jump, s.loc));
             break;
 
-        // `for T x in xs:` se desazucara a un indice sobre la lista.  Las
-        // ranuras auxiliares llevan un espacio en el nombre, que ningun
-        // identificador de Lumen Script puede contener: asi nunca chocan con las del
-        // usuario ni entre dos bucles anidados.
+        // `for T x in xs:` is desugared into an index over the list.  The helper
+        // slots carry a space in the name, which no Lumen Script identifier can
+        // contain: that way they never clash with the user's or between two
+        // nested loops.
         case StmtKind::For: {
             begin_scope();
 
@@ -375,8 +387,8 @@ void Emitter::emit_stmt(const Stmt& s) {
             loops_.push_back({});
             emit_block(s.body);
 
-            // `continue` salta al incremento, no al principio: si no, el bucle
-            // no avanzaria nunca.
+            // `continue` jumps to the increment, not to the start: otherwise the
+            // loop would never advance.
             size_t step = chunk_->here();
             for (size_t j : loops_.back().continues) chunk_->patch(j, step);
             chunk_->emit(Op::LoadLocal, s.loc, static_cast<uint32_t>(index));
@@ -403,7 +415,7 @@ void Emitter::emit_stmt(const Stmt& s) {
             range.catch_pc = chunk_->here();
             chunk_->try_ranges.push_back(range);
 
-            // El error llega en la cima como un Dict con `message`.
+            // The error arrives on top as a Dict with `message`.
             begin_scope();
             if (!s.name.empty()) {
                 int slot = declare_local(s.name, s.loc);
@@ -442,10 +454,10 @@ void Emitter::emit_expr(const Expr& e) {
             int slot = resolve_local(e.text);
             if (slot < 0) {
                 if (native_id(e.text) >= 0)
-                    error(e.loc, "'" + e.text + "' es un builtin: hay que llamarlo, "
-                                 "no usarlo como valor");
+                    error(e.loc, "'" + e.text + "' is a builtin: it must be called, "
+                                 "not to use it as a value");
                 else
-                    error(e.loc, "'" + e.text + "' no esta declarada");
+                    error(e.loc, "'" + e.text + "' is not declared");
                 return;
             }
             chunk_->emit(Op::LoadLocal, e.loc, static_cast<uint32_t>(slot));
@@ -457,8 +469,8 @@ void Emitter::emit_expr(const Expr& e) {
             chunk_->emit(e.text == "not" ? Op::Not : Op::Neg, e.loc);
             break;
 
-        // and/or cortocircuitan: se mira la cima sin consumirla y se salta con
-        // ella puesta, que es justo el valor del resultado.
+        // and/or short-circuit: the top is peeked without consuming it and the
+        // jump happens with it in place, which is exactly the result value.
         case ExprKind::Binary: {
             if (e.text == "and" || e.text == "or") {
                 emit_expr(*e.lhs);
@@ -467,6 +479,25 @@ void Emitter::emit_expr(const Expr& e) {
                 emit_expr(*e.rhs);
                 chunk_->patch(j, chunk_->here());
                 break;
+            }
+
+            // A chain of '+' collapses into a single ConcatN: that way the text
+            // is built in a buffer with the size already reserved, instead of
+            // creating a box and a buffer per '+' and throwing all but the last.
+            //
+            // Only the left spine, which is how the parser associates: flattening
+            // the right as well would change the order of a float sum, where
+            // (a+b)+c is not a+(b+c).  Integer chains keep their AddInt, which is
+            // already the fast path for that case.
+            if (e.text == "+" && !is_int_expr(e)) {
+                std::vector<const Expr*> parts;
+                flatten_concat(e, parts);
+                if (parts.size() >= 3) {
+                    for (const Expr* p : parts) emit_expr(*p);
+                    chunk_->emit(Op::ConcatN, e.loc,
+                                 static_cast<uint32_t>(parts.size()));
+                    break;
+                }
             }
 
             emit_expr(*e.lhs);
@@ -483,11 +514,11 @@ void Emitter::emit_expr(const Expr& e) {
             else if (e.text == "<=") op = Op::Le;
             else if (e.text == ">")  op = Op::Gt;
             else if (e.text == ">=") op = Op::Ge;
-            else { error(e.loc, "operador no soportado: " + e.text); return; }
+            else { error(e.loc, "unsupported operator: " + e.text); return; }
 
-            // Lumen Script declara los tipos, asi que lo que el VM generico averigua en
-            // cada vuelta se sabe aqui una sola vez.
-            if (es_int(*e.lhs) && es_int(*e.rhs)) {
+            // Lumen Script declares the types, so what the generic VM works out
+            // on every pass is known here once.
+            if (is_int_expr(*e.lhs) && is_int_expr(*e.rhs)) {
                 switch (op) {
                     case Op::Add: op = Op::AddInt; break;
                     case Op::Sub: op = Op::SubInt; break;
@@ -533,11 +564,11 @@ void Emitter::emit_expr(const Expr& e) {
             chunk_->emit(Op::GetIndex, e.loc);
             break;
 
-        // `sse.open` no es un campo de un diccionario: es un objeto reservado,
-        // y se resuelve al builtin que lo implementa.
+        // `sse.open` is not a dictionary field: it is a reserved object, and it
+        // resolves to the builtin implementing it.
         case ExprKind::Member: {
-            // `session.x` admite cualquier nombre: es un almacen, no un
-            // objeto con miembros fijos.  Se traduce a __session_get("x").
+            // `session.x` accepts any name: it is a store, not an object with
+            // fixed members.  It translates to __session_get("x").
             if (e.object->kind == ExprKind::Ident &&
                 e.object->text == "session" &&
                 resolve_local("session") < 0 &&
@@ -555,30 +586,30 @@ void Emitter::emit_expr(const Expr& e) {
 
                 int id = member_native_id(e.object->text, e.text);
                 if (id < 0) {
-                    error(e.loc, "'" + e.object->text + "' no tiene un miembro '" +
+                    error(e.loc, "'" + e.object->text + "' has no member '" +
                                  e.text + "'");
                     return;
                 }
                 if (native_at(id).min_args > 0) {
                     error(e.loc, "'" + e.object->text + "." + e.text +
-                                 "' es una operacion: hay que llamarla con ()");
+                                 "' is an operation: it must be called with ()");
                     return;
                 }
                 if ((e.object->text == "sse" && route_method_ != "SSE") ||
                     (e.object->text == "ws"  && route_method_ != "WS")) {
-                    error(e.loc, "'" + e.object->text + "' solo existe dentro de "
-                                 "una ruta " + e.object->text);
+                    error(e.loc, "'" + e.object->text + "' only exists inside "
+                                 "a route " + e.object->text);
                     return;
                 }
                 if (e.object->text == "error" && route_method_ != "ERROR") {
-                    error(e.loc, "'error' solo existe dentro de un 'on error'");
+                    error(e.loc, "'error' only exists inside an 'on error'");
                     return;
                 }
                 chunk_->emit(Op::CallNative, e.loc,
                              static_cast<uint32_t>(id) << 8);
                 return;
             }
-            if (!comprobar_campo(*e.object, e.text, e.loc)) return;
+            if (!check_field(*e.object, e.text, e.loc)) return;
 
             emit_expr(*e.object);
             chunk_->emit(Op::GetMember, e.loc,
@@ -590,13 +621,13 @@ void Emitter::emit_expr(const Expr& e) {
             emit_call(e, /*awaited=*/false);
             break;
 
-        // `await` solo tiene sentido sobre una llamada a un builtin que
-        // suspende.  Cualquier otra cosa se rechaza aqui, no en runtime.
-        // ++x / x++ sobre una variable: se lee dos veces, que es mas barato que
-        // duplicar en la pila y no necesita opcode nuevo.
+        // `await` only makes sense on a call to a builtin that suspends.
+        // Anything else is rejected here, not at runtime.
+        // ++x / x++ on a variable: it is read twice, which is cheaper than
+        // duplicating on the stack and needs no new opcode.
         //
-        // Sobre un campo, el receptor se guarda en una ranura auxiliar: `o.f++`
-        // no puede evaluar `o` dos veces, porque `o` puede tener efectos.
+        // On a field, the receiver is kept in a helper slot: `o.f++` cannot
+        // evaluate `o` twice, because `o` may have side effects.
         case ExprKind::PreStep:
         case ExprKind::PostStep: {
             bool post = (e.kind == ExprKind::PostStep);
@@ -609,15 +640,15 @@ void Emitter::emit_expr(const Expr& e) {
 
             if (tgt.kind == ExprKind::Ident) {
                 int slot = resolve_local(tgt.text);
-                if (slot < 0) { error(tgt.loc, "'" + tgt.text + "' no esta declarada"); return; }
+                if (slot < 0) { error(tgt.loc, "'" + tgt.text + "' is not declared"); return; }
                 uint32_t u = static_cast<uint32_t>(slot);
 
-                if (post) chunk_->emit(Op::LoadLocal, e.loc, u);   // valor anterior
+                if (post) chunk_->emit(Op::LoadLocal, e.loc, u);   // value anterior
                 chunk_->emit(Op::LoadLocal, e.loc, u);
                 one();
                 chunk_->emit(op, e.loc);
                 chunk_->emit(Op::StoreLocal, e.loc, u);
-                if (!post) chunk_->emit(Op::LoadLocal, e.loc, u);  // valor nuevo
+                if (!post) chunk_->emit(Op::LoadLocal, e.loc, u);  // value nuevo
                 break;
             }
 
@@ -640,7 +671,7 @@ void Emitter::emit_expr(const Expr& e) {
                 chunk_->emit(op, e.loc);
                 chunk_->emit(Op::SetMember, e.loc, name_k);
 
-                // SetMember deja el valor nuevo en la cima.
+                // SetMember leaves the new value on top.
                 if (post) {
                     chunk_->emit(Op::Pop, e.loc);
                     chunk_->emit(Op::LoadLocal, e.loc, static_cast<uint32_t>(prev));
@@ -672,7 +703,7 @@ void Emitter::emit_expr(const Expr& e) {
                 chunk_->emit(op, e.loc);
                 chunk_->emit(Op::SetIndex, e.loc);
 
-                // SetIndex deja el valor nuevo en la cima.
+                // SetIndex leaves the new value on top.
                 if (post) {
                     chunk_->emit(Op::Pop, e.loc);
                     chunk_->emit(Op::LoadLocal, e.loc, static_cast<uint32_t>(prev));
@@ -681,15 +712,15 @@ void Emitter::emit_expr(const Expr& e) {
                 break;
             }
 
-            error(e.loc, "'++' y '--' solo se aplican a una variable, un campo "
-                         "o un elemento indexado");
+            error(e.loc, "'++' and '--' only apply to a variable, a field "
+                         "or an indexed element");
             break;
         }
 
         case ExprKind::Await: {
             if (!e.lhs || e.lhs->kind != ExprKind::Call) {
-                error(e.loc, "'await' solo se aplica a una llamada asincrona "
-                             "(de momento: sleep)");
+                error(e.loc, "'await' only applies to an asynchronous call "
+                             "(for now: sleep)");
                 return;
             }
             emit_call(*e.lhs, /*awaited=*/true);
@@ -699,7 +730,7 @@ void Emitter::emit_expr(const Expr& e) {
         case ExprKind::This: {
             int slot = resolve_local("this");
             if (slot < 0) {
-                error(e.loc, "'this' solo existe dentro de un metodo o un constructor");
+                error(e.loc, "'this' only exists inside a method or a constructor");
                 return;
             }
             chunk_->emit(Op::LoadLocal, e.loc, static_cast<uint32_t>(slot));
@@ -708,46 +739,46 @@ void Emitter::emit_expr(const Expr& e) {
     }
 }
 
-// Un campo sobre un receptor de tipo conocido.  Vale tanto para leerlo como
-// para escribirlo: los campos de una clase son los declarados, y si no se
-// comprobara la escritura se podria crear uno que luego no se deja leer.
+// A field on a receiver of known type.  Good for both reading and writing it:
+// a class's fields are the declared ones, and if the write were not checked you
+// could create one that then cannot be read.
 //
-// Sin la comprobacion, leer un campo que no existe devuelve null en silencio y
-// el fallo aparece paginas mas adelante, lejos de la errata.
-bool Emitter::comprobar_campo(const Expr& objeto, const std::string& campo,
+// Without the check, reading a field that does not exist silently returns null
+// and the failure shows up pages later, far from the typo.
+bool Emitter::check_field(const Expr& object, const std::string& field,
                               SourceLoc loc) {
-    const std::string tr = tipo_de(objeto);
+    const std::string tr = type_of(object);
     if (tr.empty()) return true;
 
     if (classes_) {
         auto it = classes_->find(tr);
         if (it != classes_->end()) {
             const auto& f = it->second.fields;
-            if (std::find(f.begin(), f.end(), campo) != f.end()) return true;
-            if (it->second.methods.count(campo)) {
-                error(loc, "'" + tr + "." + campo + "' es un metodo: "
-                           "hay que llamarlo con ()");
+            if (std::find(f.begin(), f.end(), field) != f.end()) return true;
+            if (it->second.methods.count(field)) {
+                error(loc, "'" + tr + "." + field + "' es un method: "
+                           "it must be called with ()");
             } else {
-                std::string hay;
-                for (const auto& n : f) hay += (hay.empty() ? "" : ", ") + n;
-                error(loc, "'" + tr + "' no tiene un campo '" + campo + "'" +
-                           (hay.empty() ? "" : "; tiene " + hay));
+                std::string available;
+                for (const auto& n : f) available += (available.empty() ? "" : ", ") + n;
+                error(loc, "'" + tr + "' has no field '" + field + "'" +
+                           (available.empty() ? "" : "; it has " + available));
             }
             return false;
         }
     }
-    // Un escalar o una List no tienen campos, se llame como se llame lo que se
-    // les pida.  Un Dict si: ahi cualquier clave es valida.
-    if (metodos_de(tr) && tr != "Dict") {
-        error(loc, "'" + campo + "' sobre " + tr + ", que no tiene campos");
+    // A scalar or a List has no fields, whatever they are asked for.  A Dict
+    // does: there any key is valid.
+    if (methods_of(tr) && tr != "Dict") {
+        error(loc, "'" + field + "' on " + tr + ", which has no fields");
         return false;
     }
     return true;
 }
 
-// Solo lo evidente: un literal, o una variable con tipo declarado.  No hay
-// inferencia, asi que ante la duda devuelve "" y no se comprueba nada.
-std::string Emitter::tipo_de(const Expr& e) const {
+// Only the obvious: a literal, or a variable with a declared type.  There is no
+// inference, so when in doubt it returns "" and nothing is checked.
+std::string Emitter::type_of(const Expr& e) const {
     switch (e.kind) {
         case ExprKind::StringLit: return "string";
         case ExprKind::IntLit:    return "int";
@@ -755,14 +786,14 @@ std::string Emitter::tipo_de(const Expr& e) const {
         case ExprKind::BoolLit:   return "bool";
         case ExprKind::Ident:     return local_type(e.text);
         case ExprKind::This:      return local_type("this");
-        // Metodo builtin sobre un receptor de tipo conocido: la cadena sigue.
+        // Builtin method on a receiver of known type: the chain continues.
         case ExprKind::Call: {
             if (!e.object || e.object->kind != ExprKind::Member) return {};
-            const std::string recv = tipo_de(*e.object->object);
-            const auto* lista = metodos_de(recv);
-            if (!lista) return {};
-            for (const auto& m : *lista)
-                if (e.object->text == m.nombre)
+            const std::string recv = type_of(*e.object->object);
+            const auto* list_ = methods_of(recv);
+            if (!list_) return {};
+            for (const auto& m : *list_)
+                if (e.object->text == m.name)
                     return m.devuelve ? m.devuelve : recv;
             return {};
         }
@@ -770,20 +801,20 @@ std::string Emitter::tipo_de(const Expr& e) const {
     }
 }
 
-bool Emitter::comprobar_metodo_builtin(const Expr& e) {
-    const auto* lista = metodos_de(tipo_de(*e.object->object));
-    if (!lista) return true;                  // tipo sin lista cerrada
+bool Emitter::check_builtin_method(const Expr& e) {
+    const auto* list_ = methods_of(type_of(*e.object->object));
+    if (!list_) return true;                  // type with no closed list
 
-    const std::string& metodo = e.object->text;
-    const MetodoBuiltin* def = nullptr;
-    for (const auto& m : *lista)
-        if (metodo == m.nombre) { def = &m; break; }
+    const std::string& method = e.object->text;
+    const BuiltinMethod* def = nullptr;
+    for (const auto& m : *list_)
+        if (method == m.name) { def = &m; break; }
 
     if (!def) {
-        std::string hay;
-        for (const auto& m : *lista) hay += (hay.empty() ? "" : ", ") + std::string(m.nombre);
-        error(e.object->loc, "los valores de tipo " + tipo_de(*e.object->object) +
-                             " no tienen el metodo '" + metodo + "'; tienen " + hay);
+        std::string available;
+        for (const auto& m : *list_) available += (available.empty() ? "" : ", ") + std::string(m.name);
+        error(e.object->loc, "values of type " + type_of(*e.object->object) +
+                             " have no method '" + method + "'; it has " + available);
         return false;
     }
 
@@ -793,10 +824,10 @@ bool Emitter::comprobar_metodo_builtin(const Expr& e) {
 
     if (static_cast<int>(argc) < def->min_args ||
         static_cast<int>(argc) > def->max_args) {
-        std::string espera = std::to_string(def->min_args);
-        if (def->max_args != def->min_args) espera += "-" + std::to_string(def->max_args);
-        error(e.loc, "'" + metodo + "()' espera " + espera +
-                     " argumento(s), pero recibe " + std::to_string(argc));
+        std::string expects = std::to_string(def->min_args);
+        if (def->max_args != def->min_args) expects += "-" + std::to_string(def->max_args);
+        error(e.loc, "'" + method + "()' expects " + expects +
+                     " argument(s), but receives " + std::to_string(argc));
         return false;
     }
     return true;
@@ -810,8 +841,8 @@ void Emitter::emit_method_call_dynamic(const Expr& e) {
         emit_expr(*a.value);
         ++argc;
     }
-    // Los argumentos con nombre se agrupan en un Dict que ocupa el ultimo hueco
-    // posicional, igual que en render().
+    // Named arguments are grouped into a Dict that takes the last positional
+    // slot, the same as in render().
     if (named > 0) {
         for (const auto& a : e.args) {
             if (a.name.empty()) continue;
@@ -828,12 +859,12 @@ void Emitter::emit_method_call_dynamic(const Expr& e) {
 }
 
 void Emitter::emit_call(const Expr& e, bool awaited) {
-    if (!e.object) { error(e.loc, "llamada sin destino"); return; }
+    if (!e.object) { error(e.loc, "call without a target"); return; }
 
     std::string name;
     int         id = -1;
 
-    // sse.send(...) — miembro de un objeto reservado.
+    // sse.send(...) — member of a reserved object.
     if (e.object->kind == ExprKind::Member &&
         e.object->object->kind == ExprKind::Ident &&
         resolve_local(e.object->object->text) < 0 &&
@@ -843,25 +874,25 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
         id   = member_native_id(e.object->object->text, e.object->text);
         if (id < 0) {
             error(e.object->loc, "'" + e.object->object->text +
-                                 "' no tiene un miembro '" + e.object->text + "'");
+                                 "' has no member '" + e.object->text + "'");
             return;
         }
         const std::string& obj = e.object->object->text;
 
-        // Modulos: `sqlite.query(...)` exige `import sqlite`, y el nombre del
-        // modulo viaja como primer argumento para que un solo builtin sirva
-        // para los tres.
+        // Modules: `sqlite.query(...)` requires `import sqlite`, and the module
+        // name travels as the first argument so that a single builtin serves
+        // all three.
         bool is_module = is_db_module(obj);
         if (is_module && (!imports_ || !imports_->count(obj))) {
-            error(e.object->loc, "falta 'import " + obj + "' para poder usar '" +
+            error(e.object->loc, "missing 'import " + obj + "' in order to use '" +
                                  obj + "." + e.object->text + "'");
             return;
         }
         if (is_module) {
             const NativeDef& mdef = native_at(id);
             if (!awaited) {
-                error(e.loc, "'" + obj + "." + e.object->text + "()' es asincrono: "
-                             "hay que escribir 'await " + obj + "." + e.object->text +
+                error(e.loc, "'" + obj + "." + e.object->text + "()' is asynchronous: "
+                             "you must write 'await " + obj + "." + e.object->text +
                              "(...)'");
                 return;
             }
@@ -869,7 +900,7 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
             size_t argc = 1;
             for (const auto& a : e.args) {
                 if (!a.name.empty()) {
-                    error(a.loc, "las consultas no admiten argumentos con nombre");
+                    error(a.loc, "queries do not accept named arguments");
                     return;
                 }
                 emit_expr(*a.value);
@@ -877,12 +908,12 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
             }
             if (argc < static_cast<size_t>(mdef.min_args)) {
                 error(e.loc, "'" + obj + "." + e.object->text +
-                             "()' espera al menos la consulta SQL");
+                             "()' expects at least the SQL query");
                 return;
             }
             if (mdef.max_args >= 0 && argc > static_cast<size_t>(mdef.max_args)) {
                 error(e.loc, "'" + obj + "." + e.object->text +
-                             "()' no lleva argumentos");
+                             "()' takes no arguments");
                 return;
             }
             if (argc > 255) { error(e.loc, "demasiados argumentos"); return; }
@@ -894,11 +925,11 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
 
         if ((obj == "sse" && route_method_ != "SSE") ||
             (obj == "ws"  && route_method_ != "WS")) {
-            error(e.object->loc, "'" + obj + "' solo existe dentro de una ruta " + obj);
+            error(e.object->loc, "'" + obj + "' only exists inside a route " + obj);
             return;
         }
         if (obj == "error" && route_method_ != "ERROR") {
-            error(e.object->loc, "'error' solo existe dentro de un 'on error'");
+            error(e.object->loc, "'error' only exists inside an 'on error'");
             return;
         }
     }
@@ -906,9 +937,9 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
         name = e.object->text;
         id   = native_id(name);
 
-        // Si no es builtin, puede ser una funcion de usuario.  Declarar una con
-        // el nombre de un builtin ya se rechaza al construir la tabla, asi que
-        // aqui no hay ambiguedad que resolver.
+        // If it is not a builtin, it may be a user function.  Declaring one with
+        // a builtin's name is already rejected when the table is built, so there
+        // is no ambiguity to resolve here.
         if (id < 0) {
             auto it = functions_ ? functions_->find(name) : FunctionSigs::const_iterator();
             if (functions_ && it != functions_->end()) {
@@ -916,8 +947,8 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
                 size_t given = 0;
                 for (const auto& a : e.args) {
                     if (!a.name.empty()) {
-                        error(a.loc, "una funcion de usuario no admite argumentos "
-                                     "con nombre");
+                        error(a.loc, "a user function does not accept arguments "
+                                     "with a name");
                         return;
                     }
                     emit_expr(*a.value);
@@ -925,16 +956,16 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
                 }
 
                 if (given < sig.required || given > sig.defaults.size()) {
-                    std::string esperado = std::to_string(sig.required);
+                    std::string expected = std::to_string(sig.required);
                     if (sig.defaults.size() != sig.required)
-                        esperado += " a " + std::to_string(sig.defaults.size());
-                    error(e.loc, "'" + name + "()' espera " + esperado +
-                                 " argumento(s), pero recibe " + std::to_string(given));
+                        expected += " a " + std::to_string(sig.defaults.size());
+                    error(e.loc, "'" + name + "()' expects " + expected +
+                                 " argument(s), but receives " + std::to_string(given));
                     return;
                 }
 
-                // Los que faltan se rellenan aqui con su valor por defecto: la
-                // funcion recibe siempre la lista completa.
+                // The missing ones are filled in here with their default value:
+                // the function always receives the complete list.
                 for (size_t i = given; i < sig.defaults.size(); ++i)
                     emit_expr(*sig.defaults[i]);
 
@@ -945,13 +976,13 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
                              static_cast<uint32_t>(argc));
                 return;
             }
-            // Constructor: una llamada al nombre de una clase.
+            // Constructor: a call to a class name.
             auto ct = classes_ ? classes_->find(name) : ClassSigs::const_iterator();
             if (classes_ && ct != classes_->end()) {
                 size_t argc = 0;
                 for (const auto& a : e.args) {
                     if (!a.name.empty()) {
-                        error(a.loc, "un constructor no admite argumentos con nombre");
+                        error(a.loc, "a constructor does not accept named arguments");
                         return;
                     }
                     emit_expr(*a.value);
@@ -962,9 +993,9 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
                     std::string opciones;
                     for (const auto& [n, _] : ct->second.ctors)
                         opciones += (opciones.empty() ? "" : ", ") + std::to_string(n);
-                    error(e.loc, "'" + name + "' no tiene constructor de " +
+                    error(e.loc, "'" + name + "' has no constructor taking " +
                                  std::to_string(argc) + " parametro(s)" +
-                                 (opciones.empty() ? "" : "; los hay de " + opciones));
+                                 (opciones.empty() ? "" : "; there are ones taking " + opciones));
                     return;
                 }
                 chunk_->emit(Op::CallFunction, e.loc,
@@ -977,8 +1008,8 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
             return;
         }
     }
-    // Metodo de clase: el tipo declarado del receptor se conoce al compilar,
-    // asi que se resuelve aqui y un nombre mal escrito no llega a produccion.
+    // Class method: the receiver's declared type is known at compile time, so
+    // it is resolved here and a misspelled name never reaches production.
     else if (e.object->kind == ExprKind::Member && classes_) {
         std::string recv_type;
         if (e.object->object->kind == ExprKind::Ident)
@@ -990,11 +1021,11 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
         if (cls != classes_->end()) {
             auto m = cls->second.methods.find(e.object->text);
             if (m == cls->second.methods.end()) {
-                // Puede ser un campo con un metodo generico encima, o un error.
+                // It may be a field with a generic method on top, or an error.
                 if (!cls->second.fields.empty() &&
                     std::find(cls->second.fields.begin(), cls->second.fields.end(),
                               e.object->text) == cls->second.fields.end()) {
-                    error(e.object->loc, "'" + recv_type + "' no tiene un metodo '" +
+                    error(e.object->loc, "'" + recv_type + "' has no method '" +
                                          e.object->text + "'");
                     return;
                 }
@@ -1004,7 +1035,7 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
                 size_t given = 0;
                 for (const auto& a : e.args) {
                     if (!a.name.empty()) {
-                        error(a.loc, "un metodo no admite argumentos con nombre");
+                        error(a.loc, "a method does not accept named arguments");
                         return;
                     }
                     emit_expr(*a.value);
@@ -1012,8 +1043,8 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
                 }
                 if (given < sig.required || given > sig.defaults.size()) {
                     error(e.loc, "'" + recv_type + "." + e.object->text +
-                                 "()' espera " + std::to_string(sig.required) +
-                                 " argumento(s), pero recibe " + std::to_string(given));
+                                 "()' expects " + std::to_string(sig.required) +
+                                 " argument(s), but receives " + std::to_string(given));
                     return;
                 }
                 for (size_t i = given; i < sig.defaults.size(); ++i)
@@ -1025,71 +1056,71 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
                 return;
             }
         }
-        if (!comprobar_metodo_builtin(e)) return;
+        if (!check_builtin_method(e)) return;
         emit_method_call_dynamic(e);
         return;
     }
     else if (e.object->kind == ExprKind::Member) {
-        if (!comprobar_metodo_builtin(e)) return;
+        if (!check_builtin_method(e)) return;
         emit_method_call_dynamic(e);
         return;
     }
     else {
-        error(e.loc, "de momento solo se pueden llamar builtins o metodos");
+        error(e.loc, "for now only builtins or methods can be called");
         return;
     }
 
     const NativeDef& def = native_at(id);
 
-    // Un builtin que suspende obliga a esperarlo, y uno que no, no admite
-    // await: asi la firma de la llamada dice siempre si el handler se puede
-    // detener ahi, sin tener que mirar la tabla de builtins.
+    // A builtin that suspends forces you to await it, and one that does not
+    // will not accept await: that way the call signature always says whether
+    // the handler can stop there, without consulting the builtin table.
     if (def.is_async && !awaited) {
-        error(e.loc, "'" + name + "()' es asincrono: hay que escribir "
+        error(e.loc, "'" + name + "()' is asynchronous: available kind write "
                      "'await " + name + "(...)'");
         return;
     }
     if (!def.is_async && awaited) {
-        error(e.loc, "'" + name + "()' no es asincrono: sobra el 'await'");
+        error(e.loc, "'" + name + "()' is not asynchronous: the 'await' is unnecessary");
         return;
     }
 
     size_t positional = 0, named = 0;
     for (const auto& a : e.args) (a.name.empty() ? positional : named)++;
 
-    // Los argumentos con nombre son las variables de plantilla: se agrupan en
-    // un Dict que ocupa el ultimo hueco posicional.
+    // Named arguments are the template variables: they are grouped into a Dict
+    // that takes the last positional slot.
     if (named > 0 && name != "render") {
-        error(e.loc, "'" + name + "()' no admite argumentos con nombre");
+        error(e.loc, "'" + name + "()' no admite argumentos with a name");
         return;
     }
 
-    // ── render() con nombre literal: la plantilla se compila AQUI ────────────
+    // ── render() with a literal name: the template is compiled HERE ─────────
     //
-    // El emisor tiene delante el nombre del fichero y las claves que se le
-    // pasan, que es exactamente lo que hace falta.  Compilar ahora convierte
-    // una errata dentro de un {{ }} en un error de `lumen --check`.
+    // The emitter has the file name and the keys passed to it right there,
+    // which is exactly what it needs.  Compiling now turns a typo inside a
+    // {{ }} into a `lumen --check` error.
     //
-    // Si el nombre no es literal —render(variable)— no hay nada que compilar
-    // por adelantado y se sigue por la via antigua.
+    // If the name is not literal —render(variable)— there is nothing to compile
+    // ahead of time and it goes down the old path.
     if (name == "render") {
         if (e.args.empty() || !e.args[0].name.empty() ||
             e.args[0].value->kind != ExprKind::StringLit) {
-            // El nombre tiene que estar escrito.  Si no, no hay nada que
-            // compilar por adelantado, y una plantilla que solo se comprueba
-            // cuando alguien pide la pagina no vale para nada: la mitad de la
-            // gracia de tenerlas en Lumen Script es que sus erratas son errores de
-            // compilacion.
-            error(e.loc, "render() necesita el nombre de la plantilla escrito, no una "
-                         "variable. Para elegir entre varias, usa un if con nombres "
-                         "literales: cada rama queda comprobada al compilar");
+            // The name has to be written out.  Otherwise there is nothing to
+            // compile ahead of time, and a template only checked when someone
+            // loads the page is worthless: half the point of having them in
+            // Lumen Script is that their typos are compile errors.
+            //
+            error(e.loc, "render() needs the template name written out, not a "
+                         "variable. To choose between several, use an if with literal "
+                         "literals: every branch is checked at compile time");
             return;
         }
-        if (!plantillas_ || !plantillas_->tabla) {
-            error(e.loc, "render() no se puede usar aqui");
+        if (!templates_ || !templates_->table) {
+            error(e.loc, "render() cannot be used here");
             return;
         }
-        emitir_render_compilado(e);
+        emit_compiled_render(e);
         return;
     }
 
@@ -1111,10 +1142,10 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
         (def.max_args >= 0 && static_cast<int>(argc) > def.max_args)) {
         std::string expected = std::to_string(def.min_args);
         if (def.max_args != def.min_args)
-            expected += def.max_args < 0 ? " o mas"
+            expected += def.max_args < 0 ? " or more"
                                          : "-" + std::to_string(def.max_args);
-        error(e.loc, "'" + name + "()' espera " + expected +
-                     " argumento(s), pero recibe " + std::to_string(argc));
+        error(e.loc, "'" + name + "()' expects " + expected +
+                     " argument(s), but receives " + std::to_string(argc));
         return;
     }
     if (argc > 255) { error(e.loc, "demasiados argumentos"); return; }
@@ -1125,53 +1156,53 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
                  (static_cast<uint32_t>(id) << 8) | static_cast<uint32_t>(argc));
 }
 
-// Compila la plantilla contra las claves de esta llamada y emite una llamada a
-// __render_tpl(indice, datos).
-void Emitter::emitir_render_compilado(const Expr& e) {
-    const std::string& nombre = e.args[0].value->text;
+// Compiles the template against this call's keys and emits a call to
+// __render_tpl(indice, data).
+void Emitter::emit_compiled_render(const Expr& e) {
+    const std::string& name = e.args[0].value->text;
 
-    if (nombre.find("..") != std::string::npos ||
-        std::filesystem::path(nombre).is_absolute()) {
-        error(e.args[0].loc, "nombre de plantilla no valido: '" + nombre + "'");
+    if (name.find("..") != std::string::npos ||
+        std::filesystem::path(name).is_absolute()) {
+        error(e.args[0].loc, "invalid template name: '" + name + "'");
         return;
     }
 
-    // Cada clave viaja con el tipo de lo que se le pasa: es lo que permite que
-    // dentro de la plantilla `{{ titulo.mayusculas() }}` sea un error aqui y no
-    // una pagina rota en produccion.
-    std::vector<NombreTipado> claves;
+    // Every key travels with the type of what is passed to it: that is what
+    // makes `{{ title.mayusculas() }}` inside the template an error here and
+    // not a broken page in production.
+    std::vector<TypedName> keys;
     for (const auto& a : e.args) {
         if (a.name.empty()) continue;
-        claves.push_back({a.name, tipo_de(*a.value)});
+        keys.push_back({a.name, type_of(*a.value)});
     }
 
-    const std::filesystem::path ruta =
-        std::filesystem::path(plantillas_->dir) / nombre;
-    std::ifstream f(ruta, std::ios::binary);
+    const std::filesystem::path path =
+        std::filesystem::path(templates_->dir) / name;
+    std::ifstream f(path, std::ios::binary);
     if (!f) {
-        error(e.args[0].loc, "no se encuentra la plantilla '" + nombre + "' en " +
-                             plantillas_->dir);
+        error(e.args[0].loc, "template not found: '" + name + "' en " +
+                             templates_->dir);
         return;
     }
     const std::string fuente((std::istreambuf_iterator<char>(f)),
                              std::istreambuf_iterator<char>());
 
-    Plantilla tpl;
-    if (!compilar_plantilla(fuente, nombre, plantillas_->dir, claves, diags_, tpl)) {
+    Template tpl;
+    if (!compilar_plantilla(fuente, name, templates_->dir, keys, diags_, tpl)) {
         failed_ = true;
         return;
     }
-    const uint32_t idx = static_cast<uint32_t>(plantillas_->tabla->size());
-    plantillas_->tabla->push_back(std::move(tpl));
+    const uint32_t idx = static_cast<uint32_t>(templates_->table->size());
+    templates_->table->push_back(std::move(tpl));
 
-    // __render_tpl(indice, datos)
+    // __render_tpl(indice, data)
     chunk_->emit(Op::Const, e.loc, chunk_->add_constant(Value::integer(idx)));
     for (const auto& a : e.args) {
         if (a.name.empty()) continue;
         chunk_->emit(Op::Const, a.loc, chunk_->add_constant(Value::str(a.name)));
         emit_expr(*a.value);
     }
-    chunk_->emit(Op::MakeDict, e.loc, static_cast<uint32_t>(claves.size()));
+    chunk_->emit(Op::MakeDict, e.loc, static_cast<uint32_t>(keys.size()));
 
     const int id = native_id("__render_tpl");
     chunk_->emit(Op::CallNative, e.loc, (static_cast<uint32_t>(id) << 8) | 2u);

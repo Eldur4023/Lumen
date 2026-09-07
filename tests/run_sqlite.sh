@@ -1,191 +1,191 @@
 #!/usr/bin/env bash
 #
-# Bateria de tipos del modulo sqlite de Lumen 2.0.
+# Type battery for Lumen's sqlite module.
 #
-# Va aparte de run_tests.sh —que ya ejerce sqlite en el uso normal— porque esto
-# es otra cosa: los limites de los tipos, lo que sqlite guarda de verdad frente a
-# lo que dice la declaracion de la columna, y la cache de sentencias.
+# It is separate from run_tests.sh —which already drives sqlite in normal use—
+# because this is another thing: the type limits, what sqlite really stores
+# versus what the column declaration says, and the statement cache.
 #
-# No necesita servidor ni cliente: el esquema lo crea el propio .lum, asi que
-# la suite solo depende del binario y corre siempre.
+# It needs no server and no client: the schema is created by the .lum itself, so
+# the suite depends only on the binary and always runs.
 #
-#   tests/run_sqlite.sh [ruta-al-binario]
+#   tests/run_sqlite.sh [path-to-binary]
 
 set -u
 
 LUMEN="${1:-$HOME/lumen-build/lumen}"
-# A ruta absoluta antes de nada: mas abajo se cambia de directorio para que el
-# fichero .db caiga en la raiz del repo, y una ruta relativa dejaria de valer.
+# An absolute path first of all: further down the directory is changed so the
+# .db file lands in the repo root, and a relative path would stop working.
 case "$LUMEN" in /*) ;; *) LUMEN="$(cd "$(dirname "$LUMEN")" && pwd)/$(basename "$LUMEN")" ;; esac
-AQUI="$(cd "$(dirname "$0")" && pwd)"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 TMP="$(mktemp -d)"
-PUERTO=${LUMEN_TEST_SQLITE_PORT:-8820}
+PORT=${LUMEN_TEST_SQLITE_PORT:-8820}
 SRV=""
 
-pasadas=0
-fallidas=0
+passed=0
+failed=0
 
-rojo()  { printf '\033[31m%s\033[0m\n' "$*"; }
-verde() { printf '\033[32m%s\033[0m\n' "$*"; }
-gris()  { printf '\033[90m%s\033[0m\n' "$*"; }
+red()  { printf '\033[31m%s\033[0m\n' "$*"; }
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+grey()  { printf '\033[90m%s\033[0m\n' "$*"; }
 
-ok()   { pasadas=$((pasadas + 1)); printf '  ok    %s\n' "$1"; }
-fallo() {
-    fallidas=$((fallidas + 1))
-    rojo "  FALLA $1"
-    printf '        esperado: %s\n        obtenido: %s\n' "$2" "$3"
+ok()   { passed=$((passed + 1)); printf '  ok    %s\n' "$1"; }
+fail() {
+    failed=$((failed + 1))
+    red "  FAIL $1"
+    printf '        expected: %s\n        got: %s\n' "$2" "$3"
 }
 
-parar() {
+stop_server() {
     [ -n "$SRV" ] && kill -9 "$SRV" 2>/dev/null
-    # Solo ese pid: un `wait` sin argumentos esperaria tambien al servidor.
+    # Only that pid: a bare `wait` would also wait for the server.
     wait "$SRV" 2>/dev/null
     SRV=""
 }
-trap 'parar; rm -rf "$TMP" "$AQUI/../pruebas-sqlite-tipos.db"* 2>/dev/null' EXIT
+trap 'stop_server; rm -rf "$TMP" "$HERE/../tests-sqlite-types.db"* 2>/dev/null' EXIT
 
-if ! "$LUMEN" --check "$AQUI/casos/sqlite.lum" > "$TMP/check" 2>&1; then
+if ! "$LUMEN" --check "$HERE/cases/sqlite.lum" > "$TMP/check" 2>&1; then
     if grep -q "sqlite" "$TMP/check" && grep -q "import" "$TMP/check"; then
-        gris "sqlite: el binario se compilo sin el modulo — suite omitida"
+        grey "sqlite: the binary was built without the module — suite skipped"
         exit 77
     fi
-    rojo "el fichero de pruebas no compila:"; cat "$TMP/check"; exit 1
+    red "the test file does not compile:"; cat "$TMP/check"; exit 1
 fi
 
-comprueba() {
-    local nombre="$1" metodo="$2" ruta="$3" cod="$4" trozo="${5:-}"
+check() {
+    local name="$1" method="$2" path="$3" want_code="$4" needle="${5:-}"
     local got
-    got=$(curl -sS --max-time 10 -X "$metodo" -o "$TMP/body" -w '%{http_code}' \
-          "http://127.0.0.1:$PUERTO$ruta" 2>/dev/null)
+    got=$(curl -sS --max-time 10 -X "$method" -o "$TMP/body" -w '%{http_code}' \
+          "http://127.0.0.1:$PORT$path" 2>/dev/null)
     local body; body=$(head -c 400 "$TMP/body" 2>/dev/null)
-    if [ "$got" != "$cod" ]; then
-        fallo "$nombre" "codigo $cod" "codigo $got — $body"; return
+    if [ "$got" != "$want_code" ]; then
+        fail "$name" "code $want_code" "code $got — $body"; return
     fi
-    if [ -n "$trozo" ] && ! grep -qF "$trozo" "$TMP/body"; then
-        fallo "$nombre" "que contenga '$trozo'" "$body"; return
+    if [ -n "$needle" ] && ! grep -qF "$needle" "$TMP/body"; then
+        fail "$name" "to contain '$needle'" "$body"; return
     fi
-    ok "$nombre"
+    ok "$name"
 }
 
-# JSON valido de verdad: UTF-8 correcto incluido.  Un blob con bytes sueltos o
-# un infinito saldrian de forma que ningun cliente sabe leer.
-json_valido() {
-    local nombre="$1" ruta="$2"
-    curl -sS --max-time 10 -o "$TMP/body" "http://127.0.0.1:$PUERTO$ruta" 2>/dev/null
+# Really valid JSON: correct UTF-8 included.  A blob with stray bytes or an
+# infinity would come out in a shape no client can read.
+json_valid() {
+    local name="$1" path="$2"
+    curl -sS --max-time 10 -o "$TMP/body" "http://127.0.0.1:$PORT$path" 2>/dev/null
     if python3 -c "import json,sys; json.load(open(sys.argv[1], encoding='utf-8'))" \
             "$TMP/body" 2>/dev/null; then
-        ok "$nombre"
+        ok "$name"
     else
-        fallo "$nombre" "JSON valido en UTF-8" "$(head -c 200 "$TMP/body" | cat -v)"
+        fail "$name" "valid UTF-8 JSON" "$(head -c 200 "$TMP/body" | cat -v)"
     fi
 }
 
-rm -f "$AQUI/../pruebas-sqlite-tipos.db"*
+rm -f "$HERE/../tests-sqlite-types.db"*
 
 echo "== arranque =="
-cd "$AQUI/.."
-"$LUMEN" --no-watch --port "$PUERTO" "$AQUI/casos/sqlite.lum" > "$TMP/srv.log" 2>&1 &
+cd "$HERE/.."
+"$LUMEN" --no-watch --port "$PORT" "$HERE/cases/sqlite.lum" > "$TMP/srv.log" 2>&1 &
 SRV=$!
 for _ in $(seq 1 60); do
-    curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$PUERTO/__ping__" 2>/dev/null && break
-    kill -0 "$SRV" 2>/dev/null || { rojo "el servidor murio al arrancar:"; cat "$TMP/srv.log"; exit 1; }
+    curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$PORT/__ping__" 2>/dev/null && break
+    kill -0 "$SRV" 2>/dev/null || { red "the server died on startup:"; cat "$TMP/srv.log"; exit 1; }
     sleep 0.3
 done
-curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PUERTO/__ping__" || {
-    rojo "el servidor no respondio"; cat "$TMP/srv.log"; exit 1; }
-ok "arranca y conecta"
-comprueba "crea el esquema" GET /crear 200 '"ok":true'
+curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/__ping__" || {
+    red "the server did not answer"; cat "$TMP/srv.log"; exit 1; }
+ok "starts and connects"
+check "creates the schema" GET /create 200 '"ok":true'
 
 echo "== lectura =="
-comprueba "select sin parametros" GET /todos      200 '"titulo":"largo"'
-comprueba "select con parametro"  GET /uno/1      200 '"autor":"Ana"'
-comprueba "fila que no existe"    GET /uno/99999  404
+check "select without parameters" GET /all      200 '"title":"long"'
+check "select with a parameter"  GET /one/1      200 '"author":"Ana"'
+check "missing row"    GET /one/99999  404
 
-echo "== texto largo =="
-comprueba "text de 4000 bytes entero" GET /largo 200 '"recibido":4000'
+echo "== long text =="
+check "4000-byte text" GET /length 200 '"recibido":4000'
 
-echo "== tipos =="
-comprueba "entero maximo"  GET /tipos 200 '"t_int":9223372036854775807'
-comprueba "entero minimo"  GET /tipos 200 '"t_neg":-9223372036854775808'
-comprueba "decimal"        GET /tipos 200 '"t_real":3.141592653589793'
-comprueba "cadena utf8"    GET /tipos 200 'emoji'
-comprueba "nulo"           GET /tipos 200 '"t_nulo":null'
-# El blob lleva x'00FF80FE': bytes que no forman UTF-8 valido.  Salen en base64.
-json_valido "un blob con bytes sueltos no rompe el JSON" /tipos
-comprueba "el blob sale en base64" GET /tipos 200 '"t_blob":"AP+A/g=="'
+echo "== types =="
+check "integer maximum"  GET /types 200 '"t_int":9223372036854775807'
+check "integer minimum"  GET /types 200 '"t_neg":-9223372036854775808'
+check "decimal"        GET /types 200 '"t_real":3.141592653589793'
+check "utf8 text"    GET /types 200 'emoji'
+check "null"           GET /types 200 '"t_null":null'
+# The blob carries x'00FF80FE': bytes that are not valid UTF-8.  They come out in base64.
+json_valid "a blob with stray bytes does not break the JSON" /types
+check "the blob comes out in base64" GET /types 200 '"t_blob":"AP+A/g=="'
 
-echo "== byte nulo dentro de un texto =="
-comprueba "el driver devuelve los 5 bytes" GET /nulo_en_texto 200 '"bytes":5'
-# length() del motor cuenta hasta el primer NUL: es su definicion, no un fallo.
-comprueba "length() de sqlite para en el nulo" GET /nulo_en_texto 200 '"hasta_el_nulo":1'
-json_valido "y el JSON sigue siendo valido" /nulo_en_texto
+echo "== null byte inside a text =="
+check "the driver returns the 5 bytes" GET /null_in_text 200 '"bytes":5'
+# The engine's length() counts up to the first NUL: that is its definition, not a fault.
+check "sqlite's length() stops at the null" GET /null_in_text 200 '"up_to_null":1'
+json_valid "and the JSON stays valid" /null_in_text
 
-echo "== afinidad de tipos =="
-# sqlite no impone el tipo declarado: una columna integer puede guardar texto, y
-# lo que sale tiene que ser lo que HAY, no lo que dice la declaracion.
-comprueba "texto en columna integer" GET /afinidad 200 '"tipo":"text"'
-comprueba "entero en la misma"       GET /afinidad 200 '"tipo":"integer"'
+echo "== affinity de types =="
+# sqlite does not enforce the declared type: an integer column can hold text, and
+# what comes out has to be what IS THERE, not what the declaration says.
+check "text in an integer column" GET /affinity 200 '"type":"text"'
+check "integer in the same one"       GET /affinity 200 '"type":"integer"'
 
-echo "== infinito =="
-json_valido "un infinito no rompe el JSON" /infinito
+echo "== infinite =="
+json_valid "an infinity does not break the JSON" /infinite
 
 echo "== cache de sentencias =="
-# La misma consulta se prepara una vez y se reutiliza: si al reutilizarla no se
-# limpiaran los enlaces, la segunda llamada devolveria el resultado de la
-# primera.
-comprueba "primera vez"       GET /repetida/1 200 '"titulo":"largo"'
-comprueba "segunda, otro id"  GET /repetida/2 200 '"titulo":"corto"'
-comprueba "tercera, el primero otra vez" GET /repetida/1 200 '"titulo":"largo"'
-comprueba "cuarta, id que no existe"     GET /repetida/9999 200 '"titulo":null'
-comprueba "misma consulta con null"      GET /opcional 200 '"n":0'
-comprueba "misma consulta con valor"     GET '/opcional?autor=Ana' 200 '"n":1'
+# The same query is prepared once and reused: if the bindings were not cleared
+# on reuse, the second call would return the result of the first
+# one.
+check "first time"       GET /repeated/1 200 '"title":"long"'
+check "second, another id"  GET /repeated/2 200 '"title":"short"'
+check "third, the first one again" GET /repeated/1 200 '"title":"long"'
+check "fourth, missing id"     GET /repeated/9999 200 '"title":null'
+check "same query with null"      GET /optional 200 '"n":0'
+check "same query with a value"     GET '/optional?author=Ana' 200 '"n":1'
 
-echo "== unicode e inyeccion =="
-comprueba "unicode en el bind"      GET /unicode 200 'unicode'
-comprueba "comilla en el parametro" GET "/inyeccion?q=x'%20OR%20'1'='1" 200 '"encontrados":0'
+echo "== unicode e injection =="
+check "unicode in the bind"      GET /unicode 200 'unicode'
+check "quote in the parameter" GET "/injection?q=x'%20OR%20'1'='1" 200 '"encontrados":0'
 
 echo "== escritura =="
-comprueba "insert y last_id" POST /alta/probando 201 '"id"'
-comprueba "delete"           POST /borra/99999   200 '"filas":0'
+check "insert and last_id" POST /add/probing 201 '"id"'
+check "delete"           POST /delete_row/99999   200 '"rows":0'
 
-echo "== transacciones =="
-comprueba "commit"               POST /transfiere       200 '"ok":true'
-comprueba "saldos tras commit"   GET  /saldos           200 '"saldo":130'
-comprueba "begin sin error"      POST /deshace_verboso  200 '"begin":true'
-comprueba "saldos tras rollback" GET  /saldos           200 '"saldo":70'
+echo "== transactions =="
+check "commit"               POST /transfer       200 '"ok":true'
+check "balances after commit"   GET  /balances           200 '"balance":130'
+check "begin without error"      POST /undo_verbose  200 '"begin":true'
+check "balances after rollback" GET  /balances           200 '"balance":70'
 
-echo "== errores =="
-comprueba "tabla que no existe" GET /tabla_mala          200 "no_existe"
-comprueba "parametros de menos" GET /parametros_de_menos 200 "parametro"
+echo "== errors =="
+check "missing table" GET /bad_table          200 "no_existe"
+check "too few parameters" GET /too_few_params 200 "were passed"
 
-echo "== concurrencia (pool 8) =="
-# La cache de sentencias es por worker.  Aqui se comprueba que N workers usando
-# la MISMA consulta con parametros distintos no se pisan.
-fallos_conc=0
+echo "== concurrency (pool 8) =="
+# The statement cache is per worker.  Here it is checked that N workers using
+# the SAME query with different parameters do not tread on each other.
+conc_failures=0
 pids=""
 for i in $(seq 1 40); do
     curl -s --max-time 10 -o "$TMP/c$i" -w '%{http_code}' \
-      "http://127.0.0.1:$PUERTO/repetida/$(( (i % 3) + 1 ))" > "$TMP/s$i" &
+      "http://127.0.0.1:$PORT/repeated/$(( (i % 3) + 1 ))" > "$TMP/s$i" &
     pids="$pids $!"
 done
 for p in $pids; do wait "$p" 2>/dev/null; done
 for i in $(seq 1 40); do
-    [ "$(cat "$TMP/s$i" 2>/dev/null)" = "200" ] || fallos_conc=$((fallos_conc + 1))
-    esperado=$(( (i % 3) + 1 ))
-    case $esperado in
-        1) grep -q 'largo'   "$TMP/c$i" || fallos_conc=$((fallos_conc + 1)) ;;
-        2) grep -q 'corto'   "$TMP/c$i" || fallos_conc=$((fallos_conc + 1)) ;;
-        3) grep -q 'unicode' "$TMP/c$i" || fallos_conc=$((fallos_conc + 1)) ;;
+    [ "$(cat "$TMP/s$i" 2>/dev/null)" = "200" ] || conc_failures=$((conc_failures + 1))
+    expected=$(( (i % 3) + 1 ))
+    case $expected in
+        1) grep -q 'long'   "$TMP/c$i" || conc_failures=$((conc_failures + 1)) ;;
+        2) grep -q 'short'   "$TMP/c$i" || conc_failures=$((conc_failures + 1)) ;;
+        3) grep -q 'unicode' "$TMP/c$i" || conc_failures=$((conc_failures + 1)) ;;
     esac
 done
-if [ "$fallos_conc" -eq 0 ]; then ok "40 simultaneas, cada una con su resultado"
-else fallo "40 simultaneas, cada una con su resultado" "40 correctas" "$fallos_conc mal"; fi
+if [ "$conc_failures" -eq 0 ]; then ok "40 concurrent, each with its own result"
+else fail "40 concurrent, each with its own result" "40 correct" "$conc_failures wrong"; fi
 
-kill -0 "$SRV" 2>/dev/null && ok "el servidor sigue vivo" \
-                           || fallo "el servidor sigue vivo" "vivo" "muerto"
+kill -0 "$SRV" 2>/dev/null && ok "the server is still alive" \
+                           || fail "the server is still alive" "alive" "dead"
 
 echo
-if [ "$fallidas" -eq 0 ]; then verde "$pasadas pruebas, todas pasan"; exit 0; fi
-rojo "$pasadas pasan, $fallidas fallan"
-echo "--- log del servidor ---"; tail -30 "$TMP/srv.log"
+if [ "$failed" -eq 0 ]; then green "$passed tests, all passing"; exit 0; fi
+red "$passed passed, $failed failed"
+echo "--- server log ---"; tail -30 "$TMP/srv.log"
 exit 1

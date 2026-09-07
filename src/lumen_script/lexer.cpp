@@ -6,8 +6,8 @@ namespace lumen_script {
 namespace {
 
 bool is_ident_start(unsigned char c) {
-    // Los bytes >= 0x80 son continuacion UTF-8: se aceptan para que
-    // `contraseña` sea un identificador valido.
+    // Bytes >= 0x80 are UTF-8 continuations: they are accepted so that
+    // `contraseña` is a valid identifier.
     return std::isalpha(c) || c == '_' || c >= 0x80;
 }
 
@@ -15,10 +15,10 @@ bool is_ident_char(unsigned char c) {
     return is_ident_start(c) || std::isdigit(c);
 }
 
-// Traduce la letra que va detras de una barra.  Devuelve false si no es ninguno
-// de los escapes conocidos.  La usan las cadenas de una linea y las de tres
-// comillas, para que las dos entiendan exactamente lo mismo.
-bool escape_de(char e, char& out) {
+// Translates the letter following a backslash.  Returns false if it is none of
+// the known escapes.  Used by single-line strings and by triple-quoted ones, so
+// that both understand exactly the same thing.
+bool escape_char(char e, char& out) {
     switch (e) {
         case 'n':  out = '\n'; return true;
         case 't':  out = '\t'; return true;
@@ -30,56 +30,56 @@ bool escape_de(char e, char& out) {
     }
 }
 
-// Quita el margen de una cadena de tres comillas.
+// Strips the margin from a triple-quoted string.
 //
-// El texto se escribe indentado dentro del cuerpo de la ruta, pero esa
-// indentacion es del fichero, no de la cadena: sin quitarla, un SELECT llegaria
-// con ocho espacios en cada linea hasta el log del motor.  Las reglas son tres:
+// The text is written indented inside the route body, but that indentation
+// belongs to the file, not to the string: without stripping it, a SELECT would
+// reach the engine log with eight spaces on every line.  There are three rules:
 //
-//   • un salto de linea justo detras de la apertura no cuenta, esta para que el
-//     texto pueda empezar en su propia linea;
-//   • si el cierre esta solo en su linea, esa linea tampoco cuenta;
-//   • del resto se quita la sangria comun a todas las lineas con contenido.
+//   • a line break right after the opening does not count, it is there so the
+//     text can start on its own line;
+//   • if the closing sits alone on its line, that line does not count either;
+//   • from the rest, the indentation common to every non-empty line is removed.
 //
-// Solo se miran espacios: una linea que empiece por tabulador deja el margen en
-// cero y no se toca nada, que es preferible a adivinar cuanto ocupa un tab.
-std::string sin_margen(std::string s) {
+// Only spaces are considered: a line starting with a tab leaves the margin at
+// zero and nothing is touched, which beats guessing how wide a tab is.
+std::string strip_margin(std::string s) {
     if (s.rfind("\r\n", 0) == 0)         s.erase(0, 2);
     else if (!s.empty() && s[0] == '\n') s.erase(0, 1);
 
-    const size_t ult = s.rfind('\n');
-    if (ult != std::string::npos &&
-        s.find_first_not_of(" \t\r", ult + 1) == std::string::npos)
-        s.erase(ult);
+    const size_t last_nl = s.rfind('\n');
+    if (last_nl != std::string::npos &&
+        s.find_first_not_of(" \t\r", last_nl + 1) == std::string::npos)
+        s.erase(last_nl);
 
-    size_t margen = std::string::npos;
+    size_t margin = std::string::npos;
     for (size_t i = 0;;) {
-        size_t fin = s.find('\n', i);
-        const bool ultima = (fin == std::string::npos);
-        if (ultima) fin = s.size();
+        size_t end_pos = s.find('\n', i);
+        const bool last_one = (end_pos == std::string::npos);
+        if (last_one) end_pos = s.size();
 
         size_t j = i;
-        while (j < fin && s[j] == ' ') ++j;
-        if (j < fin && s[j] != '\r') margen = std::min(margen, j - i);
+        while (j < end_pos && s[j] == ' ') ++j;
+        if (j < end_pos && s[j] != '\r') margin = std::min(margin, j - i);
 
-        if (ultima) break;
-        i = fin + 1;
+        if (last_one) break;
+        i = end_pos + 1;
     }
-    if (margen == std::string::npos || margen == 0) return s;
+    if (margin == std::string::npos || margin == 0) return s;
 
     std::string out;
     out.reserve(s.size());
     for (size_t i = 0;;) {
-        size_t fin = s.find('\n', i);
-        const bool ultima = (fin == std::string::npos);
-        if (ultima) fin = s.size();
+        size_t end_pos = s.find('\n', i);
+        const bool last_one = (end_pos == std::string::npos);
+        if (last_one) end_pos = s.size();
 
-        const size_t salta = std::min(margen, fin - i);
-        out.append(s, i + salta, fin - i - salta);
+        const size_t skip = std::min(margin, end_pos - i);
+        out.append(s, i + skip, end_pos - i - skip);
 
-        if (ultima) break;
+        if (last_one) break;
         out += '\n';
-        i = fin + 1;
+        i = end_pos + 1;
     }
     return out;
 }
@@ -106,9 +106,9 @@ void Lexer::skip_line_comment() {
     while (!eof() && peek() != '\n') advance();
 }
 
-// Procesa el principio de una linea logica: mide la indentacion y emite
-// Indent/Dedent.  Las lineas en blanco y las de solo comentario se saltan sin
-// tocar la pila de indentacion.
+// Processes the start of a logical line: measures the indentation and emits
+// Indent/Dedent.  Blank lines and comment-only lines are skipped without
+// touching the indentation stack.
 void Lexer::handle_line_start() {
     while (!eof()) {
         size_t scan   = pos_;
@@ -122,7 +122,7 @@ void Lexer::handle_line_start() {
             else break;
         }
 
-        // Linea vacia, solo comentario, o retorno de carro suelto: no cuenta.
+        // Empty line, comment only, or a stray carriage return: does not count.
         if (scan >= file_.text.size()) { pos_ = scan; col_ += width; return; }
         char c = file_.text[scan];
         if (c == '\n' || c == '\r' || c == '#') {
@@ -135,13 +135,13 @@ void Lexer::handle_line_start() {
 
         if (tabs) {
             diags_.error({&file_.path, line_, 1},
-                         "indentacion con tabulador: usa espacios");
+                         "indentation with a tab: use spaces");
         }
 
-        // Una linea que empieza por '.' continua la anterior (encadenado sobre
-        // el valor devuelto), asi que no genera Indent/Dedent.  El Newline del
-        // salto anterior ya se emitio, porque hasta aqui no se sabia que la
-        // linea era una continuacion: se retira.
+        // A line starting with '.' continues the previous one (chaining on the
+        // returned value), so it generates no Indent/Dedent.  The Newline of the
+        // previous break was already emitted, because until here it was not
+        // known the line was a continuation: it is withdrawn.
         if (c == '.' && !std::isdigit(static_cast<unsigned char>(
                             scan + 1 < file_.text.size() ? file_.text[scan + 1] : '\0'))) {
             while (pos_ < scan) advance();
@@ -162,7 +162,7 @@ void Lexer::handle_line_start() {
                 push(Tok::Dedent, loc);
             }
             if (width != indents_.back()) {
-                diags_.error(loc, "la indentacion no coincide con ningun nivel abierto");
+                diags_.error(loc, "indentation does not match any open level");
                 indents_.push_back(width);
             }
         }
@@ -185,50 +185,50 @@ void Lexer::lex_number(SourceLoc loc) {
 }
 
 void Lexer::lex_string(SourceLoc loc) {
-    // Tres comillas abren una cadena que puede ocupar varias lineas.
+    // Three quotes open a string that can span several lines.
     if (peek(1) == '"' && peek(2) == '"') { lex_string_multi(loc); return; }
 
-    advance();  // comilla de apertura
+    advance();  // opening quote
     std::string value;
     while (true) {
         if (eof() || peek() == '\n') {
-            diags_.error(loc, "cadena sin cerrar");
+            diags_.error(loc, "unterminated string");
             break;
         }
         char c = advance();
         if (c == '"') break;
         if (c != '\\') { value += c; continue; }
 
-        if (eof()) { diags_.error(loc, "cadena sin cerrar"); break; }
+        if (eof()) { diags_.error(loc, "unterminated string"); break; }
         char e = advance();
         char d;
-        if (escape_de(e, d)) {
+        if (escape_char(e, d)) {
             value += d;
         } else {
             diags_.error({&file_.path, line_, col_ - 1},
-                         std::string("escape desconocido: \\") + e);
+                         std::string("unknown escape: \\") + e);
             value += e;
         }
     }
     push(Tok::String, loc, std::move(value));
 }
 
-// Cadena de tres comillas: sirve para meter SQL o HTML sin pelearse con los
-// saltos de linea.
+// Triple-quoted string: good for embedding SQL or HTML without fighting the
+// line breaks.
 //
 //     let q = """
-//         SELECT id, titulo
+//         SELECT id, title
 //         FROM posts
-//         WHERE autor = ?
+//         WHERE author = ?
 //         """
 //
-// Se recoge primero el texto crudo y solo despues se aplican los escapes: asi
-// la sangria se mide sobre los saltos de linea que hay ESCRITOS en el fichero,
-// y un \n de dentro de la cadena no altera el margen.
+// The raw text is collected first and only then are the escapes applied: that
+// way the indentation is measured over the line breaks WRITTEN in the file, and
+// a \n from inside the string does not alter the margin.
 void Lexer::lex_string_multi(SourceLoc loc) {
     advance(); advance(); advance();   // """
 
-    std::string bruto;
+    std::string raw;
     bool        cerrada = false;
     while (!eof()) {
         if (peek() == '"' && peek(1) == '"' && peek(2) == '"') {
@@ -236,30 +236,30 @@ void Lexer::lex_string_multi(SourceLoc loc) {
             cerrada = true;
             break;
         }
-        // La barra y lo que le sigue viajan juntos y sin tocar: si no, un \"
-        // dejaria una comilla suelta que podria cerrar la cadena antes de
-        // tiempo.
+        // The backslash and what follows travel together and untouched: else a \"
+        // would leave a stray quote that could close the string too early.
+        //
         if (peek() == '\\' && pos_ + 1 < file_.text.size()) {
-            bruto += advance();
-            bruto += advance();
+            raw += advance();
+            raw += advance();
             continue;
         }
-        bruto += advance();
+        raw += advance();
     }
-    if (!cerrada) diags_.error(loc, "cadena sin cerrar: faltan las tres comillas del final");
+    if (!cerrada) diags_.error(loc, "unterminated string: the closing triple quote is missing");
 
-    bruto = sin_margen(std::move(bruto));
+    raw = strip_margin(std::move(raw));
 
     std::string value;
-    value.reserve(bruto.size());
-    for (size_t i = 0; i < bruto.size(); ++i) {
-        if (bruto[i] != '\\' || i + 1 >= bruto.size()) { value += bruto[i]; continue; }
+    value.reserve(raw.size());
+    for (size_t i = 0; i < raw.size(); ++i) {
+        if (raw[i] != '\\' || i + 1 >= raw.size()) { value += raw[i]; continue; }
         char d;
-        if (escape_de(bruto[++i], d)) {
+        if (escape_char(raw[++i], d)) {
             value += d;
         } else {
-            diags_.error(loc, std::string("escape desconocido: \\") + bruto[i]);
-            value += bruto[i];
+            diags_.error(loc, std::string("unknown escape: \\") + raw[i]);
+            value += raw[i];
         }
     }
     push(Tok::String, loc, std::move(value));
@@ -313,7 +313,7 @@ void Lexer::lex_token() {
             return;
 
         case '-':
-            // '->' del montaje estatico, '--' y '-=' antes que el menos suelto.
+            // '->' of the static mount, '--' and '-=' before the bare minus.
             if (peek() == '>')      { advance(); push(Tok::Arrow, loc); }
             else if (peek() == '-') { advance(); push(Tok::MinusMinus, loc); }
             else if (peek() == '=') { advance(); push(Tok::MinusEq, loc); }
@@ -325,15 +325,15 @@ void Lexer::lex_token() {
             return;
         case '!':
             if (peek() == '=') { advance(); push(Tok::NotEq, loc); return; }
-            diags_.error(loc, "'!' suelto: la negacion se escribe 'not'");
+            diags_.error(loc, "stray '!': negation is written 'not'");
             return;
         case '<':
             if (peek() == '=') { advance(); push(Tok::LtEq, loc); }
             else               { push(Tok::Lt, loc); }
             return;
         case '>':
-            // '>' '>' nunca se fusionan: List<Dict<string,int>> tiene que
-            // cerrar con dos tokens Gt independientes.
+            // '>' '>' never merge: List<Dict<string,int>> has to close with two
+            // independent Gt tokens.
             if (peek() == '=') { advance(); push(Tok::GtEq, loc); }
             else               { push(Tok::Gt, loc); }
             return;
@@ -355,13 +355,13 @@ std::vector<Token> Lexer::tokenize() {
         if (c == '#') { skip_line_comment(); continue; }
 
         if (c == '\n') {
-            // La posicion se toma ANTES de consumir el salto: un error del tipo
-            // "se esperaba ':'" tiene que senalar el final de la linea que lo
-            // provoca, no la columna 1 de la siguiente.
+            // The position is taken BEFORE consuming the break: an error of the
+            // "expected ':'" kind has to point at the end of the line that
+            // caused it, not at column 1 of the next one.
             SourceLoc eol = here();
             advance();
             if (bracket_depth_ == 0) {
-                // Un Newline solo tiene sentido si la linea produjo tokens.
+                // A Newline only makes sense if the line produced tokens.
                 if (!out_.empty() && !out_.back().is(Tok::Newline) &&
                     !out_.back().is(Tok::Indent) && !out_.back().is(Tok::Dedent))
                     push(Tok::Newline, eol);
@@ -379,7 +379,7 @@ std::vector<Token> Lexer::tokenize() {
     push(Tok::EndOfFile, end);
 
     if (bracket_depth_ != 0)
-        diags_.error(end, "parentesis o corchete sin cerrar");
+        diags_.error(end, "unclosed parenthesis or bracket");
 
     return std::move(out_);
 }

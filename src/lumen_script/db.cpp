@@ -22,8 +22,8 @@ void DbPool::start(size_t workers) {
                     });
                     if (stopping_ && jobs_.empty() && pinned_[i].empty()) return;
 
-                    // Lo fijado a este worker va primero: es la continuacion de
-                    // una transaccion que ya tiene su conexion abierta.
+                    // What is pinned to this worker goes first: it is the
+                    // continuation of a transaction whose connection is open.
                     if (!pinned_[i].empty()) {
                         job = std::move(pinned_[i].front());
                         pinned_[i].pop();
@@ -34,8 +34,8 @@ void DbPool::start(size_t workers) {
                         continue;
                     }
                 }
-                // Un trabajo que lanza no puede llevarse por delante el worker:
-                // sin conexion viva, el modulo dejaria de responder para todos.
+                // A job that throws cannot take the worker down with it: with
+                // no live connection, the module would stop answering everyone.
                 try { job(i); } catch (...) {}
             }
         });
@@ -57,8 +57,8 @@ void DbPool::submit_to(size_t worker, std::function<void(size_t)> job) {
         if (stopping_ || worker >= pinned_.size()) return;
         pinned_[worker].push(std::move(job));
     }
-    // notify_all y no notify_one: el worker que debe atenderlo puede no ser el
-    // que despierte, y los demas volveran a dormirse.
+    // notify_all and not notify_one: the worker that should take it may not be
+    // the one that wakes, and the others will go back to sleep.
     cv_.notify_all();
 }
 
@@ -75,8 +75,8 @@ void DbPool::stop() {
 
 // ─── DbRegistry ──────────────────────────────────────────────────────────────
 
-// Cada driver compilado se declara aqui.  Las funciones existen solo si su
-// opcion de cmake esta activada.
+// Every compiled driver is declared here.  The functions exist only if their
+// cmake option is enabled.
 #ifdef LUMEN_SQLITE
 std::unique_ptr<DbDriver> make_sqlite_driver();
 #endif
@@ -119,7 +119,7 @@ bool DbRegistry::activate(const std::string& name,
                           std::string& error) {
     auto it = slots_.find(name);
     if (it == slots_.end()) {
-        error = "el modulo '" + name + "' no esta compilado en este binario";
+        error = "module '" + name + "' is not compiled into this binary";
         return false;
     }
     Slot& slot = it->second;

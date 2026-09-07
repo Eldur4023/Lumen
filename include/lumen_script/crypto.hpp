@@ -4,39 +4,39 @@
 
 namespace lumen_script::crypto {
 
-// SHA-256 y HMAC-SHA256 propios, sin OpenSSL.
+// Own SHA-256 and HMAC-SHA256, without OpenSSL.
 //
-// Lumen 2.0 no enlaza OpenSSL —TLS es cosa del reverse proxy— pero sigue
-// necesitando un MAC para firmar la cookie de sesion y los JWT HS256.  Son las
-// dos unicas operaciones criptograficas del proyecto, y ambas caben aqui.
+// Lumen does not link OpenSSL —TLS is the reverse proxy's business— but it
+// still needs a MAC to sign the session cookie and the HS256 JWTs.  Those are
+// the only two cryptographic operations in the project, and both fit here.
 //
-// Esto NO es un sustituto de una biblioteca criptografica: solo implementa lo
-// que hace falta, y nada mas.
+// This is NOT a replacement for a cryptographic library: it implements only
+// what is needed, and nothing else.
 
-// Devuelve los 32 bytes crudos del hash.
+// Returns the raw 32 bytes of the hash.
 std::string sha256(std::string_view data);
 
-// Devuelve los 32 bytes crudos del MAC (RFC 2104).
+// Returns the raw 32 bytes of the MAC (RFC 2104).
 std::string hmac_sha256(std::string_view key, std::string_view message);
 
-// Base64 con el alfabeto URL-safe y sin relleno, como exige JWT (RFC 7515).
+// Base64 with the URL-safe alphabet and no padding, as JWT requires (RFC 7515).
 std::string base64url_encode(std::string_view raw);
 bool        base64url_decode(std::string_view text, std::string& out);
 
-// Base64 del alfabeto estandar, con relleno (RFC 4648).  Es como se mete un
-// binario en un JSON: los modulos de base de datos la usan para las columnas
-// que no son texto, porque un blob crudo en la respuesta la dejaria sin ser
-// UTF-8 valido y ningun cliente sabria leerla.
+// Base64 with the standard alphabet, padded (RFC 4648).  It is how a binary
+// goes into a JSON: the database modules use it for the columns that are not
+// text, because a raw blob in the response would leave it not valid UTF-8 and
+// no client would know how to read it.
 std::string base64_encode(std::string_view raw);
 
-// Comparacion en tiempo constante.  Comparar firmas con == filtra por el
-// tiempo de respuesta cuantos bytes iniciales acerto el atacante, que es
-// suficiente para reconstruir la firma byte a byte.
+// Constant-time comparison.  Comparing signatures with == leaks through the
+// response time how many leading bytes the attacker got right, which is enough
+// to rebuild the signature byte by byte.
 bool constant_time_equal(std::string_view a, std::string_view b);
 
-// Bytes aleatorios de /dev/urandom.  Devuelve una cadena vacia si no se
-// pueden obtener, y quien llama debe tratarlo como fallo, nunca continuar con
-// un valor predecible.
+// Random bytes from /dev/urandom.  Returns an empty string if they cannot be
+// obtained, and the caller must treat that as a failure, never carry on with a
+// predictable value.
 std::string random_bytes(size_t n);
 
 } // namespace lumen_script::crypto

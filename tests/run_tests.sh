@@ -1,287 +1,287 @@
 #!/usr/bin/env bash
 #
-# Suite de regresion de Lumen 2.0.
+# Regression suite for Lumen.
 #
-# Levanta el binario contra ficheros .lum reales y comprueba las respuestas.
-# Esta escrita en shell a proposito: prueba el binario tal y como se usa, por el
-# socket, sin enlazar nada del proyecto.
+# Runs the binary against real .lum files and checks the responses.
+# It is written in shell on purpose: it tests the binary the way it is used, over
+# the socket, without linking anything from the project.
 #
-#   tests/run_tests.sh [ruta-al-binario]
+#   tests/run_tests.sh [path-to-binary]
 #
-# Sale con 0 si todo pasa.
+# Exits with 0 if everything passes.
 
 set -u
 
 LUMEN="${1:-$HOME/lumen-build/lumen}"
-AQUI="$(cd "$(dirname "$0")" && pwd)"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 TMP="$(mktemp -d)"
-PUERTO=${LUMEN_TEST_PORT:-8790}
+PORT=${LUMEN_TEST_PORT:-8790}
 SRV=""
 
-pasadas=0
-fallidas=0
+passed=0
+failed=0
 
-# ─── Utilidades ──────────────────────────────────────────────────────────────
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
-rojo()  { printf '\033[31m%s\033[0m\n' "$*"; }
-verde() { printf '\033[32m%s\033[0m\n' "$*"; }
+red()  { printf '\033[31m%s\033[0m\n' "$*"; }
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
 
-ok()   { pasadas=$((pasadas + 1)); printf '  ok    %s\n' "$1"; }
-fallo() {
-    fallidas=$((fallidas + 1))
-    rojo "  FALLA $1"
-    printf '        esperado: %s\n        obtenido: %s\n' "$2" "$3"
+ok()   { passed=$((passed + 1)); printf '  ok    %s\n' "$1"; }
+fail() {
+    failed=$((failed + 1))
+    red "  FAIL $1"
+    printf '        expected: %s\n        got: %s\n' "$2" "$3"
 }
 
-# Arranca un servidor con el .lum dado y espera a que responda.
-# Cada suite usa su propio puerto: con SO_REUSEPORT dos procesos comparten
-# puerto y el kernel reparte conexiones entre ambos, lo que falsearia todo.
-levantar() {
-    parar
-    PUERTO=$((PUERTO + 1))
-    "$LUMEN" --no-watch --port "$PUERTO" "$1" > "$TMP/srv.log" 2>&1 &
+# Starts a server with the given .lum and waits for it to answer.
+# Each suite uses its own port: with SO_REUSEPORT two processes share a
+# port and the kernel splits connections between them, which would skew everything.
+start_server() {
+    stop_server
+    PORT=$((PORT + 1))
+    "$LUMEN" --no-watch --port "$PORT" "$1" > "$TMP/srv.log" 2>&1 &
     SRV=$!
     for _ in $(seq 1 60); do
-        if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$PUERTO/__ping__" 2>/dev/null; then
+        if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$PORT/__ping__" 2>/dev/null; then
             return 0
         fi
-        kill -0 "$SRV" 2>/dev/null || { rojo "el servidor murio al arrancar:"; cat "$TMP/srv.log"; return 1; }
+        kill -0 "$SRV" 2>/dev/null || { red "the server died on startup:"; cat "$TMP/srv.log"; return 1; }
         sleep 0.2
     done
-    rojo "el servidor no respondio"; cat "$TMP/srv.log"; return 1
+    red "the server did not answer"; cat "$TMP/srv.log"; return 1
 }
 
-parar() {
+stop_server() {
     [ -n "$SRV" ] && kill -9 "$SRV" 2>/dev/null
-    # Esperar SOLO a ese pid: un `wait` sin argumentos esperaria tambien al
-    # servidor y colgaria la suite.
+    # Wait ONLY for that pid: a bare `wait` would also wait for the
+    # server and hang the suite.
     wait "$SRV" 2>/dev/null
     SRV=""
 }
 
-# comprueba <nombre> <metodo> <ruta> <codigo-esperado> [subcadena-esperada] [datos]
-comprueba() {
-    local nombre="$1" metodo="$2" ruta="$3" cod="$4" trozo="${5:-}" datos="${6:-}"
-    local args=(-sS --max-time 10 -X "$metodo" -o "$TMP/body" -w '%{http_code}')
-    [ -n "$datos" ] && args+=(-H 'Content-Type: application/json' -d "$datos")
+# check <name> <method> <path> <expected-code> [expected-substring] [data]
+check() {
+    local name="$1" method="$2" path="$3" want_code="$4" needle="${5:-}" data="${6:-}"
+    local args=(-sS --max-time 10 -X "$method" -o "$TMP/body" -w '%{http_code}')
+    [ -n "$data" ] && args+=(-H 'Content-Type: application/json' -d "$data")
 
     local got
-    got=$(curl "${args[@]}" "http://127.0.0.1:$PUERTO$ruta" 2>/dev/null)
+    got=$(curl "${args[@]}" "http://127.0.0.1:$PORT$path" 2>/dev/null)
     local body
     body=$(cat "$TMP/body" 2>/dev/null)
 
-    if [ "$got" != "$cod" ]; then
-        fallo "$nombre" "codigo $cod" "codigo $got — $body"
+    if [ "$got" != "$want_code" ]; then
+        fail "$name" "code $want_code" "code $got — $body"
         return
     fi
-    if [ -n "$trozo" ] && ! grep -qF "$trozo" "$TMP/body"; then
-        fallo "$nombre" "que contenga '$trozo'" "$body"
+    if [ -n "$needle" ] && ! grep -qF "$needle" "$TMP/body"; then
+        fail "$name" "to contain '$needle'" "$body"
         return
     fi
-    ok "$nombre"
+    ok "$name"
 }
 
-# comprueba_mp <nombre> <ruta> <codigo-esperado> <subcadena-esperada> -- <flags -F de curl...>
-# Aparte de comprueba(): un cuerpo multipart no es una cadena que se pueda pasar
-# con -d, son partes con nombre, y curl las arma con -F por campo.
-comprueba_mp() {
-    local nombre="$1" ruta="$2" cod="$3" trozo="${4:-}"; shift 4
+# check_mp <name> <path> <expected-code> <expected-substring> -- <curl -F flags...>
+# Separate from check(): a multipart body is not a string you can pass
+# with -d, it is named parts, and curl builds them with one -F per field.
+check_mp() {
+    local name="$1" path="$2" want_code="$3" needle="${4:-}"; shift 4
     local got
     got=$(curl -sS --max-time 10 -X POST -o "$TMP/body" -w '%{http_code}' "$@" \
-          "http://127.0.0.1:$PUERTO$ruta" 2>/dev/null)
+          "http://127.0.0.1:$PORT$path" 2>/dev/null)
     local body
     body=$(cat "$TMP/body" 2>/dev/null)
 
-    if [ "$got" != "$cod" ]; then
-        fallo "$nombre" "codigo $cod" "codigo $got — $body"
+    if [ "$got" != "$want_code" ]; then
+        fail "$name" "code $want_code" "code $got — $body"
         return
     fi
-    if [ -n "$trozo" ] && ! grep -qF "$trozo" "$TMP/body"; then
-        fallo "$nombre" "que contenga '$trozo'" "$body"
+    if [ -n "$needle" ] && ! grep -qF "$needle" "$TMP/body"; then
+        fail "$name" "to contain '$needle'" "$body"
         return
     fi
-    ok "$nombre"
+    ok "$name"
 }
 
-# no_compila <nombre> <fichero> <subcadena-del-error>
-no_compila() {
-    local nombre="$1" fich="$2" trozo="$3"
-    local salida
-    salida=$("$LUMEN" --check "$fich" 2>&1)
+# fails_to_compile <name> <file> <error-substring>
+fails_to_compile() {
+    local name="$1" fich="$2" needle="$3"
+    local out
+    out=$("$LUMEN" --check "$fich" 2>&1)
     if [ $? -eq 0 ]; then
-        fallo "$nombre" "error de compilacion" "compilo sin quejarse"
+        fail "$name" "a compile error" "it compiled without complaining"
         return
     fi
-    if ! printf '%s' "$salida" | grep -qF "$trozo"; then
-        fallo "$nombre" "error con '$trozo'" "$(printf '%s' "$salida" | head -2)"
+    if ! printf '%s' "$out" | grep -qF "$needle"; then
+        fail "$name" "an error containing '$needle'" "$(printf '%s' "$out" | head -2)"
         return
     fi
-    ok "$nombre"
+    ok "$name"
 }
 
-compila() {
-    local nombre="$1" fich="$2"
+compiles() {
+    local name="$1" fich="$2"
     if "$LUMEN" --check "$fich" > "$TMP/check" 2>&1; then
-        ok "$nombre"
+        ok "$name"
     else
-        fallo "$nombre" "que compile" "$(head -3 "$TMP/check")"
+        fail "$name" "it to compile" "$(head -3 "$TMP/check")"
     fi
 }
 
-limpiar() { parar; rm -rf "$TMP"; }
-trap limpiar EXIT
+cleanup() { stop_server; rm -rf "$TMP"; }
+trap cleanup EXIT
 
 # ─── Suites ──────────────────────────────────────────────────────────────────
 
-echo "== lenguaje =="
-levantar "$AQUI/casos/lenguaje.lum" || exit 1
-comprueba "aritmetica"          GET /aritmetica       200 '"suma":7'
-comprueba "cadenas"             GET /cadenas          200 '"mayus":"HOLA"'
-comprueba "multilinea sin margen" GET /multilinea     200 '"sql":"SELECT id\nFROM posts"'
-comprueba "multilinea de una"   GET /multilinea       200 '"suelta":"en una linea"'
-comprueba "multilinea escapes"  GET /multilinea       200 '"escapes":"con \"comillas\""'
-comprueba "veracidad"           GET /veracidad        200 '"cero":false'
+echo "== language =="
+start_server "$HERE/cases/language.lum" || exit 1
+check "arithmetic"          GET /arithmetic       200 '"sum":7'
+check "strings"             GET /strings          200 '"upper":"HELLO"'
+check "multiline without margin" GET /multiline     200 '"sql":"SELECT id\nFROM posts"'
+check "one-line multiline"   GET /multiline       200 '"loose":"on one line"'
+check "multiline escapes"  GET /multiline       200 '"escapes":"with \"quotes\""'
+check "truthiness"           GET /truthiness        200 '"zero":false'
 
-# JSON tiene que ser UTF-8 (RFC 8259).  Un 0xFF suelto llega desde la red por
-# varias vias, y sin sanear producia una respuesta que ni el cliente que la
-# mando podia parsear: no falla la peticion, falla quien la recibe.
+# JSON has to be UTF-8 (RFC 8259).  A stray 0xFF arrives from the network by
+# several routes, and without sanitizing it produced a response that not even
+# the client that sent it could parse: the request does not fail, the receiver does.
 json_utf8() {
-    local nombre="$1"; shift
+    local name="$1"; shift
     curl -sS --max-time 10 -o "$TMP/body" "$@" 2>/dev/null
     if python3 -c "import json,sys; json.load(open(sys.argv[1], encoding='utf-8'))"             "$TMP/body" 2>/dev/null; then
-        ok "$nombre"
+        ok "$name"
     else
-        fallo "$nombre" "JSON valido en UTF-8" "$(head -c 120 "$TMP/body" | cat -v)"
+        fail "$name" "valid UTF-8 JSON" "$(head -c 120 "$TMP/body" | cat -v)"
     fi
 }
-json_utf8 "utf8 roto en la query"    "http://127.0.0.1:$PUERTO/eco_query?q=a%FFb"
-json_utf8 "utf8 roto en la cabecera" -H "$(printf 'X-Prueba: aÿb')"           "http://127.0.0.1:$PUERTO/eco_cabecera"
-# Y lo que si es valido tiene que salir INTACTO: sanear no puede estropear texto
-# bueno, que es la mitad que de verdad importa.
-comprueba "utf8 valido intacto" GET /eco_valido 200 '"eco":"añoñó 🐻 ñ"'
-comprueba "sin coercion"        GET /coercion         500 'no se puede sumar'
-comprueba "condicional elif"    GET /clasifica/0      200 '"r":"cero"'
-comprueba "condicional else"    GET /clasifica/99     200 '"r":"grande"'
-comprueba "bucle while"         GET /suma_hasta/10    200 '"total":55'
-comprueba "bucle for y break"   GET /pares            200 '"pares":[2,4,6]'
-comprueba "operadores"          GET /operadores       200 '"a":2'
-comprueba "incremento previo"   GET /incremento       200 '"pre":7'
-comprueba "indices"             GET /indices          200 '"l":[99,20,25]'
-comprueba "ternario"            GET /ternario/20      200 '"rol":"adulto"'
-comprueba "try captura"         GET /captura          200 'division por cero'
-comprueba "error sin capturar"  GET /revienta         500 'division por cero'
+json_utf8 "broken utf8 in the query"    "http://127.0.0.1:$PORT/echo_query?q=a%FFb"
+json_utf8 "broken utf8 in the header" -H "$(printf 'X-Test: aÿb')"           "http://127.0.0.1:$PORT/echo_header"
+# And what IS valid has to come out UNTOUCHED: sanitizing cannot spoil good
+# text, which is the half that really matters.
+check "valid utf8 untouched" GET /echo_valid 200 '"echo":"añoñó 🐻 ñ"'
+check "no coercion"        GET /coercion         500 'cannot add'
+check "elif conditional"    GET /classify/0      200 '"r":"zero"'
+check "else conditional"    GET /classify/99     200 '"r":"big"'
+check "while loop"         GET /sum_up_to/10    200 '"total":55'
+check "for loop and break"   GET /evens            200 '"evens":[2,4,6]'
+check "operators"          GET /operators       200 '"a":2'
+check "pre-increment"   GET /increment       200 '"pre":7'
+check "indices"             GET /indices          200 '"l":[99,20,25]'
+check "ternary"            GET /ternary/20      200 '"role":"adult"'
+check "try catches"         GET /captura          200 'division by zero'
+check "uncaught error"  GET /boom         500 'division by zero'
 
-echo "== rutas y parametros =="
-levantar "$AQUI/casos/rutas.lum" || exit 1
-comprueba "parametro de ruta"   GET /eco/42           200 '"id":42'
-comprueba "query con defecto"   GET /pagina           200 '"page":1'
-comprueba "query explicita"     GET '/pagina?page=7'  200 '"page":7'
-comprueba "tipo invalido"       GET /eco/abc          400 'parametro invalido'
-comprueba "ruta inexistente"    GET /nada             404 'no existe'
-comprueba "grupo con prefijo"   GET /api/v1/hola      200 '"v":1'
-comprueba "guarda deniega"      GET /admin/panel      403
-comprueba "guarda permite"      GET '/admin/panel?k=abre' 200 '"panel":true'
-comprueba "manejador 404"       GET /tampoco          404 '"ruta":"/tampoco"'
+echo "== routes and parameters =="
+start_server "$HERE/cases/routes.lum" || exit 1
+check "path parameter"   GET /echo/42           200 '"id":42'
+check "query with default"   GET /pagina           200 '"page":1'
+check "query explicita"     GET '/pagina?page=7'  200 '"page":7'
+check "invalid type"       GET /echo/abc          400 'invalid parameter'
+check "path inexistente"    GET /nada             404 'not found'
+check "group with prefix"   GET /api/v1/hello      200 '"v":1'
+check "guard denies"      GET /admin/panel      403
+check "guard allows"      GET '/admin/panel?k=abre' 200 '"panel":true'
+check "404 handler"       GET /tampoco          404 '"path":"/tampoco"'
 
-# ── Matriz de enlace de parametros ──────────────────────────────────────────
-# Origen (ruta / query / multipart) x tipo (escalar, File, List<File>) x
-# presencia (falta, mal tipado, en dos sitios a la vez).  Ver casos/parametros.lum:
-# el bug real fue un parametro de texto SIEMPRE vacio en una ruta con ficheros,
-# y solo aparece cuando los dos conviven en la misma ruta -- probar query y
-# multipart cada uno por separado, como hacia el resto de la suite, no lo cazaba.
-echo "== enlace de parametros =="
-levantar "$AQUI/casos/parametros.lum" || exit 1
+# ── Parameter binding matrix ──────────────────────────────────────────────
+# Origen (path / query / multipart) x type (escalar, File, List<File>) x
+# presence (missing, mistyped, in two places at once).  See cases/params.lum:
+# the real bug was a text parameter ALWAYS empty on a route with files,
+# and it only shows up when the two live on the same route -- testing query and
+# multipart separately, as the rest of the suite did, never caught it.
+echo "== parameter binding =="
+start_server "$HERE/cases/params.lum" || exit 1
 
-comprueba "query ausente sin defecto da el cero del tipo" GET /query 200 '"q":""'
+check "missing query without a default gives the type's zero" GET /query 200 '"q":""'
 
-comprueba_mp "multipart: texto junto a un fichero" /mp/uno 200 '"titulo":"hola"' \
-    -F "f=@$AQUI/casos/parametros.lum;filename=a.txt" -F "titulo=hola"
-comprueba_mp "multipart: el fichero tambien llega" /mp/uno 200 '"filename":"a.txt"' \
-    -F "f=@$AQUI/casos/parametros.lum;filename=a.txt" -F "titulo=hola"
+check_mp "multipart: text next to a file" /mp/one 200 '"title":"hello"' \
+    -F "f=@$HERE/cases/params.lum;filename=a.txt" -F "title=hello"
+check_mp "multipart: the file arrives too" /mp/one 200 '"filename":"a.txt"' \
+    -F "f=@$HERE/cases/params.lum;filename=a.txt" -F "title=hello"
 
-comprueba_mp "multipart: string"  /mp/tipos 200 '"s":"hola"' \
-    -F "f=@$AQUI/casos/parametros.lum;filename=a.txt" -F "s=hola" -F "n=7" -F "b=true"
-comprueba_mp "multipart: int"     /mp/tipos 200 '"n":7' \
-    -F "f=@$AQUI/casos/parametros.lum;filename=a.txt" -F "s=hola" -F "n=7" -F "b=true"
-comprueba_mp "multipart: bool"    /mp/tipos 200 '"b":true' \
-    -F "f=@$AQUI/casos/parametros.lum;filename=a.txt" -F "s=hola" -F "n=7" -F "b=true"
+check_mp "multipart: string"  /mp/types 200 '"s":"hello"' \
+    -F "f=@$HERE/cases/params.lum;filename=a.txt" -F "s=hello" -F "n=7" -F "b=true"
+check_mp "multipart: int"     /mp/types 200 '"n":7' \
+    -F "f=@$HERE/cases/params.lum;filename=a.txt" -F "s=hello" -F "n=7" -F "b=true"
+check_mp "multipart: bool"    /mp/types 200 '"b":true' \
+    -F "f=@$HERE/cases/params.lum;filename=a.txt" -F "s=hello" -F "n=7" -F "b=true"
 
-comprueba_mp "multipart: texto junto a List<File>" /mp/lista 200 '"album":"vacaciones"' \
-    -F "fs=@$AQUI/casos/parametros.lum;filename=a.txt" -F "album=vacaciones"
-comprueba_mp "multipart: cuenta los ficheros de la lista" /mp/lista 200 '"n":2' \
-    -F "fs=@$AQUI/casos/parametros.lum;filename=a.txt" \
-    -F "fs=@$AQUI/casos/parametros.lum;filename=b.txt" -F "album=x"
+check_mp "multipart: text next to a List<File>" /mp/list 200 '"album":"holidays"' \
+    -F "fs=@$HERE/cases/params.lum;filename=a.txt" -F "album=holidays"
+check_mp "multipart: counts the files in the list" /mp/list 200 '"n":2' \
+    -F "fs=@$HERE/cases/params.lum;filename=a.txt" \
+    -F "fs=@$HERE/cases/params.lum;filename=b.txt" -F "album=x"
 
-comprueba_mp "multipart: campo ausente cae al defecto" /mp/defecto 200 '"etiqueta":"sin-etiqueta"' \
-    -F "f=@$AQUI/casos/parametros.lum;filename=a.txt"
+check_mp "multipart: missing field falls back to the default" /mp/default 200 '"label":"no-label"' \
+    -F "f=@$HERE/cases/params.lum;filename=a.txt"
 
-comprueba_mp "multipart: la query gana al campo del formulario" "/mp/prioridad?origen=query" 200 '"origen":"query"' \
-    -F "f=@$AQUI/casos/parametros.lum;filename=a.txt" -F "origen=formulario"
+check_mp "multipart: the query beats the form field" "/mp/prioridad?origin=query" 200 '"origin":"query"' \
+    -F "f=@$HERE/cases/params.lum;filename=a.txt" -F "origin=formulario"
 
-comprueba_mp "multipart: escalar mal tipado da 400" /mp/malo 400 'parametro invalido' \
-    -F "f=@$AQUI/casos/parametros.lum;filename=a.txt" -F "n=no-es-un-numero"
+check_mp "multipart: mistyped scalar gives 400" /mp/bad 400 'invalid parameter' \
+    -F "f=@$HERE/cases/params.lum;filename=a.txt" -F "n=no-es-un-number"
 
-echo "== clases y validacion =="
-levantar "$AQUI/casos/clases.lum" || exit 1
-comprueba "cuerpo valido"       POST /alta 201 '"creado":"Ana"' '{"nombre":"Ana","edad":30}'
-comprueba "campo obligatorio"   POST /alta 422 'edad: obligatorio' '{"nombre":"Ana"}'
-comprueba "tipo equivocado"     POST /alta 422 'se esperaba int' '{"nombre":"Ana","edad":"30"}'
-comprueba "regla incumplida"    POST /alta 422 'mayor de edad' '{"nombre":"Ana","edad":10}'
-comprueba "todos los mensajes"  POST /alta 422 'nombre: obligatorio' '{"nombre":"","edad":10}'
-comprueba "json invalido"       POST /alta 400 'JSON invalido' '{roto'
-comprueba "mensajes en on error" POST /alta 422 '"cuantos":2' '{"nombre":"","edad":10}'
-comprueba "constructor"         GET /punto/3/4        200 '"cuadrado":25'
-comprueba "metodo con defecto"  GET /etiqueta/1/2     200 '"otra":"Q(1,2)"'
-comprueba "funcion de usuario"  GET /doble/21         200 '"r":42'
-comprueba "recursion"           GET /factorial/5      200 '"r":120'
-comprueba "tope de recursion"   GET /infinita         500 'demasiada recursion'
+echo "== classes and validation =="
+start_server "$HERE/cases/classes.lum" || exit 1
+check "valid body"       POST /add 201 '"creado":"Ana"' '{"name":"Ana","age":30}'
+check "field required"   POST /add 422 'age: required' '{"name":"Ana"}'
+check "wrong type"     POST /add 422 'expected int' '{"name":"Ana","age":"30"}'
+check "broken rule"    POST /add 422 'must be of age' '{"name":"Ana","age":10}'
+check "every message"  POST /add 422 'name: required' '{"name":"","age":10}'
+check "invalid json"       POST /add 400 'invalid JSON' '{roto'
+check "messages in on error" POST /add 422 '"count":2' '{"name":"","age":10}'
+check "constructor"         GET /punto/3/4        200 '"cuadrado":25'
+check "method with a default"  GET /label/1/2     200 '"other":"Q(1,2)"'
+check "user function"  GET /doble/21         200 '"r":42'
+check "recursion"           GET /factorial/5      200 '"r":120'
+check "recursion cap"   GET /infinita         500 'too much recursion'
 
-echo "== sesion y jwt =="
-levantar "$AQUI/casos/sesion.lum" || exit 1
-comprueba "sin sesion"          GET /quien            200 '"usuario":null'
-comprueba "zona protegida"      GET /admin/panel      403
-comprueba "cookie falsificada"  GET /quien            200 '"usuario":null'
-comprueba "jwt ausente"         GET /api/yo           401
-comprueba "jwt invalido"        GET /api/yo           401
+echo "== session and jwt =="
+start_server "$HERE/cases/session.lum" || exit 1
+check "no session"          GET /quien            200 '"user":null'
+check "protected area"      GET /admin/panel      403
+check "forged cookie"  GET /quien            200 '"user":null'
+check "jwt missing"         GET /api/yo           401
+check "invalid jwt"        GET /api/yo           401
 
-echo "== base de datos =="
-rm -f "$TMP/pruebas.db"
-levantar "$AQUI/casos/datos.lum" || exit 1
-comprueba "crear tabla"         GET  /crear           200 '"ok":true'
-comprueba "insertar"            POST /alta/ana        201 '"id":1'
-comprueba "insertar otro"       POST /alta/bob        201 '"id":2'
-comprueba "listar"              GET  /todos           200 '"nombre":"ana"'
-comprueba "buscar por id"       GET  /uno/1           200 '"nombre":"ana"'
-comprueba "no encontrado"       GET  /uno/99          404
-comprueba "inyeccion sql"       GET  "/busca?q=ana'%20OR%20'1'='1" 200 '"encontrados":0'
-comprueba "transaccion"         POST /transfiere      200 '"ok":true'
-comprueba "saldos tras commit"  GET  /saldos          200 '"saldo":70'
-comprueba "rollback"            POST /deshace         200 '"deshecho":true'
-comprueba "saldos tras rollback" GET /saldos          200 '"saldo":70'
-comprueba "error del motor"     GET  /malo            200 'no such table'
+echo "== database =="
+rm -f "$TMP/tests.db"
+start_server "$HERE/cases/data.lum" || exit 1
+check "create table"         GET  /create           200 '"ok":true'
+check "insert"            POST /add/ana        201 '"id":1'
+check "insert another"       POST /add/bob        201 '"id":2'
+check "list"              GET  /all           200 '"name":"ana"'
+check "lookup by id"       GET  /one/1           200 '"name":"ana"'
+check "no encontrado"       GET  /one/99          404
+check "sql injection"       GET  "/search?q=ana'%20OR%20'1'='1" 200 '"encontrados":0'
+check "transaction"         POST /transfer      200 '"ok":true'
+check "balances after commit"  GET  /balances          200 '"balance":70'
+check "rollback"            POST /undo         200 '"deshecho":true'
+check "balances after rollback" GET /balances          200 '"balance":70'
+check "engine error"     GET  /bad            200 'no such table'
 
-echo "== errores de compilacion =="
-compila    "los ejemplos del repo compilan" "$AQUI/casos/lenguaje.lum"
-no_compila "patron sin parametro"  "$AQUI/casos/malos/patron.lum"   "ningun parametro lo recoge"
-no_compila "await que falta"       "$AQUI/casos/malos/await.lum"    "es asincrono"
-no_compila "objeto fuera de sitio" "$AQUI/casos/malos/sse.lum"      "solo existe dentro de una ruta sse"
-no_compila "ws sin origins"        "$AQUI/casos/malos/ws.lum"       "necesita origins"
-no_compila "campo inexistente"     "$AQUI/casos/malos/validate.lum" "no esta declarada"
-no_compila "metodo inexistente"    "$AQUI/casos/malos/metodo.lum"   "no tiene un metodo"
-no_compila "metodo de un string"   "$AQUI/casos/malos/metodo_tipo.lum" "no tienen el metodo"
-no_compila "campo de una clase"    "$AQUI/casos/malos/campo_tipo.lum"  "no tiene un campo"
-no_compila "modulo sin importar"   "$AQUI/casos/malos/import.lum"   "falta 'import sqlite'"
-# Los tipos de las expresiones se comprueban en EJECUCION: el compilador
-# verifica nombres, aridad, contexto, y los metodos y campos de un receptor
-# cuyo tipo conoce -- pero no que `s - 1` cuadre.
-# Eso ya lo cubre la prueba "sin coercion" de la suite de lenguaje.
+echo "== compile errors =="
+compiles    "the repo examples compile" "$HERE/cases/language.lum"
+fails_to_compile "pattern without a parameter"  "$HERE/cases/bad/pattern.lum"   "no parameter binds it"
+fails_to_compile "missing await"       "$HERE/cases/bad/await.lum"    "is asynchronous"
+fails_to_compile "object out of place" "$HERE/cases/bad/sse.lum"      "only exists inside a route sse"
+fails_to_compile "ws without origins"        "$HERE/cases/bad/ws.lum"       "needs origins"
+fails_to_compile "unknown field"     "$HERE/cases/bad/validate.lum" "is not declared"
+fails_to_compile "unknown method"    "$HERE/cases/bad/method.lum"   "has no method"
+fails_to_compile "method on a string"   "$HERE/cases/bad/method_type.lum" "have no method"
+fails_to_compile "field of a class"    "$HERE/cases/bad/field_type.lum"  "has no field"
+fails_to_compile "module not imported"   "$HERE/cases/bad/import.lum"   "missing 'import sqlite'"
+# Expression types are checked at RUN TIME: the compiler
+# it verifies names, arity, context, and the methods and fields of a receiver
+# whose type it knows -- but not that `s - 1` adds up.
+# That is already covered by the "no coercion" test of the language suite.
 
-# ─── Resumen ─────────────────────────────────────────────────────────────────
+# ─── Summary ─────────────────────────────────────────────────────────────────
 
 echo
-if [ "$fallidas" -eq 0 ]; then
-    verde "$pasadas pruebas, todas pasan"
+if [ "$failed" -eq 0 ]; then
+    green "$passed tests, all passing"
     exit 0
 fi
-rojo "$pasadas pasan, $fallidas fallan"
+red "$passed passed, $failed failed"
 exit 1

@@ -1,5 +1,5 @@
 #include <lumen_script/natives.hpp>
-#include <lumen_script/plantilla.hpp>
+#include <lumen_script/template.hpp>
 
 #include <lumen/request.hpp>
 #include <lumen/response.hpp>
@@ -36,52 +36,52 @@ Value fn_json(NativeCtx& ctx, std::vector<Value>& args, std::string&) {
     return Value::null();
 }
 
-// Renderiza una plantilla ya compilada.  El primer argumento es su indice en
-// la tabla del modulo, que puso el emisor; el segundo, las variables.
+// Renders an already compiled template.  The first argument is its index in
+// the module table, placed there by the emitter; the second, the variables.
 //
-// Los valores se colocan en el mismo orden en que se compilaron: la plantilla
-// guarda sus nombres, asi que aqui no se busca nada por cadena en caliente.
-// render() nunca llega a ejecutarse: el emisor SIEMPRE lo reescribe a
-// __render_tpl con la plantilla ya compilada.  Sigue en la tabla porque el
-// emisor busca ahi para saber que existe y cuantos argumentos admite.
+// The values are placed in the same order they were compiled in: the template
+// keeps its names, so nothing is looked up by string on the hot path.
+// render() never actually runs: the emitter ALWAYS rewrites it to __render_tpl
+// with the template already compiled.  It stays in the table because the
+// emitter looks there to know it exists and how many arguments it takes.
 Value fn_render(NativeCtx&, std::vector<Value>&, std::string& error) {
-    error = "render(): la plantilla no se compilo al arrancar";
+    error = "render(): the template was not compiled at startup";
     return Value::null();
 }
 
 Value fn_render_tpl(NativeCtx& ctx, std::vector<Value>& args, std::string& error) {
-    if (!ctx.plantillas || !args[0].is_int()) {
-        error = "render(): plantilla no compilada";
+    if (!ctx.templates || !args[0].is_int()) {
+        error = "render(): template not compiled";
         return Value::null();
     }
     const size_t idx = static_cast<size_t>(args[0].as_int());
-    if (idx >= ctx.plantillas->size()) {
-        error = "render(): indice de plantilla fuera de rango";
+    if (idx >= ctx.templates->size()) {
+        error = "render(): template index out of range";
         return Value::null();
     }
-    const Plantilla& p = (*ctx.plantillas)[idx];
+    const Template& p = (*ctx.templates)[idx];
 
-    std::vector<Value> valores;
-    valores.reserve(p.nombres.size());
-    const bool hay = args.size() > 1 && args[1].is_dict();
-    for (const auto& n : p.nombres) {
-        if (!hay) { valores.push_back(Value::null()); continue; }
-        auto it = args[1].as_dict().find(n.nombre);
-        valores.push_back(it == args[1].as_dict().end() ? Value::null() : it->second);
+    std::vector<Value> values;
+    values.reserve(p.names.size());
+    const bool present = args.size() > 1 && args[1].is_dict();
+    for (const auto& n : p.names) {
+        if (!present) { values.push_back(Value::null()); continue; }
+        auto it = args[1].as_dict().find(n.name);
+        values.push_back(it == args[1].as_dict().end() ? Value::null() : it->second);
     }
 
-    std::string salida;
-    if (!render_plantilla(p, std::move(valores), ctx, ctx.funciones, salida, error))
+    std::string out;
+    if (!render_plantilla(p, std::move(values), ctx, ctx.functions, out, error))
         return Value::null();
 
-    ctx.res.header("Content-Type", "text/html; charset=utf-8").send(std::move(salida));
+    ctx.res.header("Content-Type", "text/html; charset=utf-8").send(std::move(out));
     ctx.response_written = true;
     return Value::null();
 }
 
 Value fn_status(NativeCtx& ctx, std::vector<Value>& args, std::string& error) {
     if (!args[0].is_int()) {
-        error = "status() espera un codigo entero";
+        error = "status() expects an integer status code";
         return Value::null();
     }
     ctx.res.status(static_cast<int>(args[0].as_int())).send("");
@@ -91,13 +91,13 @@ Value fn_status(NativeCtx& ctx, std::vector<Value>& args, std::string& error) {
 
 Value fn_redirect(NativeCtx& ctx, std::vector<Value>& args, std::string& error) {
     if (!args[0].is_str()) {
-        error = "redirect() espera el destino como string";
+        error = "redirect() expects the target as a string";
         return Value::null();
     }
     int code = 302;
     if (args.size() > 1) {
         if (!args[1].is_int()) {
-            error = "el segundo argumento de redirect() es el codigo";
+            error = "the second argument of redirect() is the status code";
             return Value::null();
         }
         code = static_cast<int>(args[1].as_int());
@@ -109,7 +109,7 @@ Value fn_redirect(NativeCtx& ctx, std::vector<Value>& args, std::string& error) 
 
 Value fn_send_file(NativeCtx& ctx, std::vector<Value>& args, std::string& error) {
     if (!args[0].is_str()) {
-        error = "send_file() espera una ruta como string";
+        error = "send_file() expects a path as a string";
         return Value::null();
     }
     ctx.res.send_file(args[0].as_str());
@@ -122,7 +122,7 @@ Value fn_len(NativeCtx&, std::vector<Value>& args, std::string& error) {
     if (v.is_str())  return Value::integer((long long)v.as_str().size());
     if (v.is_list()) return Value::integer((long long)v.as_list().size());
     if (v.is_dict()) return Value::integer((long long)v.as_dict().size());
-    error = std::string("len() no aplica a ") + v.type_name();
+    error = std::string("len() does not apply to ") + v.type_name();
     return Value::null();
 }
 
@@ -137,47 +137,47 @@ Value fn_int(NativeCtx&, std::vector<Value>& args, std::string& error) {
     if (v.is_bool())  return Value::integer(v.as_bool() ? 1 : 0);
     if (v.is_str()) {
         try { return Value::integer(std::stoll(v.as_str())); }
-        catch (...) { error = "int(): '" + v.as_str() + "' no es un numero"; }
+        catch (...) { error = "int(): '" + v.as_str() + "' is not a number"; }
         return Value::null();
     }
-    error = std::string("int() no aplica a ") + v.type_name();
+    error = std::string("int() does not apply to ") + v.type_name();
     return Value::null();
 }
 
 Value fn_header(NativeCtx& ctx, std::vector<Value>& args, std::string& error) {
-    if (!args[0].is_str()) { error = "header() espera el nombre como string"; return Value::null(); }
+    if (!args[0].is_str()) { error = "header() expects the name as a string"; return Value::null(); }
     auto h = ctx.req.header(args[0].as_str());
     if (!h) return args.size() > 1 ? args[1] : Value::null();
     return Value::str(*h);
 }
 
 Value fn_query(NativeCtx& ctx, std::vector<Value>& args, std::string& error) {
-    if (!args[0].is_str()) { error = "query() espera el nombre como string"; return Value::null(); }
+    if (!args[0].is_str()) { error = "query() expects the name as a string"; return Value::null(); }
     auto it = ctx.req.query.find(args[0].as_str());
     if (it == ctx.req.query.end()) return args.size() > 1 ? args[1] : Value::null();
     return Value::str(it->second);
 }
 
 // ─── sse.* ───────────────────────────────────────────────────────────────────
-// El objeto `sse` solo existe dentro de una ruta sse; fuera, ctx.sse es nulo y
-// el builtin lo dice en vez de reventar.
+// The `sse` object only exists inside an sse route; outside, ctx.sse is null
+// and the builtin says so instead of blowing up.
 
 bool need_sse(NativeCtx& ctx, std::string& error, const char* what) {
     if (ctx.sse) return true;
-    error = std::string("'sse.") + what + "' solo existe dentro de una ruta sse";
+    error = std::string("'sse.") + what + "' only exists inside an sse route";
     return false;
 }
 
-// sse.send(datos)
-// sse.send(evento, datos)
-// sse.send(evento, datos, id)     ← el id permite al navegador reconectar
+// sse.send(data)
+// sse.send(event, data)
+// sse.send(event, data, id)     ← the id lets the browser reconnect
 Value fn_sse_send(NativeCtx& ctx, std::vector<Value>& args, std::string& error) {
     if (!need_sse(ctx, error, "send")) return Value::null();
 
     if (args.size() == 1) return Value::boolean(ctx.sse->send(args[0].to_string()));
 
     if (!args[0].is_str()) {
-        error = "el nombre del evento tiene que ser string";
+        error = "the event name must be a string";
         return Value::null();
     }
     std::string id = args.size() > 2 ? args[2].to_string() : std::string();
@@ -199,7 +199,7 @@ Value fn_sse_open(NativeCtx& ctx, std::vector<Value>&, std::string& error) {
 
 bool need_ws(NativeCtx& ctx, std::string& error, const char* what) {
     if (ctx.ws) return true;
-    error = std::string("'ws.") + what + "' solo existe dentro de una ruta ws";
+    error = std::string("'ws.") + what + "' only exists inside a ws route";
     return false;
 }
 
@@ -224,7 +224,7 @@ Value fn_ws_close(NativeCtx& ctx, std::vector<Value>&, std::string& error) {
 
 Value fn_session_get(NativeCtx& ctx, std::vector<Value>& args, std::string& error) {
     if (!ctx.session || ctx.session->secret.empty()) {
-        error = "la sesion no esta configurada: falta 'session: secret ...' en app:";
+        error = "the session is not configured: missing 'session: secret ...' in app:";
         return Value::null();
     }
     auto it = ctx.session->data.find(args[0].as_str());
@@ -233,7 +233,7 @@ Value fn_session_get(NativeCtx& ctx, std::vector<Value>& args, std::string& erro
 
 Value fn_session_set(NativeCtx& ctx, std::vector<Value>& args, std::string& error) {
     if (!ctx.session || ctx.session->secret.empty()) {
-        error = "la sesion no esta configurada: falta 'session: secret ...' en app:";
+        error = "the session is not configured: missing 'session: secret ...' in app:";
         return Value::null();
     }
     ctx.session->data[args[0].as_str()] = args[1];
@@ -243,7 +243,7 @@ Value fn_session_set(NativeCtx& ctx, std::vector<Value>& args, std::string& erro
 
 Value fn_session_clear(NativeCtx& ctx, std::vector<Value>&, std::string& error) {
     if (!ctx.session || ctx.session->secret.empty()) {
-        error = "la sesion no esta configurada: falta 'session: secret ...' en app:";
+        error = "the session is not configured: missing 'session: secret ...' in app:";
         return Value::null();
     }
     ctx.session->data.clear();
@@ -263,36 +263,36 @@ Value fn_jwt_claims(NativeCtx& ctx, std::vector<Value>&, std::string&) {
 // ─── state.* ─────────────────────────────────────────────────────────────────
 
 Value fn_state_incr(NativeCtx&, std::vector<Value>& args, std::string& error) {
-    if (!args[0].is_str()) { error = "state.incr() espera la clave como string"; return Value::null(); }
+    if (!args[0].is_str()) { error = "state.incr() expects the key as a string"; return Value::null(); }
     long long by = 1;
     if (args.size() > 1) {
-        if (!args[1].is_int()) { error = "state.incr() espera un entero"; return Value::null(); }
+        if (!args[1].is_int()) { error = "state.incr() expects an integer"; return Value::null(); }
         by = args[1].as_int();
     }
     return Value::integer(SharedState::instance().incr(args[0].as_str(), by));
 }
 
 Value fn_state_decr(NativeCtx&, std::vector<Value>& args, std::string& error) {
-    if (!args[0].is_str()) { error = "state.decr() espera la clave como string"; return Value::null(); }
+    if (!args[0].is_str()) { error = "state.decr() expects the key as a string"; return Value::null(); }
     long long by = args.size() > 1 && args[1].is_int() ? args[1].as_int() : 1;
     return Value::integer(SharedState::instance().incr(args[0].as_str(), -by));
 }
 
 Value fn_state_get(NativeCtx&, std::vector<Value>& args, std::string& error) {
-    if (!args[0].is_str()) { error = "state.get() espera la clave como string"; return Value::null(); }
+    if (!args[0].is_str()) { error = "state.get() expects the key as a string"; return Value::null(); }
     Value v = SharedState::instance().get(args[0].as_str());
     if (v.is_null() && args.size() > 1) return args[1];
     return v;
 }
 
 Value fn_state_set(NativeCtx&, std::vector<Value>& args, std::string& error) {
-    if (!args[0].is_str()) { error = "state.set() espera la clave como string"; return Value::null(); }
+    if (!args[0].is_str()) { error = "state.set() expects the key as a string"; return Value::null(); }
     SharedState::instance().set(args[0].as_str(), args[1]);
     return args[1];
 }
 
 Value fn_state_remove(NativeCtx&, std::vector<Value>& args, std::string& error) {
-    if (!args[0].is_str()) { error = "state.remove() espera la clave como string"; return Value::null(); }
+    if (!args[0].is_str()) { error = "state.remove() expects the key as a string"; return Value::null(); }
     return Value::boolean(SharedState::instance().remove(args[0].as_str()));
 }
 
@@ -312,14 +312,14 @@ Value fn_log_error(NativeCtx&, std::vector<Value>& args, std::string&) {
 }
 
 Value fn_cookie(NativeCtx& ctx, std::vector<Value>& args, std::string& error) {
-    if (!args[0].is_str()) { error = "cookie() espera el nombre como string"; return Value::null(); }
+    if (!args[0].is_str()) { error = "cookie() expects the name as a string"; return Value::null(); }
     auto c = ctx.req.cookie(args[0].as_str());
     if (!c) return args.size() > 1 ? args[1] : Value::null();
     return Value::str(*c);
 }
 
 Value fn_form(NativeCtx& ctx, std::vector<Value>& args, std::string& error) {
-    if (!args[0].is_str()) { error = "form() espera el nombre como string"; return Value::null(); }
+    if (!args[0].is_str()) { error = "form() expects the name as a string"; return Value::null(); }
     auto f  = ctx.req.form();
     auto it = f.find(args[0].as_str());
     if (it == f.end()) return args.size() > 1 ? args[1] : Value::null();
@@ -336,8 +336,8 @@ Value fn_error_message(NativeCtx& ctx, std::vector<Value>&, std::string&) {
     return Value::str(ctx.error_message);
 }
 
-// Lista vacia y no null cuando el error no viene de validar: asi recorrerla con
-// `for` siempre funciona.
+// An empty list and not null when the error does not come from validation: so
+// that walking it with `for` always works.
 Value fn_error_messages(NativeCtx& ctx, std::vector<Value>&, std::string&) {
     Value::List out;
     if (ctx.error_messages)
@@ -358,7 +358,7 @@ Value fn_req_ip(NativeCtx& ctx, std::vector<Value>&, std::string&) {
 }
 
 const std::array<NativeDef, 49> kNatives = {{
-    // Respuesta
+    // Response
     {"text",      1, 1,  fn_text},
     {"html",      1, 1,  fn_html},
     {"json",      1, 1,  fn_json},
@@ -367,23 +367,23 @@ const std::array<NativeDef, 49> kNatives = {{
     {"status",    1, 1,  fn_status},
     {"redirect",  1, 2,  fn_redirect},
     {"send_file", 1, 1,  fn_send_file},
-    // Utilidades
+    // Utilities
     {"len",       1, 1,  fn_len},
     {"str",       1, 1,  fn_str},
     {"int",       1, 1,  fn_int},
-    // Peticion
+    // Request
     {"header",    1, 2,  fn_header},
     {"query",     1, 2,  fn_query},
-    // sse.* — no se escriben asi en Lumen Script: se llega por member_native_id().
+    // sse.* — not written like this in Lumen Script: reached via member_native_id().
     {"__sse_send", 1, 3,  fn_sse_send},
     {"__sse_ping", 0, 1,  fn_sse_ping},
     {"__sse_open", 0, 0,  fn_sse_open},
-    // ws.* — igual que sse.*, se llega por member_native_id().
+    // ws.* — same as sse.*, reached via member_native_id().
     {"__ws_send",  1, 1,  fn_ws_send},
     {"__ws_open",  0, 0,  fn_ws_open},
     {"__ws_close", 0, 0,  fn_ws_close},
-    // session.* / jwt.* — se llega por member_native_id() o, en el caso de
-    // session, por el acceso a un campo cualquiera.
+    // session.* / jwt.* — reached via member_native_id() or, for session, by
+    // accessing any field.
     {"__session_get",   1, 1,  fn_session_get},
     {"__session_set",   2, 2,  fn_session_set},
     {"__session_clear", 0, 0,  fn_session_clear},
@@ -405,18 +405,18 @@ const std::array<NativeDef, 49> kNatives = {{
     {"__log_error",     1, 1,  fn_log_error},
     {"cookie",          1, 2,  fn_cookie},
     {"form",            1, 2,  fn_form},
-    // Asincronos: sin fn, los resuelve el driver del handler.
+    // Asynchronous: with no fn, the handler's driver resolves them.
     {"sleep",     1, 1,  nullptr, true},
     {"__ws_recv", 0, 0,  nullptr, true},
-    // Base de datos: el primer argumento es el nombre del modulo, que el
-    // emisor apila; asi un unico builtin sirve para los tres.
+    // Database: the first argument is the module name, which the emitter
+    // pushes; that way a single builtin serves all three.
     {"__db_query", 2, -1, nullptr, true},
     {"__db_exec",  2, -1, nullptr, true},
     {"__db_begin",    1, 1, nullptr, true},
     {"__db_commit",   1, 1, nullptr, true},
     {"__db_rollback", 1, 1, nullptr, true},
     {"__db_last_id",  1, 1, nullptr, true},
-    // Marcador final para que native_count() no dependa del orden.
+    // Final marker so native_count() does not depend on the order.
     {nullptr,     0, 0,  nullptr},
 }};
 
@@ -467,19 +467,19 @@ const NativeDef& native_at(int id) { return kNatives[static_cast<size_t>(id)]; }
 
 int native_count() { return static_cast<int>(kNatives.size()) - 1; }
 
-// ─── Metodos sobre valores ───────────────────────────────────────────────────
+// ─── Methods on values ───────────────────────────────────────────────────────
 
 namespace {
 
 bool want(size_t got, size_t min, size_t max, const std::string& name,
           std::string& error) {
     if (got >= min && got <= max) return true;
-    error = "'" + name + "()' recibe un numero de argumentos que no admite";
+    error = "'" + name + "()' received a number of arguments it does not accept";
     return false;
 }
 
-// Guarda una parte subida quedandose solo con el nombre de fichero, sin ruta:
-// asi un filename con ".." o absoluto no puede escapar del directorio.
+// Saves an uploaded part keeping only the file name, with no path: that way a
+// filename with ".." or an absolute one cannot escape the directory.
 std::string safe_name(const std::string& raw) {
     size_t slash = raw.find_last_of("/\\");
     std::string base = (slash == std::string::npos) ? raw : raw.substr(slash + 1);
@@ -491,12 +491,12 @@ std::string safe_name(const std::string& raw) {
 
 Value call_method(NativeCtx& ctx, Value& recv, const std::string& name,
                   std::vector<Value>& args, std::string& error) {
-    // ── Modificadores de respuesta ───────────────────────────────────────────
-    // Se encadenan sobre lo que se devuelve —`return {...}.status(201)`— y
-    // dejan pasar el valor, para no reintroducir un objeto `response` mutable.
+    // ── Response modifiers ───────────────────────────────────────────────────
+    // They chain onto what is returned —`return {...}.status(201)`— and let the
+    // value through, so as not to reintroduce a mutable `response` object.
     if (name == "status") {
         if (args.size() != 1 || !args[0].is_int()) {
-            error = "status() espera un codigo entero";
+            error = "status() expects an integer status code";
             return Value::null();
         }
         ctx.res.status(static_cast<int>(args[0].as_int()));
@@ -504,7 +504,7 @@ Value call_method(NativeCtx& ctx, Value& recv, const std::string& name,
     }
     if (name == "header") {
         if (args.size() != 2 || !args[0].is_str()) {
-            error = "header() espera nombre y valor";
+            error = "header() expects name y value";
             return Value::null();
         }
         ctx.res.header(args[0].as_str(), args[1].to_string());
@@ -512,7 +512,7 @@ Value call_method(NativeCtx& ctx, Value& recv, const std::string& name,
     }
     if (name == "cookie") {
         if (args.size() < 2 || !args[0].is_str()) {
-            error = "cookie() espera al menos nombre y valor";
+            error = "cookie() expects al menos name y value";
             return Value::null();
         }
         lumen::CookieOptions opts;
@@ -520,7 +520,7 @@ Value call_method(NativeCtx& ctx, Value& recv, const std::string& name,
         opts.http_only = true;
         opts.same_site = lumen::SameSite::Lax;
 
-        // Tercer hueco: las opciones con nombre, agrupadas por el emisor.
+        // Third slot: the named options, grouped by the emitter.
         if (args.size() > 2 && args[2].is_dict()) {
             const auto& o = args[2].as_dict();
             auto pick = [&o](const char* k) -> const Value* {
@@ -548,7 +548,7 @@ Value call_method(NativeCtx& ctx, Value& recv, const std::string& name,
         const std::string& s = recv.as_str();
         if (name == "starts_with" || name == "ends_with" || name == "contains") {
             if (!want(args.size(), 1, 1, name, error)) return Value::null();
-            if (!args[0].is_str()) { error = "'" + name + "()' espera un string"; return Value::null(); }
+            if (!args[0].is_str()) { error = "'" + name + "()' expects un string"; return Value::null(); }
             const std::string& n = args[0].as_str();
             if (name == "starts_with") return Value::boolean(s.rfind(n, 0) == 0);
             if (name == "ends_with")
@@ -568,7 +568,7 @@ Value call_method(NativeCtx& ctx, Value& recv, const std::string& name,
             size_t b = s.find_last_not_of(" \t\r\n");
             return Value::str(s.substr(a, b - a + 1));
         }
-        error = "los string no tienen el metodo '" + name + "'";
+        error = "strings have no method '" + name + "'";
         return Value::null();
     }
 
@@ -579,26 +579,26 @@ Value call_method(NativeCtx& ctx, Value& recv, const std::string& name,
             recv.as_list().push_back(args[0]);
             return recv;
         }
-        error = "las List no tienen el metodo '" + name + "'";
+        error = "Lists have no method '" + name + "'";
         return Value::null();
     }
 
-    // ── Dict, incluido File ──────────────────────────────────────────────────
+    // ── Dict, File included ──────────────────────────────────────────────────
     if (recv.is_dict()) {
         auto& d = recv.as_dict();
 
         if (name == "save") {
             auto idx = d.find("__idx");
             if (idx == d.end() || !ctx.parts) {
-                error = "save() solo existe sobre un File subido";
+                error = "save() only exists on an uploaded File";
                 return Value::null();
             }
             if (!want(args.size(), 1, 1, name, error)) return Value::null();
-            if (!args[0].is_str()) { error = "save() espera el directorio como string"; return Value::null(); }
+            if (!args[0].is_str()) { error = "save() expects the directory as a string"; return Value::null(); }
 
             size_t i = static_cast<size_t>(idx->second.as_int());
             if (!ctx.parts || i >= ctx.parts->size()) {
-                error = "el fichero subido ya no esta disponible";
+                error = "the uploaded file is no longer available";
                 return Value::null();
             }
 
@@ -611,10 +611,10 @@ Value call_method(NativeCtx& ctx, Value& recv, const std::string& name,
             std::filesystem::create_directories(dir, ec);
 
             std::ofstream out(dir + base, std::ios::binary);
-            if (!out) { error = "no se puede escribir en " + dir + base; return Value::null(); }
+            if (!out) { error = "cannot write to " + dir + base; return Value::null(); }
             const std::string& bytes = (*ctx.parts)[i].body;
             out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-            if (!out) { error = "fallo al escribir " + dir + base; return Value::null(); }
+            if (!out) { error = "fallo al write " + dir + base; return Value::null(); }
             return Value::str(base);
         }
 
@@ -627,51 +627,51 @@ Value call_method(NativeCtx& ctx, Value& recv, const std::string& name,
             for (const auto& [k, _] : d) if (k.rfind("__", 0) != 0) ks.push_back(Value::str(k));
             return Value::list(std::move(ks));
         }
-        error = "los Dict no tienen el metodo '" + name + "'";
+        error = "Dicts have no method '" + name + "'";
         return Value::null();
     }
 
-    error = std::string("los valores de tipo ") + recv.type_name() +
-            " no tienen metodos";
+    error = std::string("values of type ") + recv.type_name() +
+            " have no methods";
     return Value::null();
 }
 
-// La cara de compilacion de call_method().
+// The compile-time face of call_method().
 //
-// Lo que el VM rechazaria al ejecutar se puede rechazar antes si el tipo del
-// receptor se conoce: `nombre.mayusculas()` sobre un string es una errata, y
-// una errata no deberia esperar a que alguien pida la pagina para salir.
+// What the VM would reject at run time can be rejected earlier if the type of
+// the receiver is known: `name.mayusculas()` on a string is a typo, and a typo
+// should not wait for someone to load the page to show up.
 //
-// Si se anade un metodo arriba hay que anadirlo aqui: son la misma lista vista
-// desde los dos lados.
-const std::vector<MetodoBuiltin>* metodos_de(const std::string& tipo) {
-    // Los tres modificadores de respuesta se encadenan sobre CUALQUIER valor
-    // —`return {...}.status(201)`—, asi que aparecen en todas las listas.
-    static const std::vector<MetodoBuiltin> kComunes = {
+// If a method is added above it has to be added here: they are the same list
+// seen from both sides.
+const std::vector<BuiltinMethod>* methods_of(const std::string& type) {
+    // The three response modifiers chain onto ANY value —`return
+    // {...}.status(201)`— so they appear in every list.
+    static const std::vector<BuiltinMethod> kComunes = {
         {"status", 1, 1, nullptr}, {"header", 2, 2, nullptr}, {"cookie", 2, 3, nullptr},
     };
-    static const auto con = [](std::initializer_list<MetodoBuiltin> propios) {
-        std::vector<MetodoBuiltin> v = kComunes;
-        v.insert(v.end(), propios);
+    static const auto with_own = [](std::initializer_list<BuiltinMethod> own) {
+        std::vector<BuiltinMethod> v = kComunes;
+        v.insert(v.end(), own);
         return v;
     };
 
-    static const std::vector<MetodoBuiltin> kString = con({
+    static const std::vector<BuiltinMethod> kString = with_own({
         {"starts_with", 1, 1, "bool"}, {"ends_with", 1, 1, "bool"},
         {"contains", 1, 1, "bool"},    {"upper", 0, 0, "string"},
         {"lower", 0, 0, "string"},     {"trim", 0, 0, "string"},
     });
-    static const std::vector<MetodoBuiltin> kList = con({{"add", 1, 1, nullptr}});
-    static const std::vector<MetodoBuiltin> kDict = con({
+    static const std::vector<BuiltinMethod> kList = with_own({{"add", 1, 1, nullptr}});
+    static const std::vector<BuiltinMethod> kDict = with_own({
         {"has", 1, 1, "bool"}, {"keys", 0, 0, "List"}, {"save", 1, 1, "string"},
     });
 
-    if (tipo == "string") return &kString;
-    if (tipo == "List")   return &kList;
-    if (tipo == "Dict")   return &kDict;
-    // Los numeros y los bool no tienen nada propio: solo lo comun.
-    if (tipo == "int" || tipo == "long" || tipo == "float" ||
-        tipo == "double" || tipo == "bool")
+    if (type == "string") return &kString;
+    if (type == "List")   return &kList;
+    if (type == "Dict")   return &kDict;
+    // Numbers and bools have nothing of their own: only the common part.
+    if (type == "int" || type == "long" || type == "float" ||
+        type == "double" || type == "bool")
         return &kComunes;
     return nullptr;
 }

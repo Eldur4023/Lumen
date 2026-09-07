@@ -4,5 +4,6 @@ plan.md
 .claude/
 build/
 
-# Artefactos que deja la suite de pruebas.
-pruebas-suite.db*
+# Artifacts left behind by the test suite.
+tests-suite.db*
+tests-sqlite-types.db*

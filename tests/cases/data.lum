@@ -1,0 +1,59 @@
+import sqlite
+
+app:
+    port 8790
+
+    sqlite:
+        file "./tests-suite.db"
+        pool 4
+
+get endpoint("/__ping__"):
+    return { "ok": true }
+
+get endpoint("/create"):
+    await sqlite.exec("drop table if exists accounts")
+    await sqlite.exec("create table accounts (id integer primary key autoincrement, name text, balance integer)")
+    return { "ok": true }
+
+post endpoint("/add/:name", string name):
+    await sqlite.exec("insert into accounts (name, balance) values (?, 100)", name)
+    int id = await sqlite.last_id()
+    return { "id": id }.status(201)
+
+get endpoint("/all"):
+    return await sqlite.query("""
+        select id, name, balance
+        from accounts
+        order by id
+        """)
+
+get endpoint("/one/:id", int id):
+    List<Json> rows = await sqlite.query("select name from accounts where id = ?", id)
+    if len(rows) == 0:
+        return status(404)
+    return rows[0]
+
+get endpoint("/search", string q):
+    List<Json> rows = await sqlite.query("select id from accounts where name = ?", q)
+    return { "encontrados": len(rows) }
+
+get endpoint("/balances"):
+    List<Json> rows = await sqlite.query("select balance from accounts where name = ?", "ana")
+    return rows[0]
+
+post endpoint("/transfer"):
+    await sqlite.begin()
+    await sqlite.exec("update accounts set balance = balance - 30 where name = ?", "ana")
+    await sqlite.exec("update accounts set balance = balance + 30 where name = ?", "bob")
+    await sqlite.commit()
+    return { "ok": true }
+
+post endpoint("/undo"):
+    await sqlite.begin()
+    await sqlite.exec("update accounts set balance = 0 where name = ?", "ana")
+    await sqlite.rollback()
+    return { "deshecho": true }
+
+get endpoint("/bad"):
+    Json r = await sqlite.query("select * from no_existe")
+    return r
