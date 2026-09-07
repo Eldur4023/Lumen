@@ -463,10 +463,35 @@ pasos anteriores, sigue siendo aditivo — nada de esto se llama todavía desde 
 
 Con esto, el checker en paralelo cubre expresiones Y sentencias — el criterio del paso 3 original
 ("reproduce el 100% de los diagnósticos... antes de convertir") está cumplido para el subconjunto
-verificado aquí. Pendiente: definir `IrStmt` (el paso 1 hecho solo cubrió `IrExpr`), y solo
-entonces la conversión real de `emit_expr`/`emit_stmt`/`emit_call` en consumidores del IR con sus
-propias comprobaciones eliminadas — el paso de mayor riesgo de toda la fase 1, porque ahí sí se
-toca el camino real de compilación.
+verificado aquí.
+
+**Validación adicional, contra programas .lum orgánicos, no solo casos de mano**: antes de dar el
+paso de mayor riesgo (el corte real) hacía falta más que los casos escritos a propósito de
+`tests/check_*_shadow.cpp` — esos ejercitan cada rama una vez, pero no dicen nada sobre
+combinaciones reales que nadie diseñó pensando en el checker. Se añadió un canario en
+`project.cpp` (`shadow_comparar`, activo solo si `LUMEN_SHADOW_CHECK` está en el entorno — coste
+cero en el camino normal): en cada uno de los 9 sitios donde `project.cpp` construye un `Emitter`
+real (`validate`, métodos, constructores explícitos e implícitos, funciones, `on error`, rutas
+`ws`/`sse`/normales), justo después de la llamada real a `emit_*` se llama también a su `check_*`
+equivalente sobre el mismo `Emitter` — es seguro porque cada punto de entrada (`emit_route`/
+`check_route`, etc.) reinicia `locals_`/`route_method_`/`scope_depth_` por completo al entrar, así
+que la sombra nunca pisa el estado de la emisión real que la precedió — y se compara texto a
+texto, imprimiendo a `stderr` si difieren.
+
+Con `LUMEN_SHADOW_CHECK=1 ./build/lumen --check <fichero>` sobre los 20 `.lum` reales del
+repositorio (los 9 de `tests/casos/*.lum`, los 10 casos de error de `tests/casos/malos/*.lum`, y
+`bench/lumen/app.lum` — el benchmark de 16 endpoints escrito leyendo solo la gramática, sin mirar
+el compilador) no apareció ni una sola discrepancia, sobre más de 100 rutas/funciones/métodos/
+constructores reales. `tests/run_tests.sh` sigue en 79/79 sin `LUMEN_SHADOW_CHECK` (el canario es
+inerte por defecto).
+
+Con esto, el checker en paralelo queda razonablemente probado: no solo reproduce los casos que se
+diseñaron para ejercitarlo, sino que coincide con la compilación real sobre programas escritos sin
+pensar en él. Pendiente: definir `IrStmt` (el paso 1 hecho solo cubrió `IrExpr`), y solo entonces
+la conversión real de `emit_expr`/`emit_stmt`/`emit_call` en consumidores del IR con sus propias
+comprobaciones eliminadas — el paso de mayor riesgo de toda la fase 1, porque ahí sí se toca el
+camino real de compilación. El canario de `project.cpp` puede quedarse: no cuesta nada en
+producción y da una señal inmediata si esa conversión introduce una divergencia.
 
 #### 1.2 — Las formas de llamada que `IrCall` tiene que distinguir
 

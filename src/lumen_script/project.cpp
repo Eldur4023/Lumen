@@ -18,6 +18,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <fstream>
@@ -80,6 +82,34 @@ std::string format_errors(const DiagnosticBag& diags,
 // que hay que calcular, la ruta necesita el VM y eso es otro hito.
 
 namespace {
+
+// Fase 1 de --native (COMPILACION-NATIVA.md): compara, para UNA llamada
+// concreta a emit_route/emit_function/emit_method/emit_ctor/
+// emit_error_handler/emit_condition, los diagnosticos que anadio contra los
+// que da su check_* equivalente. Puramente observacional -- nunca toca
+// `diags`, nunca cambia el resultado de una compilacion real -- y por tanto
+// solo corre si LUMEN_SHADOW_CHECK esta en el entorno: coste cero en el
+// camino normal. Es el canario que valida, antes de dar el paso de
+// convertir emit_expr/emit_stmt/emit_call en consumidores del IR y quitarles
+// sus propias comprobaciones, que check_expr/check_stmt siguen
+// reproduciendo la compilacion real tambien sobre programas .lum
+// organicos (no solo los casos de mano de tests/check_*_shadow.cpp).
+bool shadow_check_activo() {
+    static const bool v = std::getenv("LUMEN_SHADOW_CHECK") != nullptr;
+    return v;
+}
+
+void shadow_comparar(const char* etiqueta, const DiagnosticBag& diags, size_t antes,
+                     const DiagnosticBag& shadow) {
+    if (!shadow_check_activo()) return;
+    std::vector<std::string> real, sombra;
+    for (size_t i = antes; i < diags.items().size(); ++i) real.push_back(diags.items()[i].message);
+    for (const auto& it : shadow.items()) sombra.push_back(it.message);
+    if (real == sombra) return;
+    std::fprintf(stderr, "[shadow-check] discrepancia en %s\n", etiqueta);
+    for (const auto& m : real)   std::fprintf(stderr, "  real:   %s\n", m.c_str());
+    for (const auto& m : sombra) std::fprintf(stderr, "  sombra: %s\n", m.c_str());
+}
 
 // Nombre de tipo de Lumen Script para un valor ya construido.  Se usa donde los datos
 // son constantes y por tanto su tipo es exacto.
@@ -576,7 +606,13 @@ void build_classes(const Program& program, const FunctionSigs& fns,
         for (const auto& r : c.rules) {
             auto    chunk = std::make_shared<Chunk>();
             Emitter emitter(diags, &fns, &sigs, imports);
+            size_t  antes = diags.size();
             if (!emitter.emit_condition(*r.condition, field_names, *chunk)) continue;
+            if (shadow_check_activo()) {
+                DiagnosticBag shadow;
+                emitter.check_condition(*r.condition, field_names, shadow);
+                shadow_comparar("validate", diags, antes, shadow);
+            }
             info->rules.push_back({chunk, r.message});
         }
 
@@ -1177,13 +1213,25 @@ void emit_class_bodies(Module& mod, const ClassSigs& classes, const FunctionSigs
             auto ms = sig.methods.find(m.name);
             if (ms == sig.methods.end()) continue;
             Emitter emitter(diags, &fns, &classes, imports);
+            size_t  antes = diags.size();
             emitter.emit_method(c.name, m, *mod.functions[ms->second.index]);
+            if (shadow_check_activo()) {
+                DiagnosticBag shadow;
+                emitter.check_method(c.name, m, shadow);
+                shadow_comparar(("metodo " + c.name + "." + m.name).c_str(), diags, antes, shadow);
+            }
         }
         for (const auto& ct : c.ctors) {
             auto cs = sig.ctors.find(ct.params.size());
             if (cs == sig.ctors.end()) continue;
             Emitter emitter(diags, &fns, &classes, imports);
+            size_t  antes = diags.size();
             emitter.emit_ctor(c.name, sig.fields, ct, *mod.functions[cs->second]);
+            if (shadow_check_activo()) {
+                DiagnosticBag shadow;
+                emitter.check_ctor(c.name, sig.fields, ct, shadow);
+                shadow_comparar(("constructor " + c.name).c_str(), diags, antes, shadow);
+            }
         }
 
         // El constructor implicito: un CtorDecl sintetico con un parametro por
@@ -1201,8 +1249,15 @@ void emit_class_bodies(Module& mod, const ClassSigs& classes, const FunctionSigs
             auto cs = sig.ctors.find(c.fields.size());
             if (cs != sig.ctors.end()) {
                 Emitter emitter(diags, &fns, &classes, imports);
+                size_t  antes = diags.size();
                 emitter.emit_ctor(c.name, sig.fields, implicito,
                                   *mod.functions[cs->second]);
+                if (shadow_check_activo()) {
+                    DiagnosticBag shadow;
+                    emitter.check_ctor(c.name, sig.fields, implicito, shadow);
+                    shadow_comparar(("constructor implicito " + c.name).c_str(), diags, antes,
+                                    shadow);
+                }
             }
         }
     }
@@ -1226,7 +1281,13 @@ FunctionSigs build_functions(Module& mod, DiagnosticBag& diags) {
         auto it = index.find(f.name);
         if (it == index.end()) continue;
         Emitter emitter(diags, &index, nullptr, &mod.program.imports);
+        size_t  antes = diags.size();
         emitter.emit_function(f, *mod.functions[it->second.index]);
+        if (shadow_check_activo()) {
+            DiagnosticBag shadow;
+            emitter.check_function(f, shadow);
+            shadow_comparar(("funcion " + f.name).c_str(), diags, antes, shadow);
+        }
     }
     return index;
 }
@@ -1238,7 +1299,13 @@ void build_error_handlers(Module& mod, const FunctionSigs& fns,
     for (const auto& e : mod.program.errors) {
         auto    chunk = std::make_shared<Chunk>();
         Emitter emitter(diags, &fns, &sigs, &mod.program.imports, &pctx);
+        size_t  antes = diags.size();
         if (!emitter.emit_error_handler(e, *chunk)) continue;
+        if (shadow_check_activo()) {
+            DiagnosticBag shadow;
+            emitter.check_error_handler(e, shadow);
+            shadow_comparar(("on error " + std::to_string(e.code)).c_str(), diags, antes, shadow);
+        }
         mod.error_handlers[e.code] = std::move(chunk);
     }
 }
@@ -1285,7 +1352,13 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
 
             auto    ws_chunk = std::make_shared<Chunk>();
             Emitter ws_emitter(diags, &fns, &sigs, &mod.program.imports, &pctx);
+            size_t  antes = diags.size();
             if (!ws_emitter.emit_route(r, *ws_chunk)) continue;
+            if (shadow_check_activo()) {
+                DiagnosticBag shadow;
+                ws_emitter.check_route(r, shadow);
+                shadow_comparar(("ws " + r.pattern).c_str(), diags, antes, shadow);
+            }
 
             ++mod.vm_routes;
             std::string ws_where = "WS " + r.pattern;
@@ -1366,7 +1439,13 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
 
             auto    sse_chunk = std::make_shared<Chunk>();
             Emitter sse_emitter(diags, &fns, &sigs, &mod.program.imports, &pctx);
+            size_t  antes = diags.size();
             if (!sse_emitter.emit_route(r, *sse_chunk)) continue;
+            if (shadow_check_activo()) {
+                DiagnosticBag shadow;
+                sse_emitter.check_route(r, shadow);
+                shadow_comparar(("sse " + r.pattern).c_str(), diags, antes, shadow);
+            }
 
             ++mod.vm_routes;
             std::string sse_where = "SSE " + r.pattern;
@@ -1448,7 +1527,13 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
 
         auto    chunk = std::make_shared<Chunk>();
         Emitter emitter(diags, &fns, &sigs, &mod.program.imports, &pctx);
+        size_t  antes = diags.size();
         if (!emitter.emit_route(r, *chunk)) continue;
+        if (shadow_check_activo()) {
+            DiagnosticBag shadow;
+            emitter.check_route(r, shadow);
+            shadow_comparar((r.method + " " + r.pattern).c_str(), diags, antes, shadow);
+        }
 
         ++mod.vm_routes;
         bool needs_upload = false;
