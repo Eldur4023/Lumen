@@ -192,6 +192,18 @@ bool Emitter::emit_condition(const Expr& e, const std::vector<NombreTipado>& nam
     return !failed_;
 }
 
+void Emitter::check_condition(const Expr& e, const std::vector<NombreTipado>& names,
+                              DiagnosticBag& shadow) {
+    route_method_ = {};
+    locals_.clear();
+    loops_.clear();
+    scope_depth_ = 0;
+
+    for (const auto& n : names) declare_local(n.nombre, e.loc, Type::from_legacy_name(n.tipo));
+
+    check_expr(e, shadow);
+}
+
 bool Emitter::emit_error_handler(const ErrorDecl& decl, Chunk& out) {
     chunk_        = &out;
     route_method_ = "ERROR";
@@ -808,6 +820,72 @@ bool Emitter::comprobar_metodo_builtin(const Expr& e) {
     return true;
 }
 
+// Shadow de comprobar_campo: misma logica letra por letra, error a `shadow`
+// en vez de a diags_ (fase 1, checker en paralelo -- ver emitter.hpp).
+bool Emitter::check_campo(const Expr& objeto, const std::string& campo, SourceLoc loc,
+                          DiagnosticBag& shadow) const {
+    const Type tr = tipo_de(objeto);
+    if (tr.is_unknown()) return true;
+    const std::string base = tr.base_name();
+
+    if (classes_) {
+        auto it = classes_->find(base);
+        if (it != classes_->end()) {
+            const auto& f = it->second.fields;
+            if (std::find(f.begin(), f.end(), campo) != f.end()) return true;
+            if (it->second.methods.count(campo)) {
+                shadow.error(loc, "'" + base + "." + campo + "' es un metodo: "
+                           "hay que llamarlo con ()");
+            } else {
+                std::string hay;
+                for (const auto& n : f) hay += (hay.empty() ? "" : ", ") + n;
+                shadow.error(loc, "'" + base + "' no tiene un campo '" + campo + "'" +
+                           (hay.empty() ? "" : "; tiene " + hay));
+            }
+            return false;
+        }
+    }
+    if (metodos_de(base) && base != "Dict") {
+        shadow.error(loc, "'" + campo + "' sobre " + base + ", que no tiene campos");
+        return false;
+    }
+    return true;
+}
+
+// Shadow de comprobar_metodo_builtin: idem.
+bool Emitter::check_metodo_builtin(const Expr& e, DiagnosticBag& shadow) const {
+    const Type recv = tipo_de(*e.object->object);
+    const auto* lista = metodos_de(recv.base_name());
+    if (!lista) return true;
+
+    const std::string& metodo = e.object->text;
+    const MetodoBuiltin* def = nullptr;
+    for (const auto& m : *lista)
+        if (metodo == m.nombre) { def = &m; break; }
+
+    if (!def) {
+        std::string hay;
+        for (const auto& m : *lista) hay += (hay.empty() ? "" : ", ") + std::string(m.nombre);
+        shadow.error(e.object->loc, "los valores de tipo " + recv.base_name() +
+                             " no tienen el metodo '" + metodo + "'; tienen " + hay);
+        return false;
+    }
+
+    size_t argc = 0, named = 0;
+    for (const auto& a : e.args) (a.name.empty() ? argc : named)++;
+    if (named > 0) ++argc;
+
+    if (static_cast<int>(argc) < def->min_args ||
+        static_cast<int>(argc) > def->max_args) {
+        std::string espera = std::to_string(def->min_args);
+        if (def->max_args != def->min_args) espera += "-" + std::to_string(def->max_args);
+        shadow.error(e.loc, "'" + metodo + "()' espera " + espera +
+                     " argumento(s), pero recibe " + std::to_string(argc));
+        return false;
+    }
+    return true;
+}
+
 void Emitter::emit_method_call_dynamic(const Expr& e) {
     emit_expr(*e.object->object);
     size_t argc = 0, named = 0;
@@ -1130,6 +1208,409 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
 
     chunk_->emit(def.is_async ? Op::CallAsync : Op::CallNative, e.loc,
                  (static_cast<uint32_t>(id) << 8) | static_cast<uint32_t>(argc));
+}
+
+// Shadow de emit_expr (fase 1, checker en paralelo -- ver emitter.hpp): misma
+// forma, mismo orden de comprobaciones y mismo texto de error, pero sin tocar
+// chunk_ y sin declarar ninguna ranura (las declare_local() de emit_expr son
+// temporales de codegen que un paso de solo comprobacion no necesita). El
+// tipo que devuelve es el mismo que ya calcula tipo_de(): completarlo con mas
+// casos seria funcionalidad nueva, no una reproduccion de lo que hay hoy.
+Type Emitter::check_expr(const Expr& e, DiagnosticBag& shadow) const {
+    switch (e.kind) {
+        case ExprKind::StringLit:
+        case ExprKind::IntLit:
+        case ExprKind::FloatLit:
+        case ExprKind::BoolLit:
+        case ExprKind::NullLit:
+            break;
+
+        case ExprKind::Ident: {
+            int slot = resolve_local(e.text);
+            if (slot < 0) {
+                if (native_id(e.text) >= 0)
+                    shadow.error(e.loc, "'" + e.text + "' es un builtin: hay que llamarlo, "
+                                 "no usarlo como valor");
+                else
+                    shadow.error(e.loc, "'" + e.text + "' no esta declarada");
+            }
+            break;
+        }
+
+        case ExprKind::Unary:
+            check_expr(*e.lhs, shadow);
+            break;
+
+        case ExprKind::Binary: {
+            if (e.text == "and" || e.text == "or") {
+                check_expr(*e.lhs, shadow);
+                check_expr(*e.rhs, shadow);
+                break;
+            }
+            check_expr(*e.lhs, shadow);
+            check_expr(*e.rhs, shadow);
+            static const std::set<std::string> ops = {
+                "+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">="};
+            if (!ops.count(e.text))
+                shadow.error(e.loc, "operador no soportado: " + e.text);
+            break;
+        }
+
+        case ExprKind::Ternary:
+            check_expr(*e.object, shadow);
+            check_expr(*e.lhs, shadow);
+            check_expr(*e.rhs, shadow);
+            break;
+
+        case ExprKind::ListLit:
+            for (const auto& item : e.items) check_expr(*item, shadow);
+            break;
+
+        case ExprKind::DictLit:
+            for (const auto& entry : e.entries) {
+                check_expr(*entry.key, shadow);
+                check_expr(*entry.value, shadow);
+            }
+            break;
+
+        case ExprKind::Index:
+            check_expr(*e.object, shadow);
+            check_expr(*e.lhs, shadow);
+            break;
+
+        case ExprKind::Member: {
+            if (e.object->kind == ExprKind::Ident &&
+                e.object->text == "session" &&
+                resolve_local("session") < 0 &&
+                member_native_id("session", e.text) < 0) {
+                break;
+            }
+
+            if (e.object->kind == ExprKind::Ident &&
+                resolve_local(e.object->text) < 0 &&
+                is_reserved_object(e.object->text)) {
+
+                int id = member_native_id(e.object->text, e.text);
+                if (id < 0) {
+                    shadow.error(e.loc, "'" + e.object->text + "' no tiene un miembro '" +
+                                 e.text + "'");
+                    break;
+                }
+                if (native_at(id).min_args > 0) {
+                    shadow.error(e.loc, "'" + e.object->text + "." + e.text +
+                                 "' es una operacion: hay que llamarla con ()");
+                    break;
+                }
+                if ((e.object->text == "sse" && route_method_ != "SSE") ||
+                    (e.object->text == "ws"  && route_method_ != "WS")) {
+                    shadow.error(e.loc, "'" + e.object->text + "' solo existe dentro de "
+                                 "una ruta " + e.object->text);
+                    break;
+                }
+                if (e.object->text == "error" && route_method_ != "ERROR") {
+                    shadow.error(e.loc, "'error' solo existe dentro de un 'on error'");
+                    break;
+                }
+                break;
+            }
+            if (!check_campo(*e.object, e.text, e.loc, shadow)) break;
+            check_expr(*e.object, shadow);
+            break;
+        }
+
+        case ExprKind::Call:
+            check_call(e, /*awaited=*/false, shadow);
+            break;
+
+        case ExprKind::PreStep:
+        case ExprKind::PostStep: {
+            const Expr& tgt = *e.lhs;
+
+            if (tgt.kind == ExprKind::Ident) {
+                if (resolve_local(tgt.text) < 0)
+                    shadow.error(tgt.loc, "'" + tgt.text + "' no esta declarada");
+                break;
+            }
+            if (tgt.kind == ExprKind::Member) {
+                // Igual que emit_expr: NO se comprueba que el campo exista
+                // (comprobar_campo no se llama aqui hoy tampoco). Reproducir
+                // ese hueco, no arreglarlo, es lo que toca en esta fase.
+                check_expr(*tgt.object, shadow);
+                break;
+            }
+            if (tgt.kind == ExprKind::Index) {
+                check_expr(*tgt.object, shadow);
+                check_expr(*tgt.lhs, shadow);
+                break;
+            }
+            shadow.error(e.loc, "'++' y '--' solo se aplican a una variable, un campo "
+                         "o un elemento indexado");
+            break;
+        }
+
+        case ExprKind::Await: {
+            if (!e.lhs || e.lhs->kind != ExprKind::Call) {
+                shadow.error(e.loc, "'await' solo se aplica a una llamada asincrona "
+                             "(de momento: sleep)");
+                break;
+            }
+            check_call(*e.lhs, /*awaited=*/true, shadow);
+            break;
+        }
+
+        case ExprKind::This:
+            if (resolve_local("this") < 0)
+                shadow.error(e.loc, "'this' solo existe dentro de un metodo o un constructor");
+            break;
+    }
+    return tipo_de(e);
+}
+
+// Shadow de emit_call: misma forma, mismo orden, mismo texto -- ver el
+// comentario de check_expr.
+void Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow) const {
+    if (!e.object) { shadow.error(e.loc, "llamada sin destino"); return; }
+
+    std::string name;
+    int         id = -1;
+
+    // sse.send(...) — miembro de un objeto reservado.
+    if (e.object->kind == ExprKind::Member &&
+        e.object->object->kind == ExprKind::Ident &&
+        resolve_local(e.object->object->text) < 0 &&
+        is_reserved_object(e.object->object->text)) {
+
+        name = e.object->object->text + "." + e.object->text;
+        id   = member_native_id(e.object->object->text, e.object->text);
+        if (id < 0) {
+            shadow.error(e.object->loc, "'" + e.object->object->text +
+                                 "' no tiene un miembro '" + e.object->text + "'");
+            return;
+        }
+        const std::string& obj = e.object->object->text;
+
+        bool is_module = is_db_module(obj);
+        if (is_module && (!imports_ || !imports_->count(obj))) {
+            shadow.error(e.object->loc, "falta 'import " + obj + "' para poder usar '" +
+                                 obj + "." + e.object->text + "'");
+            return;
+        }
+        if (is_module) {
+            const NativeDef& mdef = native_at(id);
+            if (!awaited) {
+                shadow.error(e.loc, "'" + obj + "." + e.object->text + "()' es asincrono: "
+                             "hay que escribir 'await " + obj + "." + e.object->text +
+                             "(...)'");
+                return;
+            }
+            size_t argc = 1;
+            for (const auto& a : e.args) {
+                if (!a.name.empty()) {
+                    shadow.error(a.loc, "las consultas no admiten argumentos con nombre");
+                    return;
+                }
+                check_expr(*a.value, shadow);
+                ++argc;
+            }
+            if (argc < static_cast<size_t>(mdef.min_args)) {
+                shadow.error(e.loc, "'" + obj + "." + e.object->text +
+                             "()' espera al menos la consulta SQL");
+                return;
+            }
+            if (mdef.max_args >= 0 && argc > static_cast<size_t>(mdef.max_args)) {
+                shadow.error(e.loc, "'" + obj + "." + e.object->text +
+                             "()' no lleva argumentos");
+                return;
+            }
+            if (argc > 255) { shadow.error(e.loc, "demasiados argumentos"); return; }
+            return;
+        }
+
+        if ((obj == "sse" && route_method_ != "SSE") ||
+            (obj == "ws"  && route_method_ != "WS")) {
+            shadow.error(e.object->loc, "'" + obj + "' solo existe dentro de una ruta " + obj);
+            return;
+        }
+        if (obj == "error" && route_method_ != "ERROR") {
+            shadow.error(e.object->loc, "'error' solo existe dentro de un 'on error'");
+            return;
+        }
+    }
+    else if (e.object->kind == ExprKind::Ident) {
+        name = e.object->text;
+        id   = native_id(name);
+
+        if (id < 0) {
+            auto it = functions_ ? functions_->find(name) : FunctionSigs::const_iterator();
+            if (functions_ && it != functions_->end()) {
+                const FnSig& sig = it->second;
+                size_t given = 0;
+                for (const auto& a : e.args) {
+                    if (!a.name.empty()) {
+                        shadow.error(a.loc, "una funcion de usuario no admite argumentos "
+                                     "con nombre");
+                        return;
+                    }
+                    check_expr(*a.value, shadow);
+                    ++given;
+                }
+
+                if (given < sig.required || given > sig.defaults.size()) {
+                    std::string esperado = std::to_string(sig.required);
+                    if (sig.defaults.size() != sig.required)
+                        esperado += " a " + std::to_string(sig.defaults.size());
+                    shadow.error(e.loc, "'" + name + "()' espera " + esperado +
+                                 " argumento(s), pero recibe " + std::to_string(given));
+                    return;
+                }
+                return;
+            }
+            auto ct = classes_ ? classes_->find(name) : ClassSigs::const_iterator();
+            if (classes_ && ct != classes_->end()) {
+                size_t argc = 0;
+                for (const auto& a : e.args) {
+                    if (!a.name.empty()) {
+                        shadow.error(a.loc, "un constructor no admite argumentos con nombre");
+                        return;
+                    }
+                    check_expr(*a.value, shadow);
+                    ++argc;
+                }
+                auto found = ct->second.ctors.find(argc);
+                if (found == ct->second.ctors.end()) {
+                    std::string opciones;
+                    for (const auto& [n, _] : ct->second.ctors)
+                        opciones += (opciones.empty() ? "" : ", ") + std::to_string(n);
+                    shadow.error(e.loc, "'" + name + "' no tiene constructor de " +
+                                 std::to_string(argc) + " parametro(s)" +
+                                 (opciones.empty() ? "" : "; los hay de " + opciones));
+                    return;
+                }
+                return;
+            }
+
+            shadow.error(e.object->loc, "funcion desconocida: '" + name + "'");
+            return;
+        }
+    }
+    else if (e.object->kind == ExprKind::Member && classes_) {
+        Type recv_type = Type::unknown();
+        if (e.object->object->kind == ExprKind::Ident)
+            recv_type = local_type(e.object->object->text);
+        else if (e.object->object->kind == ExprKind::This)
+            recv_type = local_type("this");
+        const std::string recv_name = recv_type.base_name();
+
+        auto cls = recv_type.is_unknown() ? classes_->end() : classes_->find(recv_name);
+        if (cls != classes_->end()) {
+            auto m = cls->second.methods.find(e.object->text);
+            if (m == cls->second.methods.end()) {
+                if (!cls->second.fields.empty() &&
+                    std::find(cls->second.fields.begin(), cls->second.fields.end(),
+                              e.object->text) == cls->second.fields.end()) {
+                    shadow.error(e.object->loc, "'" + recv_name + "' no tiene un metodo '" +
+                                         e.object->text + "'");
+                    return;
+                }
+            } else {
+                const FnSig& sig = m->second;
+                check_expr(*e.object->object, shadow);
+                size_t given = 0;
+                for (const auto& a : e.args) {
+                    if (!a.name.empty()) {
+                        shadow.error(a.loc, "un metodo no admite argumentos con nombre");
+                        return;
+                    }
+                    check_expr(*a.value, shadow);
+                    ++given;
+                }
+                if (given < sig.required || given > sig.defaults.size()) {
+                    shadow.error(e.loc, "'" + recv_name + "." + e.object->text +
+                                 "()' espera " + std::to_string(sig.required) +
+                                 " argumento(s), pero recibe " + std::to_string(given));
+                    return;
+                }
+                return;
+            }
+        }
+        if (!check_metodo_builtin(e, shadow)) return;
+        check_expr(*e.object->object, shadow);
+        for (const auto& a : e.args) check_expr(*a.value, shadow);
+        return;
+    }
+    else if (e.object->kind == ExprKind::Member) {
+        if (!check_metodo_builtin(e, shadow)) return;
+        check_expr(*e.object->object, shadow);
+        for (const auto& a : e.args) check_expr(*a.value, shadow);
+        return;
+    }
+    else {
+        shadow.error(e.loc, "de momento solo se pueden llamar builtins o metodos");
+        return;
+    }
+
+    const NativeDef& def = native_at(id);
+
+    if (def.is_async && !awaited) {
+        shadow.error(e.loc, "'" + name + "()' es asincrono: hay que escribir "
+                     "'await " + name + "(...)'");
+        return;
+    }
+    if (!def.is_async && awaited) {
+        shadow.error(e.loc, "'" + name + "()' no es asincrono: sobra el 'await'");
+        return;
+    }
+
+    size_t positional = 0, named = 0;
+    for (const auto& a : e.args) (a.name.empty() ? positional : named)++;
+
+    if (named > 0 && name != "render") {
+        shadow.error(e.loc, "'" + name + "()' no admite argumentos con nombre");
+        return;
+    }
+
+    // render() compila la plantilla en si en emitir_render_compilado, que es
+    // superficie de plantillas (fase 3), no de expresiones -- no se reproduce
+    // aqui; solo se valida lo que ya se valido arriba mas las subexpresiones.
+    if (name == "render") {
+        if (e.args.empty() || !e.args[0].name.empty() ||
+            e.args[0].value->kind != ExprKind::StringLit) {
+            shadow.error(e.loc, "render() necesita el nombre de la plantilla escrito, no una "
+                         "variable. Para elegir entre varias, usa un if con nombres "
+                         "literales: cada rama queda comprobada al compilar");
+            return;
+        }
+        if (!plantillas_ || !plantillas_->tabla) {
+            shadow.error(e.loc, "render() no se puede usar aqui");
+            return;
+        }
+        for (const auto& a : e.args) check_expr(*a.value, shadow);
+        return;
+    }
+
+    for (const auto& a : e.args)
+        if (a.name.empty()) check_expr(*a.value, shadow);
+
+    size_t argc = positional;
+    if (named > 0) {
+        for (const auto& a : e.args) {
+            if (a.name.empty()) continue;
+            check_expr(*a.value, shadow);
+        }
+        ++argc;
+    }
+
+    if (static_cast<int>(argc) < def.min_args ||
+        (def.max_args >= 0 && static_cast<int>(argc) > def.max_args)) {
+        std::string expected = std::to_string(def.min_args);
+        if (def.max_args != def.min_args)
+            expected += def.max_args < 0 ? " o mas"
+                                         : "-" + std::to_string(def.max_args);
+        shadow.error(e.loc, "'" + name + "()' espera " + expected +
+                     " argumento(s), pero recibe " + std::to_string(argc));
+        return;
+    }
+    if (argc > 255) { shadow.error(e.loc, "demasiados argumentos"); return; }
 }
 
 // Compila la plantilla contra las claves de esta llamada y emite una llamada a

@@ -422,6 +422,29 @@ bytecode se convierte en una función mucho más tonta que index-in, opcode-out.
 4. En cada uno de los tres pasos, `tests/run_tests.sh` en verde y sin ningún mensaje de error
    cambiado es la condición para seguir al siguiente — no una casilla que marcar al final.
 
+**Paso 1 hecho**: `include/lumen_script/ir.hpp` define `IrExpr` (un caso por `ExprKind`, calcando
+el reuso de `object`/`lhs`/`rhs` de `Expr`) e `IrCallShape` con las 8 formas de §1.2. Aditivo,
+sin conectar, verificado con un smoke test standalone.
+
+**Paso 2 hecho**: `Emitter::check_expr`/`check_call` (más `check_campo`/`check_metodo_builtin`,
+sombra de `comprobar_campo`/`comprobar_metodo_builtin`) reproducen rama a rama las comprobaciones
+de `emit_expr`/`emit_call` — mismo texto, mismo orden — escribiendo a un `DiagnosticBag` aparte
+(`shadow`) que nunca toca `diags_`. No necesitan declarar ninguna ranura (las únicas
+`declare_local` de hoy son temporales de codegen en `PreStep`/`PostStep`, que un paso de solo
+comprobación no necesita), así que son lectores puros de `locals_` y pueden convivir con la
+compilación real sin ningún riesgo de interferencia.
+
+Se verificaron con `tests/check_expr_shadow.cpp` (`ctest -R check_expr_shadow`), que compara,
+expresión a expresión, la salida de `check_expr`/`check_call` contra la compilación real
+(`emit_condition`, ya existente para probar expresiones sueltas) — 14 casos de error, uno por
+cada rama tocada aquí, más las 6 que ya cubre `tests/casos/malos/*.lum`, y 4 casos de camino
+feliz para descartar falsos positivos. Los 18 coinciden byte a byte. `tests/run_tests.sh` sigue
+en 79/79 porque `check_expr`/`check_call` aún no se llaman desde ningún sitio de la compilación
+real — siguen siendo aditivos, exactamente como el IR del paso 1.
+
+Pendiente: paso 3 (statements — `check_stmt`/`IrStmt`, y solo entonces la conversión real de
+`emit_expr`/`emit_call` en consumidores del IR con sus propias comprobaciones eliminadas).
+
 #### 1.2 — Las formas de llamada que `IrCall` tiene que distinguir
 
 `emit_call` (no solo `emit_expr`) es donde vive la mayor parte de la superficie real. Antes de

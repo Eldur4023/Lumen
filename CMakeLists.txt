@@ -192,6 +192,14 @@ add_executable(prueba_plantillas tests/plantillas.cpp)
 target_link_libraries(prueba_plantillas PRIVATE lumen_script)
 add_test(NAME plantillas COMMAND prueba_plantillas)
 
+# Fase 1 de --native (COMPILACION-NATIVA.md): compara Emitter::check_expr/
+# check_call contra la compilacion real, expresion a expresion. Vive aqui, no
+# en tests/run_tests.sh, porque llama a la libreria directamente en vez de al
+# binario: es una prueba de una pieza interna que todavia no esta conectada.
+add_executable(prueba_check_expr tests/check_expr_shadow.cpp)
+target_link_libraries(prueba_check_expr PRIVATE lumen_script)
+add_test(NAME check_expr_shadow COMMAND prueba_check_expr)
+
 # El traductor de marcadores de postgres es una funcion pura: se prueba sin
 # servidor incluyendo el .cpp del driver, para probar EL codigo y no una copia.
 if(LUMEN_POSTGRES AND PQ_INC AND PQ_LIB)

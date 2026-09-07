@@ -100,6 +100,38 @@ public:
     // Cuerpo de un `on error`: sin parametros, con el objeto `error` disponible.
     bool emit_error_handler(const ErrorDecl& decl, Chunk& out);
 
+    // ── Fase 1 (COMPILACION-NATIVA.md): checker en paralelo ─────────────────
+    //
+    // Reproduce TODAS las comprobaciones que hace emit_expr/emit_call (mismo
+    // texto de error, mismo orden), pero sin tocar chunk_ ni locals_: no emite
+    // bytecode y no declara ninguna ranura (las unicas declare_local() de hoy
+    // son temporales de codegen -- PreStep/PostStep sobre un campo o un
+    // indice -- que un paso de solo comprobacion no necesita).  Por eso puede
+    // correr sobre el `this` REAL de una compilacion en curso, en cualquier
+    // orden respecto a emit_expr/emit_call, sin corromper la numeracion de
+    // ranuras: es un lector de locals_, nunca un escritor.
+    //
+    // Los errores van a `shadow`, NUNCA a diags_: todavia no es la fuente de
+    // diagnosticos (eso es el paso 3 de la fase 1), asi que un error de aqui
+    // no debe duplicar el que ya produce emit_expr/emit_call por su cuenta.
+    //
+    // Publico porque la verificacion (comparar shadow contra diags_ real
+    // sobre el corpus de tests/casos) vive en un binario de pruebas aparte;
+    // nada en el compilador real llama a esto todavia.
+    Type check_expr(const Expr& e, DiagnosticBag& shadow) const;
+    void check_call(const Expr& e, bool awaited, DiagnosticBag& shadow) const;
+
+    // Contrapartida de check_expr para emit_condition: mismo reinicio de
+    // locals_/route_method_/scope_depth_, mismas declaraciones de `names`,
+    // pero llamando a check_expr en vez de a emit_expr. Es la manera mas
+    // directa de comparar check_expr contra la compilacion real sobre una
+    // expresion suelta: emit_condition y check_condition se pueden llamar en
+    // secuencia sobre el mismo Emitter porque las dos reinician su estado por
+    // completo al entrar, igual que ya hace emit_condition hoy si se llama
+    // mas de una vez.
+    void check_condition(const Expr& e, const std::vector<NombreTipado>& names,
+                         DiagnosticBag& shadow);
+
 private:
     DiagnosticBag&                       diags_;
     const FunctionSigs*                  functions_ = nullptr;
@@ -159,6 +191,12 @@ private:
     // Metodo cuyo receptor no tiene tipo conocido al compilar: se apila y el
     // despacho por tipo lo hace el VM.
     void emit_method_call_dynamic(const Expr& e);
+
+    // Shadow de comprobar_campo/comprobar_metodo_builtin: misma logica, error
+    // a `shadow` en vez de a diags_. Usados por check_expr/check_call.
+    bool check_campo(const Expr& objeto, const std::string& campo, SourceLoc loc,
+                     DiagnosticBag& shadow) const;
+    bool check_metodo_builtin(const Expr& e, DiagnosticBag& shadow) const;
 };
 
 } // namespace lumen_script
