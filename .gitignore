@@ -6,3 +6,4 @@ build/
 
 # Artefactos que deja la suite de pruebas.
 pruebas-suite.db*
+bench
