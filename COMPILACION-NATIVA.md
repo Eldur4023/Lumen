@@ -442,8 +442,31 @@ feliz para descartar falsos positivos. Los 18 coinciden byte a byte. `tests/run_
 en 79/79 porque `check_expr`/`check_call` aún no se llaman desde ningún sitio de la compilación
 real — siguen siendo aditivos, exactamente como el IR del paso 1.
 
-Pendiente: paso 3 (statements — `check_stmt`/`IrStmt`, y solo entonces la conversión real de
-`emit_expr`/`emit_call` en consumidores del IR con sus propias comprobaciones eliminadas).
+**Paso 3 hecho**: `Emitter::check_stmt`/`check_block` reproducen `emit_stmt`/`emit_block` rama a
+rama. A diferencia de `check_expr`, SÍ llaman a `declare_local`/`begin_scope`/`end_scope`
+(`VarDecl`, el `for` desazucarado, el nombre de un `catch`): son contabilidad de nombres real, no
+un temporal de codegen, y hace falta reproducirla para que el `Ident` de una sentencia posterior
+resuelva a la ranura correcta. Por eso `check_stmt` no puede convivir con una emisión real en
+curso sobre el mismo `Emitter` — necesita sus propios puntos de entrada (`check_route`/
+`check_function`/`check_method`/`check_ctor`/`check_error_handler`), cada uno reiniciando el
+estado exactamente como su contrapartida `emit_*`, para poder llamarse en secuencia sobre el
+mismo `Emitter` (primero la vía real, luego la sombra) sin interferir.
+
+Verificado con `tests/check_stmt_shadow.cpp` (`ctest -R check_stmt_shadow`): 12 casos sobre
+funciones y clases completas de verdad (no expresiones sueltas) — aritmética con `if`/`else`,
+`while`, `for` con `break`/`continue`, `try`/`catch`, índices y `++`/`--`, y las ramas de error
+nuevas que trae `check_stmt` (asignar a variable no declarada, `break`/`continue` fuera de un
+bucle, `require` con una condición inválida, asignar a un campo de clase inexistente, un
+constructor implícito con un parámetro que no es campo). Los 12 coinciden byte a byte contra
+`emit_function`/`emit_method`/`emit_ctor` reales. `tests/run_tests.sh` sigue en 79/79: como los
+pasos anteriores, sigue siendo aditivo — nada de esto se llama todavía desde la compilación real.
+
+Con esto, el checker en paralelo cubre expresiones Y sentencias — el criterio del paso 3 original
+("reproduce el 100% de los diagnósticos... antes de convertir") está cumplido para el subconjunto
+verificado aquí. Pendiente: definir `IrStmt` (el paso 1 hecho solo cubrió `IrExpr`), y solo
+entonces la conversión real de `emit_expr`/`emit_stmt`/`emit_call` en consumidores del IR con sus
+propias comprobaciones eliminadas — el paso de mayor riesgo de toda la fase 1, porque ahí sí se
+toca el camino real de compilación.
 
 #### 1.2 — Las formas de llamada que `IrCall` tiene que distinguir
 

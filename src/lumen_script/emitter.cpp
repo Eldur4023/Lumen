@@ -204,6 +204,89 @@ void Emitter::check_condition(const Expr& e, const std::vector<NombreTipado>& na
     check_expr(e, shadow);
 }
 
+// check_route/check_function/check_method/check_ctor/check_error_handler:
+// contrapartida de emit_route/emit_function/emit_method/emit_ctor/
+// emit_error_handler para check_stmt, con el mismo reinicio de estado y las
+// mismas declaraciones de parametros/`this`. Devuelven si esta llamada en
+// concreto no anadio ningun error a `shadow` (no si `shadow` esta vacio del
+// todo: quien llama puede reusar el mismo DiagnosticBag para varios casos).
+bool Emitter::check_route(const RouteDecl& route, DiagnosticBag& shadow) {
+    size_t antes    = shadow.size();
+    route_method_   = route.method;
+    locals_.clear();
+    loops_.clear();
+    scope_depth_ = 0;
+
+    for (const auto& p : route.params) declare_local(p.name, p.loc, Type::from_declared(p.type));
+
+    for (const auto& g : route.guards) {
+        if (!g.condition || !g.otherwise) continue;
+        check_expr(*g.condition, shadow);
+        check_expr(*g.otherwise, shadow);
+    }
+
+    check_block(route.body, shadow);
+    return shadow.size() == antes;
+}
+
+bool Emitter::check_function(const FnDecl& fn, DiagnosticBag& shadow) {
+    size_t antes  = shadow.size();
+    route_method_ = "FN";
+    locals_.clear();
+    loops_.clear();
+    scope_depth_ = 0;
+
+    for (const auto& p : fn.params) declare_local(p.name, p.loc, Type::from_declared(p.type));
+    check_block(fn.body, shadow);
+    return shadow.size() == antes;
+}
+
+bool Emitter::check_method(const std::string& cls, const FnDecl& m, DiagnosticBag& shadow) {
+    size_t antes  = shadow.size();
+    route_method_ = "FN";
+    locals_.clear();
+    loops_.clear();
+    scope_depth_ = 0;
+
+    declare_local("this", m.loc, Type::class_ref(cls));
+    for (const auto& p : m.params) declare_local(p.name, p.loc, Type::from_declared(p.type));
+    check_block(m.body, shadow);
+    return shadow.size() == antes;
+}
+
+bool Emitter::check_ctor(const std::string& cls, const std::vector<std::string>& fields,
+                         const CtorDecl& ct, DiagnosticBag& shadow) {
+    size_t antes  = shadow.size();
+    route_method_ = "FN";
+    locals_.clear();
+    loops_.clear();
+    scope_depth_ = 0;
+
+    for (const auto& p : ct.params) declare_local(p.name, p.loc, Type::from_declared(p.type));
+    declare_local("this", ct.loc, Type::class_ref(cls));
+
+    if (ct.has_body) {
+        check_block(ct.body, shadow);
+    } else {
+        for (const auto& p : ct.params) {
+            if (std::find(fields.begin(), fields.end(), p.name) == fields.end())
+                shadow.error(p.loc, "'" + p.name + "' no es un campo de '" + cls + "'");
+        }
+    }
+    return shadow.size() == antes;
+}
+
+bool Emitter::check_error_handler(const ErrorDecl& decl, DiagnosticBag& shadow) {
+    size_t antes  = shadow.size();
+    route_method_ = "ERROR";
+    locals_.clear();
+    loops_.clear();
+    scope_depth_ = 0;
+
+    check_block(decl.body, shadow);
+    return shadow.size() == antes;
+}
+
 bool Emitter::emit_error_handler(const ErrorDecl& decl, Chunk& out) {
     chunk_        = &out;
     route_method_ = "ERROR";
@@ -430,6 +513,126 @@ void Emitter::emit_stmt(const Stmt& s) {
             end_scope();
 
             chunk_->patch(to_end, chunk_->here());
+            break;
+        }
+    }
+}
+
+// Shadow de emit_block/emit_stmt (fase 1, checker en paralelo -- ver
+// emitter.hpp). Mismo orden de comprobaciones, mismo texto, sin tocar chunk_.
+// A diferencia de check_expr, SI llama a declare_local/begin_scope/end_scope:
+// VarDecl, el `for` desazucarado y el nombre de un `catch` son contabilidad
+// de nombres real (no un temporal de codegen), y hace falta reproducirla para
+// que el Ident de una sentencia posterior resuelva a la ranura correcta.
+void Emitter::check_block(const Block& body, DiagnosticBag& shadow) {
+    begin_scope();
+    for (const auto& s : body) check_stmt(*s, shadow);
+    end_scope();
+}
+
+void Emitter::check_stmt(const Stmt& s, DiagnosticBag& shadow) {
+    switch (s.kind) {
+        case StmtKind::Return:
+            if (s.value) check_expr(*s.value, shadow);
+            break;
+
+        case StmtKind::ExprStmt:
+            check_expr(*s.value, shadow);
+            break;
+
+        case StmtKind::VarDecl: {
+            if (s.value) check_expr(*s.value, shadow);
+            declare_local(s.name, s.loc, Type::from_declared(s.type));
+            break;
+        }
+
+        case StmtKind::Assign: {
+            if (s.target->kind == ExprKind::Member &&
+                s.target->object->kind == ExprKind::Ident &&
+                s.target->object->text == "session" &&
+                resolve_local("session") < 0) {
+                check_expr(*s.value, shadow);
+                return;
+            }
+
+            if (s.target->kind == ExprKind::Index) {
+                check_expr(*s.target->object, shadow);
+                check_expr(*s.target->lhs, shadow);
+                check_expr(*s.value, shadow);
+                return;
+            }
+
+            if (s.target->kind == ExprKind::Member) {
+                if (!check_campo(*s.target->object, s.target->text, s.loc, shadow)) return;
+                check_expr(*s.target->object, shadow);
+                check_expr(*s.value, shadow);
+                return;
+            }
+
+            if (s.target->kind != ExprKind::Ident) {
+                shadow.error(s.loc, "solo se puede asignar a una variable o a un campo");
+                return;
+            }
+            int slot = resolve_local(s.target->text);
+            if (slot < 0) {
+                shadow.error(s.target->loc, "'" + s.target->text + "' no esta declarada");
+                return;
+            }
+            check_expr(*s.value, shadow);
+            break;
+        }
+
+        case StmtKind::If: {
+            check_expr(*s.value, shadow);
+            check_block(s.body, shadow);
+            if (!s.orelse.empty()) check_block(s.orelse, shadow);
+            break;
+        }
+
+        case StmtKind::While: {
+            check_expr(*s.value, shadow);
+            loops_.push_back({});
+            check_block(s.body, shadow);
+            loops_.pop_back();
+            break;
+        }
+
+        case StmtKind::Require: {
+            check_expr(*s.value, shadow);
+            check_expr(*s.target, shadow);
+            break;
+        }
+
+        case StmtKind::Break:
+            if (loops_.empty()) shadow.error(s.loc, "'break' fuera de un bucle");
+            break;
+
+        case StmtKind::Continue:
+            if (loops_.empty()) shadow.error(s.loc, "'continue' fuera de un bucle");
+            break;
+
+        case StmtKind::For: {
+            begin_scope();
+            check_expr(*s.target, shadow);
+            declare_local(" items", s.loc);
+            declare_local(" count", s.loc);
+            declare_local(" index", s.loc);
+            declare_local(s.name, s.loc, Type::from_declared(s.type));
+
+            loops_.push_back({});
+            check_block(s.body, shadow);
+            loops_.pop_back();
+
+            end_scope();
+            break;
+        }
+
+        case StmtKind::Try: {
+            check_block(s.body, shadow);
+            begin_scope();
+            if (!s.name.empty()) declare_local(s.name, s.loc);
+            for (const auto& st : s.orelse) check_stmt(*st, shadow);
+            end_scope();
             break;
         }
     }

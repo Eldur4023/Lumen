@@ -132,6 +132,27 @@ public:
     void check_condition(const Expr& e, const std::vector<NombreTipado>& names,
                          DiagnosticBag& shadow);
 
+    // check_stmt/check_block: la misma idea que check_expr, pero para
+    // sentencias -- reproducen emit_stmt/emit_block rama a rama. A
+    // diferencia de check_expr, SI declaran ranuras (VarDecl, el `for`
+    // desazucarado, el nombre de un `catch`): esas SI son contabilidad de
+    // nombres real, no un temporal de codegen, y hace falta que el checker
+    // la lleve para que el Ident de una sentencia posterior resuelva bien.
+    // Por construccion no puede correr sobre el `this` de una emision real en
+    // curso (pisaria sus ranuras) -- de ahi check_route/check_function/etc.
+    // como puntos de entrada propios, cada uno reiniciando el estado exactamente
+    // como su contrapartida emit_*, para poder llamarse en secuencia sobre el
+    // mismo Emitter (primero la via real, luego la sombra) sin interferir.
+    void check_stmt(const Stmt& s, DiagnosticBag& shadow);
+    void check_block(const Block& body, DiagnosticBag& shadow);
+
+    bool check_route(const RouteDecl& route, DiagnosticBag& shadow);
+    bool check_function(const FnDecl& fn, DiagnosticBag& shadow);
+    bool check_method(const std::string& cls, const FnDecl& m, DiagnosticBag& shadow);
+    bool check_ctor(const std::string& cls, const std::vector<std::string>& fields,
+                    const CtorDecl& ct, DiagnosticBag& shadow);
+    bool check_error_handler(const ErrorDecl& decl, DiagnosticBag& shadow);
+
 private:
     DiagnosticBag&                       diags_;
     const FunctionSigs*                  functions_ = nullptr;

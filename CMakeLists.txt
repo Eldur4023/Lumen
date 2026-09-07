@@ -200,6 +200,10 @@ add_executable(prueba_check_expr tests/check_expr_shadow.cpp)
 target_link_libraries(prueba_check_expr PRIVATE lumen_script)
 add_test(NAME check_expr_shadow COMMAND prueba_check_expr)
 
+add_executable(prueba_check_stmt tests/check_stmt_shadow.cpp)
+target_link_libraries(prueba_check_stmt PRIVATE lumen_script)
+add_test(NAME check_stmt_shadow COMMAND prueba_check_stmt)
+
 # El traductor de marcadores de postgres es una funcion pura: se prueba sin
 # servidor incluyendo el .cpp del driver, para probar EL codigo y no una copia.
 if(LUMEN_POSTGRES AND PQ_INC AND PQ_LIB)
