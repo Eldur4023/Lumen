@@ -487,11 +487,22 @@ inerte por defecto).
 
 Con esto, el checker en paralelo queda razonablemente probado: no solo reproduce los casos que se
 diseñaron para ejercitarlo, sino que coincide con la compilación real sobre programas escritos sin
-pensar en él. Pendiente: definir `IrStmt` (el paso 1 hecho solo cubrió `IrExpr`), y solo entonces
-la conversión real de `emit_expr`/`emit_stmt`/`emit_call` en consumidores del IR con sus propias
-comprobaciones eliminadas — el paso de mayor riesgo de toda la fase 1, porque ahí sí se toca el
-camino real de compilación. El canario de `project.cpp` puede quedarse: no cuesta nada en
-producción y da una señal inmediata si esa conversión introduce una divergencia.
+pensar en él. El canario de `project.cpp` puede quedarse: no cuesta nada en producción y da una
+señal inmediata si el corte que sigue introduce una divergencia.
+
+**`IrStmt` hecho**: `include/lumen_script/ir.hpp` ahora también define `IrStmt` (un caso por
+`StmtKind`, calcando el reuso de `value`/`target`/`body`/`orelse` de `Stmt`) e `IrAssignTarget`
+con las 4 formas de destino que distingue hoy `emit_stmt`/`check_stmt` en el caso `Assign`
+(`Session`/`Index`/`Member`/`Local` — la misma idea que las 8 formas de `IrCall`, pero para
+asignación). Aditivo, sin conectar, verificado con un smoke test standalone (`VarDecl`, las 4
+formas de `Assign`, `For` y `Try`/`catch`).
+
+Con `IrExpr` e `IrStmt` definidos y `check_expr`/`check_stmt` verificados contra la compilación
+real (casos de mano y corpus orgánico), queda un solo paso para cerrar la fase 1: convertir
+`check_expr`/`check_stmt` para que **devuelvan** `IrExpr`/`IrStmt` en vez de escribir a un
+`DiagnosticBag` aparte, y luego convertir `emit_expr`/`emit_stmt`/`emit_call` en consumidores
+puros de ese IR, quitándoles sus propias llamadas a `error()` — el paso de mayor riesgo de toda
+la fase 1, porque ahí sí se toca el camino real de compilación que usa todo el mundo.
 
 #### 1.2 — Las formas de llamada que `IrCall` tiene que distinguir
 

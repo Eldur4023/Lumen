@@ -122,4 +122,62 @@ struct IrExpr {
     std::vector<IrDictEntry> entries;
 };
 
+// IR de sentencias (COMPILACION-NATIVA.md fase 1, paso 3 de §1.1: check_stmt
+// ya existe y esta verificado -- ver Emitter::check_stmt -- este es el IR que
+// deberia producir en vez de escribir a un DiagnosticBag). Aditivo, sin
+// conectar: como con IrExpr, la forma calca a Stmt (ast.hpp) a proposito, y
+// construirlo a partir de un Stmt real es traduccion nodo a nodo.
+
+struct IrStmt;
+using IrStmtPtr = std::unique_ptr<IrStmt>;
+using IrBlock   = std::vector<IrStmtPtr>;
+
+enum class IrStmtKind {
+    Return, ExprStmt, VarDecl, Assign,
+    If, While, For, Require, Try, Break, Continue,
+};
+
+// Las 4 formas de destino que distingue emit_stmt/check_stmt hoy en el caso
+// StmtKind::Assign (mirando Stmt::target->kind): cada una es una operacion de
+// runtime distinta, igual de bien diferenciada que las 8 formas de IrCall.
+enum class IrAssignTarget {
+    Session,  // session.x = v -> __session_set("x", v)
+    Index,    // xs[i] = v     -> SetIndex
+    Member,   // o.f = v       -> SetMember, tras comprobar que el campo existe
+    Local,    // x = v         -> StoreLocal en la ranura ya resuelta
+};
+
+struct IrStmt {
+    IrStmtKind kind;
+    SourceLoc  loc;
+
+    // Return / ExprStmt / VarDecl.init: la expresion (nulo en un Return sin
+    // valor). If / While / Require: la condicion. Assign: el valor a asignar,
+    // en las 4 formas.
+    IrExprPtr value;
+
+    // VarDecl / For: el tipo declarado y el nombre de la variable, y la
+    // ranura que le asigno declare_local -- el consumidor de este IR no
+    // vuelve a llamar a declare_local, solo StoreLocal en `slot`. Try: `name`
+    // es el nombre del `catch` (vacio si no captura nada) y `slot` su ranura.
+    Type        decl_type = Type::unknown();
+    std::string name;
+    int         slot = -1;
+
+    // For: el iterable (`Stmt::target` original). Require: la expresion del
+    // `else` (lo que se devuelve si la condicion es falsa).
+    IrExprPtr target;
+
+    // Assign: que forma de destino es, y las piezas que necesita cada una.
+    // Nunca se rellena mas de lo que corresponde a `assign_target`.
+    IrAssignTarget assign_target = IrAssignTarget::Local;
+    IrExprPtr      assign_object;    // Index/Member: el receptor
+    IrExprPtr      assign_index;     // Index: la expresion del indice
+    std::string    assign_field;     // Session/Member: el nombre del campo
+    int            assign_slot = -1; // Local: la ranura ya resuelta
+
+    IrBlock body;    // If-then / While / For / Try
+    IrBlock orelse;  // If-else / Try-catch
+};
+
 } // namespace lumen_script
