@@ -422,6 +422,47 @@ bytecode se convierte en una función mucho más tonta que index-in, opcode-out.
 4. En cada uno de los tres pasos, `tests/run_tests.sh` en verde y sin ningún mensaje de error
    cambiado es la condición para seguir al siguiente — no una casilla que marcar al final.
 
+#### 1.2 — Las formas de llamada que `IrCall` tiene que distinguir
+
+`emit_call` (no solo `emit_expr`) es donde vive la mayor parte de la superficie real. Antes de
+diseñar `IrCall` hace falta la lista completa de formas que hoy resuelve, porque cada una tiene
+sus propias reglas de aridad/async y su propio opcode de destino — enumerarlas a medias es
+peor que no enumerarlas, porque el hueco no aparece hasta que alguien escribe el `.lum` que lo
+pisa:
+
+1. **Miembro de un objeto reservado, módulo de BD** (`sqlite.query(...)`) — exige `import`,
+   exige `await`, primer argumento es el nombre del módulo inyectado por el emisor, sin
+   argumentos con nombre, `CallAsync`.
+2. **Miembro de un objeto reservado, no-módulo** (`sse.send(...)`, `ws.send(...)`,
+   `error.foo()`...) — comprueba que la ruta es del tipo correcto (`SSE`/`WS`/`ERROR`) antes de
+   nada; puede ser async o no según el nativo.
+3. **Función de usuario** (`fn` declarada) — aridad contra `FnSig` (obligatorios vs. con
+   defecto), sin nombrados, defectos rellenados por el propio emisor, `CallFunction`.
+4. **Constructor** (llamada al nombre de una clase) — resuelto por número de argumentos
+   (`ctors` indexado por aridad, no por tipos — la gramática los distingue así, §15), sin
+   nombrados, `CallFunction`.
+5. **Método de clase con receptor de tipo estático conocido** — resuelto contra `ClassSig`,
+   aridad contra `FnSig` igual que una función, sin nombrados, `emit_expr` del receptor +
+   `CallFunction`.
+6. **Builtin global** (`len(...)`, `sleep(...)`, `render(...)`...) — `render()` con nombre
+   literal es un caso aparte dentro de este (compila la plantilla en el propio `Emitter`,
+   `emitir_render_compilado`); el resto valida `is_async`/`awaited`, admite nombrados solo si es
+   `render`, `CallNative` o `CallAsync`.
+7. **Método builtin sobre un valor** (`s.upper()`, `xs.add(v)`...) — cuando el receptor tiene
+   tipo estático conocido pasa por `comprobar_metodo_builtin` (ya aislado); si no, se despacha
+   en runtime (`emit_method_call_dynamic`, opcode `CallMethod` por nombre).
+8. **Nada de lo anterior** — error de compilación (`"de momento solo se pueden llamar builtins
+   o metodos"`).
+
+`IrCall` necesita un caso por cada una de estas ocho formas (no una sola forma genérica
+"llamada con argumentos"), porque cada una decide de forma distinta cuántos argumentos son
+válidos, si hace falta `await`, y a qué opcode/función C++ generada se traduce. El backend
+nativo (fase 5) va a querer exactamente esta misma lista para decidir qué genera cada una: 1 y 2
+son `co_await`/llamada directa sobre `DbAwaitable`/las structs que ya expone `db.hpp`; 3, 4 y 5
+son llamadas a funciones C++ generadas; 6 y 7 son llamadas a la biblioteca de soporte del
+runtime (`crypto::`, `Value::`, etc.); 8 sigue siendo un error de compilación en los dos
+backends por igual.
+
 ### Fase 2 — Backend nativo: funciones puras
 - Generación de C++ para `fn` con primitivos y control de flujo. Sin clases, sin contenedores,
   sin `await`, sin rutas.
