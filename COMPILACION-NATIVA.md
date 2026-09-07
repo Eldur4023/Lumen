@@ -354,6 +354,74 @@ siguiente sin el anterior en verde.
   error de compilación (fichero, línea, columna, texto) no cambian ni uno. Es refactor puro:
   **cero funcionalidad nueva en esta fase**, para que cualquier regresión sea atribuible.
 
+#### 1.1 — Lo que se descubrió al mirar `emit_expr`/`emit_stmt` de verdad
+
+Antes de tocar esto conviene dejar constancia de por qué el corte no es tan simple como "mover
+las comprobaciones a una función y la emisión a otra". `Type` (§9.2 más abajo, ya conectado) fue
+la parte fácil porque tenía un contrato claro y sitios de llamada contados. `emit_expr` es otra
+cosa: es **una sola función con las comprobaciones y la emisión entrelazadas rama a rama**, no
+dos bloques separables. El caso `ExprKind::Member` por sí solo tiene tres ramas (`session.x`
+dinámico, un objeto reservado como `sse`/`ws`/`error`, y un campo normal vía
+`comprobar_campo`), cada una con sus propios `error(...); return;` intercalados con
+`chunk_->emit(...)`.
+
+La buena noticia, mirándolo de cerca: **dentro de cada rama, el orden ya es "comprobar y salir
+si falla, emitir si no"** — no hay una emisión que ocurra y luego se invalide. Eso significa que
+separar checker y emisor **no es reescribir la lógica de cada rama**, es partirla en dos
+funciones que recorren el AST en paralelo con la misma forma:
+
+- `check_expr(const Expr&) -> Type` — hace exactamente las mismas comprobaciones que hoy hace
+  `emit_expr` (resolver nombres, `comprobar_campo`, `comprobar_metodo_builtin`, las reglas de
+  objetos reservados, aridad de llamadas...) y llama a `error()` en los mismos sitios con el
+  mismo texto, pero **no emite ni un solo opcode**. Es `tipo_de()` de hoy, pero completo: todas
+  las ramas de `ExprKind`, no solo las cuatro que necesita resolver un receptor.
+- `emit_expr(const IrExpr&)` (o, en la version mas simple de partida, la `emit_expr` de hoy con
+  todas las llamadas a `error()` quitadas) — asume que ya paso el checker y solo genera bytecode.
+
+**La trampa que hay que evitar**: si el checker y el emisor corren como dos pasadas
+independientes y AMBOS siguen llamando a `error()`, cada fallo sale duplicado en `DiagnosticBag`
+— justo el tipo de regresión silenciosa que el criterio de aceptación de esta fase prohíbe. Por
+eso el checker tiene que ser la **única** fuente de diagnósticos: `emit_*` deja de comprobar
+nada y confía en que si se le llama es porque el checker ya dio el visto bueno (y si no lo dio,
+no se llega a invocar al emisor para ese chunk en absoluto — `failed_` ya hace ese papel hoy).
+
+**La segunda trampa**: `declare_local`/`resolve_local`/`begin_scope`/`end_scope` no son bytecode
+— son contabilidad de nombres — pero hoy se llaman **desde dentro de la emisión** (p.ej. el
+`for` desazucarado declara sus ranuras auxiliares según emite). Si el checker y el emisor son
+dos recorridos separados del mismo cuerpo, **los dos tienen que hacer exactamente la misma
+secuencia de `declare_local`/`begin_scope`/`end_scope`**, en el mismo orden, para que los
+índices de ranura que calcula el checker (los que va a llevar el IR) coincidan con los que
+espera el bytecode. Esto no es un problema — es determinista a partir del AST — pero es la
+razón por la que "solo mover las comprobaciones" no basta: el checker necesita su propia copia
+de ese estado de resolución de nombres (o, mejor, el IR resultante ya lleva los índices
+resueltos y el emisor deja de tocar `locals_` en absoluto, limitándose a leer los índices que ya
+trae cada nodo).
+
+**Conclusión de diseño, ya con esto claro**: el IR de §6 no es opcional ni una comodidad — es lo
+que hace que el checker y el emisor no dupliquen la contabilidad de nombres cada uno por su
+lado. Cada nodo de expresión del IR lleva: su `Type` (ya resuelto), y si es un `Ident` el
+**índice de ranura ya resuelto** (no el nombre); cada nodo de sentencia que declara algo lleva
+el índice que le tocó. Construir eso es responsabilidad exclusiva del checker; el emisor de
+bytecode se convierte en una función mucho más tonta que index-in, opcode-out.
+
+**Orden de trabajo recomendado, revisado** (más fino que "escribir el checker" a secas):
+1. Definir el IR de expresiones (un `IrExpr` por cada `ExprKind`, con `Type` y, donde aplique,
+   el índice ya resuelto) — aditivo, sin tocar `Emitter`, verificado con casos de mano como se
+   hizo con `Type::from_declared`.
+2. Escribir `check_expr` como una función nueva que **reproduce** las comprobaciones de
+   `emit_expr` rama a rama (mismo texto de error, mismo orden), construida y probada **en
+   paralelo** a la `emit_expr` existente sin sustituirla todavía — comparando sus diagnósticos
+   contra los de compilar programas inválidos de verdad, uno por cada rama que se ha visto aquí
+   (`session.x`, un objeto reservado fuera de sitio, un campo inexistente, una llamada con
+   aridad equivocada...).
+3. Solo cuando `check_expr` reproduce el 100% de los diagnósticos de expresiones del corpus,
+   convertir `emit_expr` en un consumidor del IR y quitarle sus propias comprobaciones. Repetir
+   el mismo proceso para sentencias (`check_stmt`/`IrStmt`), que es donde vive el desazucarado
+   real (`for`, `require`, `x += e`) — la parte con más superficie pero, por lo visto aquí,
+   ninguna sorpresa de diseño nueva respecto a lo que ya resolvió expresiones.
+4. En cada uno de los tres pasos, `tests/run_tests.sh` en verde y sin ningún mensaje de error
+   cambiado es la condición para seguir al siguiente — no una casilla que marcar al final.
+
 ### Fase 2 — Backend nativo: funciones puras
 - Generación de C++ para `fn` con primitivos y control de flujo. Sin clases, sin contenedores,
   sin `await`, sin rutas.
