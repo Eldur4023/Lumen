@@ -110,6 +110,7 @@ add_library(lumen_script STATIC
     src/lumen_script/lexer.cpp
     src/lumen_script/parser.cpp
     src/lumen_script/crypto.cpp
+    src/lumen_script/auth.cpp
     src/lumen_script/db.cpp
     src/lumen_script/value.cpp
     src/lumen_script/json_parse.cpp
