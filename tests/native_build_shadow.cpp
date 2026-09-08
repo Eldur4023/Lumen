@@ -409,6 +409,69 @@ static bool prueba_diccionarios() {
     return ok;
 }
 
+// str(x)/len(x) (natives.cpp: fn_str/fn_len), los dos unicos
+// BuiltinGlobalCall que Comprobador::tipo_provable() sabe demostrar --
+// str() sobre int/bool/float (el mismo puente a Value que usa el valor de
+// retorno de una ruta, ver Generador::valor_json) y len() sobre string y
+// sobre List<int> (LList::lumen_len(), no .size() -- los dos tienen un
+// metodo distinto de "tamaño" y el generador tiene que elegir el correcto
+// segun el tipo demostrado, no una unica llamada generica).
+static bool prueba_str_len() {
+    const std::string src =
+        "fn string describe(int n):\n"
+        "    return str(n) + \",\" + str(n > 0) + \",\" + str(1.5)\n"
+        "\n"
+        "fn int usa_str(int n):\n"
+        "    string s = describe(n)\n"
+        "    return len(s)\n"
+        "\n"
+        "fn int usa_len(int n):\n"
+        "    List<int> xs = [1, 2, 3]\n"
+        "    xs.add(n)\n"
+        "    return len(xs)\n";
+
+    SourceFile    file;
+    DiagnosticBag diag_parse;
+    Program       prog;
+    if (!parse_program(src, file, diag_parse, prog)) {
+        std::printf("FALLA (str/len): no parsea (%s)\n",
+                    diag_parse.items().empty() ? "?" : diag_parse.items().front().message.c_str());
+        return false;
+    }
+
+    FunctionSigs                  sigs = firmar(prog);
+    FunctionTable                 tabla_vm;
+    std::unique_ptr<NativeModule> nativo;
+    const auto cache_dir = std::filesystem::temp_directory_path() / "lumen_native_build_check_strlen";
+    if (!compilar_las_dos_vias(prog, sigs, tabla_vm, nativo, cache_dir)) return false;
+
+    // usa_str/usa_len son int->int, cruzan la ABI; describe (string en la
+    // frontera) no -- mismo criterio que prueba_strings().
+    if (!nativo || nativo->compiladas() != 2) {
+        std::printf("FALLA (str/len): se esperaban 2 funciones con wrapper (usa_str, usa_len), "
+                    "hay %zu\n", nativo ? nativo->compiladas() : 0);
+        return false;
+    }
+
+    bool ok = true;
+    auto comparar = [&](const char* nombre, long long arg) {
+        const Chunk& chunk = *tabla_vm[sigs.at(nombre).index];
+        long long sin_n = ejecutar(chunk, arg, &tabla_vm, nullptr);
+        long long con_n = ejecutar(chunk, arg, &tabla_vm, nativo.get());
+        if (sin_n != con_n) {
+            std::printf("  FALLA %s(%lld): bytecode=%lld nativo=%lld\n", nombre, arg, sin_n, con_n);
+            ok = false;
+        } else {
+            std::printf("  ok    %s(%lld) = %lld (bytecode y VM+nativo coinciden)\n", nombre, arg,
+                        sin_n);
+        }
+    };
+    comparar("usa_str", 42);
+    comparar("usa_str", -7);
+    comparar("usa_len", 9);
+    return ok;
+}
+
 // `require cond else otherwise`: el mismo IrStmtKind que las guardas de
 // grupo de una ruta (Emitter::check_require_like) -- probado aqui sobre una
 // funcion suelta, que ya lo puede usar sin necesitar ninguna pieza de rutas
@@ -743,6 +806,7 @@ int main() {
     if (!prueba_metodos_string()) ++fallos;
     if (!prueba_listas()) ++fallos;
     if (!prueba_diccionarios()) ++fallos;
+    if (!prueba_str_len()) ++fallos;
     if (!prueba_require()) ++fallos;
     if (!prueba_sin_return_en_todos_los_caminos()) ++fallos;
     if (!prueba_tipos_dinamicos()) ++fallos;

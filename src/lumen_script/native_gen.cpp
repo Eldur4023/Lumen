@@ -604,6 +604,28 @@ public:
                     }
                     return mit->second.retorno;
                 }
+                // Dos builtins globales puros (natives.cpp: fn_str/fn_len),
+                // el resto (sleep/render/status/text/...) o tienen efecto
+                // (escriben la respuesta, leen la peticion) o son asincronos
+                // -- fuera de alcance de tipo_provable, que solo demuestra
+                // tipos de expresiones sin efectos. `str(x)` reusa el mismo
+                // puente a Value que el valor de retorno de una ruta (ver
+                // Generador::valor_json): solo escalares, para no
+                // reimplementar Value::to_string() aqui. `len(x)` solo
+                // String/List<T> -- Dict queda fuera porque LDict no expone
+                // ningun metodo de tamaño (dict_runtime_prelude solo trae
+                // has/set/keys).
+                if (e.call_shape == IrCallShape::BuiltinGlobalCall) {
+                    if (e.call_name == "str" && e.args.size() == 1 && e.args[0].value) {
+                        auto t = tipo_provable(*e.args[0].value);
+                        if (t && es_escalar_json(t->kind())) return Type::primitive(Type::Kind::String);
+                    }
+                    if (e.call_name == "len" && e.args.size() == 1 && e.args[0].value) {
+                        auto t = tipo_provable(*e.args[0].value);
+                        if (t && (t->kind() == Type::Kind::String || t->kind() == Type::Kind::List))
+                            return Type::primitive(Type::Kind::Int);
+                    }
+                }
                 return std::nullopt;
             }
         }
@@ -954,6 +976,24 @@ public:
                     if (e.call_name == "has")
                         return expr(*e.object) + ".lumen_has(" + expr(*e.args[0].value) + ")";
                     return expr(*e.object) + ".lumen_keys()"; // "keys": sin argumentos
+                }
+
+                // str(x)/len(x) (natives.cpp: fn_str/fn_len): los dos
+                // unicos BuiltinGlobalCall que tipo_provable() sabe
+                // demostrar (ver ese caso, mas arriba). str() pasa por el
+                // mismo puente a Value que un valor de retorno de ruta
+                // (Generador::valor_json) y llama a Value::to_string(), la
+                // MISMA funcion que fn_str. len() traduce a lo que cada
+                // tipo expone (string: std::string::size(); List<T>: LList
+                // no tiene .size(), su metodo es lumen_len() -- ver
+                // list_runtime_prelude), no a una sola llamada generica.
+                if (e.call_shape == IrCallShape::BuiltinGlobalCall && e.call_name == "str")
+                    return valor_json(*e.args[0].value) + ".to_string()";
+                if (e.call_shape == IrCallShape::BuiltinGlobalCall && e.call_name == "len") {
+                    auto t = comprobador_.tipo_provable(*e.args[0].value);
+                    return t->kind() == Type::Kind::String
+                               ? "static_cast<int64_t>(" + expr(*e.args[0].value) + ".size())"
+                               : expr(*e.args[0].value) + ".lumen_len()";
                 }
 
                 // BuiltinMethodCall (metodos de string, ver

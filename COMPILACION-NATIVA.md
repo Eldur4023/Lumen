@@ -1222,6 +1222,33 @@ html()`, `return status(204)`, guarda con `redirect(url, código)`, `return redi
 `Resultado` de la prueba ahora compara también la cabecera `Location`, no solo status+cuerpo. 79/79
 del corpus y las 8 suites de `ctest` en verde.
 
+**`str()`/`len()`: los dos primeros `BuiltinGlobalCall` puros que demuestra `tipo_provable()`.** No es
+una pieza de rutas — beneficia a cualquier función/método nativo, aunque nació al querer escribir
+`text("resultado: " + str(n))` en una ruta. `str(x)` solo acepta un escalar (reusa el mismo puente a
+`Value` que el valor de retorno de una ruta, `Generador::valor_json()`, y llama a `Value::to_string()`
+— la MISMA función que `fn_str`, así que el formato de un `float`/`bool` convertido a texto coincide
+por construcción). `len(x)` solo `string`/`List<T>` — nunca `Dict` (`LDict` no expone ningún método de
+tamaño, ver `dict_runtime_prelude`) — y traduce a lo que cada tipo expone de verdad: `.size()` para
+`std::string`, pero `.lumen_len()` para `LList<T>` (no tiene `.size()`), una elección real según el
+tipo demostrado, no una única llamada genérica que hubiera compilado por casualidad para uno de los
+dos y fallado en silencio para el otro.
+
+**Bug real encontrado escribiendo la prueba, corregido antes de commitear — `Value` no siempre estaba
+declarado.** `str()` puede aparecer en CUALQUIER función/método nativo, no solo en una ruta — pero el
+`#include <lumen_script/value.hpp>` + `using lumen_script::Value;` que necesita se anteponía
+"solo si el módulo tiene alguna ruta" (`con_rutas`, ver el incremento del enlazado real, más arriba):
+un módulo con una función que usa `str()` y NINGUNA ruta fallaba a compilar con `'Value' has not been
+declared`, confirmado escribiendo `tests/native_build_shadow.cpp::prueba_str_len()` (funciones
+sueltas, sin ninguna ruta en el programa de prueba) antes de arreglarlo. Es la misma familia de
+descuido que las dos correcciones críticas anteriores: una condición de guarda que servía para el
+caso que la motivó (rutas) dejaba de servir en cuanto algo la reutilizó desde otro contexto (una
+función suelta) sin que nadie volviera a mirarla. La corrección: el `include`/`using` de `Value` (y el
+enlazado contra `liblumen_script.a`, y el `-I` que lo hace posible) ahora son incondicionales siempre
+que se vaya a compilar algo — solo `<lumen/request.hpp>`/`<lumen/response.hpp>`/
+`route_runtime_prelude()` siguen exclusivos de `con_rutas`, porque esos sí son privativos de una ruta.
+`prueba_str_len()` queda como regresión permanente en `tests/native_build_shadow.cpp`. 79/79 del
+corpus y las 8 suites de `ctest`, incluida `native_route_shadow`, en verde tras la corrección.
+
 ### Fase 5 — Asincronía y base de datos
 - `await` → `co_await` sobre los awaitables existentes; transacciones, pool, `last_id`.
 - **Aceptación:** el banco de pruebas completo (`bench/run_all.sh`) corre en modo `--native`
