@@ -650,9 +650,51 @@ los casos. Es la primera vez que este documento valida su tesis central con el c
 en vez de con código escrito a mano para la ocasión (ese PoC, en `experiments/native_poc/`, sigue
 siendo válido como primera señal, pero éste es el generador de verdad).
 
-Pendiente de esta fase: invocar el compilador de C++ desde el propio `lumen` (no sólo desde una
-prueba) y enlazar el resultado — hoy `generar_funcion_nativa` produce el texto C++, pero nada
-dentro del binario `lumen` lo compila ni lo carga todavía.
+**Hecho también: invocar el compilador desde el propio `lumen` y enlazar el resultado.**
+`include/lumen_script/native_abi.hpp` fija la ABI que cruza el límite de `dlopen`: un único POD
+(`NativeValue`, con una etiqueta y una unión int64_t/double/bool) y una única firma de función
+(`CompiledFn = NativeValue(*)(const NativeValue*, int32_t)`) que vale para cualquier función
+generada sin importar su aridad o tipos reales — así `dlsym()` no necesita conocer la firma real
+de cada una. `generar_funcion_nativa` ahora también produce, junto al cuerpo de la función, un
+wrapper `extern "C"` con esa firma fija que desempaqueta cada argumento y empaqueta el resultado.
+
+`include/lumen_script/native_build.hpp` + `src/lumen_script/native_build.cpp`:
+`compilar_nativo(prog, sigs, cache_dir, aviso)` recorre las funciones del programa, genera las que
+puede, ensambla un único `.cpp`, invoca `g++ -shared -fPIC` de verdad como subproceso, y carga la
+biblioteca resultante con `dlopen()` — dejando resuelto, por `dlsym()`, un `CompiledFn` por cada
+función que se compiló. Un fallo aquí (falta `g++`, un error de enlazado, `dlopen` sin suerte)
+**nunca** tumba la compilación del módulo: es una degradación a bytecode para todo el módulo, con
+el motivo en `Module::native_aviso` para que `main.cpp` lo imprima como advertencia, nunca en
+silencio — el mismo principio de "no hay generación parcial silenciosa" que rige el generador.
+
+La VM (`vm.hpp`/`vm.cpp`) ahora recibe una tabla `CompiledFn` opcional, indexada igual que
+`FunctionTable` (por `FnSig::index`), junto a la de siempre. Dentro de `Op::CallFunction`, si esa
+tabla tiene un puntero para el índice llamado, la llamada entera se desvía a código nativo — sin
+abrir marco de intérprete — y el resultado se empuja a la pila exactamente donde lo habría dejado
+un `Op::Return` normal: el resto del bytecode que la invocó no distingue una cosa de la otra. Es
+el modo mixto que describe la sección 11, aplicado hoy a funciones sueltas (`build_routes` conecta
+la tabla nativa del módulo a las tres rutas que arrancan una VM: HTTP normal, `ws` y `sse`; también
+el manejador de `on error` en `main.cpp`). Quedan sin conectar, a propósito y documentado aquí para
+no perderlo de vista: las reglas de `validate:` (`bind_body`/`prepare_args`) y las expresiones de
+plantilla (`render_plantilla`) — ninguna de las dos es parte del criterio de aceptación de esta
+fase y ambas siguen sirviéndose con bytecode aunque llamen a una función que sí se compiló nativa.
+
+El binario `lumen` suma `--native` a sus opciones (`main.cpp`): compila con `compile(inputs, diags,
+/*native=*/true)`, apaga la recarga en caliente igual que `--no-watch` (recompilar con `g++` en
+cada guardado no es una experiencia de desarrollo, tal como dice la sección 11), y añade una línea
+al informe de arranque (`lumen: --native: N funcion(es) compilada(s) a codigo nativo`). El cacheado
+por hash de fuentes que describe la sección 11 queda pendiente para cuando de verdad haga falta —
+hoy `.lumen-native/` se regenera en cada arranque.
+
+**Validado con el servidor real, no solo con una prueba de biblioteca.** `ctest -R
+native_build_shadow` cubre lo que `native_gen_shadow` no cubre: llama a `compilar_nativo()` de
+verdad (invoca `g++`, `dlopen`, `dlsym`) y compara, para `fib`/`cuenta_primos`, `VM::start()` con y
+sin la tabla nativa conectada — es la prueba de que el despacho dentro de `Op::CallFunction` está
+bien enlazado, no solo que el generador produce C++ correcto. Y, más allá de cualquier prueba:
+sirviendo `bench/lumen/app.lum` de verdad con `lumen ... --native` y con `lumen ... --no-watch`
+(bytecode) y comparando las respuestas HTTP de `/compute/fib/:n` y `/compute/primes/:n` para varias
+entradas, coinciden exactamente — y `fib(32)` bajó de ~0.47s a ~0.002s por petición, un salto de
+~250× medido en el proceso real sirviendo HTTP, no en un microbenchmark aislado.
 
 **Rendimiento, comprobado de forma ligera**: el C++ que produce `generar_funcion_nativa` para
 `fib`/`cuenta_primos` es, salvo el prefijo `l_` de cada nombre, el mismo que el PoC escrito a

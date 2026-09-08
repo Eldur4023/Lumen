@@ -119,12 +119,13 @@ add_library(lumen_script STATIC
     src/lumen_script/natives.cpp
     src/lumen_script/emitter.cpp
     src/lumen_script/native_gen.cpp
+    src/lumen_script/native_build.cpp
     src/lumen_script/vm.cpp
     src/lumen_script/autotest.cpp
     src/lumen_script/project.cpp
 )
 target_include_directories(lumen_script PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(lumen_script PUBLIC lumen)
+target_link_libraries(lumen_script PUBLIC lumen ${CMAKE_DL_LIBS})
 
 if(LUMEN_SQLITE)
     find_path(SQLITE3_INC sqlite3.h)
@@ -218,6 +219,13 @@ add_test(NAME emit_ir_shadow COMMAND prueba_emit_ir)
 add_executable(prueba_native_gen tests/native_gen_shadow.cpp)
 target_link_libraries(prueba_native_gen PRIVATE lumen_script)
 add_test(NAME native_gen_shadow COMMAND prueba_native_gen)
+
+# La otra mitad: compilar_nativo() de verdad (invoca g++, dlopen, dlsym) y el
+# despacho dentro de la VM (VM::start con la tabla nativa conectada) dan lo
+# mismo que el bytecode -- ver el comentario en tests/native_build_shadow.cpp.
+add_executable(prueba_native_build tests/native_build_shadow.cpp)
+target_link_libraries(prueba_native_build PRIVATE lumen_script)
+add_test(NAME native_build_shadow COMMAND prueba_native_build)
 
 # El traductor de marcadores de postgres es una funcion pura: se prueba sin
 # servidor incluyendo el .cpp del driver, para probar EL codigo y no una copia.

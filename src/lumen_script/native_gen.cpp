@@ -40,6 +40,26 @@ std::string tipo_cpp(const Type& t) {
 // mantener sincronizada con el estandar.
 std::string nombre_cpp(const std::string& lumen) { return "l_" + lumen; }
 
+// Ver native_abi.hpp: campo de la union de NativeValue que corresponde a
+// cada Type::Kind soportado, y la etiqueta que hay que ponerle.
+std::string campo_abi(Type::Kind k) {
+    switch (k) {
+        case Type::Kind::Int:   return "i";
+        case Type::Kind::Float: return "d";
+        case Type::Kind::Bool:  return "b";
+        default: return ""; // inalcanzable: tipo_soportado() ya lo descarto
+    }
+}
+
+std::string etiqueta_abi(Type::Kind k) {
+    switch (k) {
+        case Type::Kind::Int:   return "NativeValue::Tag::Int";
+        case Type::Kind::Float: return "NativeValue::Tag::Float";
+        case Type::Kind::Bool:  return "NativeValue::Tag::Bool";
+        default: return "";
+    }
+}
+
 // ── Comprobacion: ¿esta esto enteramente dentro de lo que compila esta fase? ──
 
 bool expr_compilable(const IrExpr& e);
@@ -314,7 +334,51 @@ std::optional<FuncionNativa> generar_funcion_nativa(const FnDecl& fn, const IrBl
     for (size_t i = 0; i < fn.params.size(); ++i)
         gen.registrar(static_cast<int>(i), fn.params[i].name);
     out.cuerpo_cpp = "{\n" + gen.block(body, 1) + "}";
+
+    // El wrapper de ABI fija (ver native_abi.hpp): descomprime args[i] al
+    // tipo real de cada parametro, llama a la funcion de arriba, y empaqueta
+    // el resultado -- o, si la funcion es void, un NativeValue::Tag::Int a 0
+    // que nadie mira (el llamante conoce el tipo de retorno declarado, igual
+    // que ya conoce la aridad, asi que un valor void nunca se desempaqueta).
+    out.simbolo_abi = "lumen_native_" + fn.name;
+    std::string cuerpo_wrapper = "    (void)argc;\n";
+    for (size_t i = 0; i < fn.params.size(); ++i) {
+        const Type t = Type::from_declared(fn.params[i].type);
+        cuerpo_wrapper += "    " + tipo_cpp(t) + " " + nombre_cpp(fn.params[i].name) +
+                          " = args[" + std::to_string(i) + "]." + campo_abi(t.kind()) + ";\n";
+    }
+    const Type ret = Type::from_declared(fn.return_type);
+    const std::string llamada = nombre_cpp(fn.name) + "(" + [&] {
+        std::string s;
+        for (size_t i = 0; i < fn.params.size(); ++i) {
+            if (i) s += ", ";
+            s += nombre_cpp(fn.params[i].name);
+        }
+        return s;
+    }() + ")";
+    if (ret.kind() == Type::Kind::Void) {
+        cuerpo_wrapper += "    " + llamada + ";\n"
+                          "    NativeValue salida; salida.tag = NativeValue::Tag::Int; salida.i = 0;\n"
+                          "    return salida;\n}";
+    } else {
+        cuerpo_wrapper += "    NativeValue salida; salida.tag = " + etiqueta_abi(ret.kind()) +
+                          "; salida." + campo_abi(ret.kind()) + " = " + llamada + ";\n"
+                          "    return salida;\n}";
+    }
+    out.wrapper_cpp = "extern \"C\" NativeValue " + out.simbolo_abi +
+                      "(const NativeValue* args, int32_t argc) {\n" +
+                      cuerpo_wrapper;
     return out;
+}
+
+std::string abi_prelude() {
+    // Identico, campo a campo, a la definicion de include/lumen_script/native_abi.hpp.
+    return
+        "struct NativeValue {\n"
+        "    enum class Tag : int32_t { Int, Float, Bool } tag = Tag::Int;\n"
+        "    union { int64_t i; double d; bool b; };\n"
+        "};\n"
+        "using NativeFn = NativeValue (*)(const NativeValue*, int32_t);\n";
 }
 
 } // namespace lumen_script

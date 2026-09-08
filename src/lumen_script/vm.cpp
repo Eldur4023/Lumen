@@ -52,11 +52,32 @@ bool compare(const Value& a, const Value& b, Op op, bool& ok) {
     return false;
 }
 
+// Un valor de Lumen Script solo puede ser Int/Float/Bool al cruzar hacia
+// nativo -- generar_funcion_nativa() ya garantiza que una funcion solo se
+// ofrece por esta via si todos sus parametros y su retorno son uno de esos
+// tres, asi que el tipo real siempre coincide con el que el wrapper espera.
+NativeValue a_nativevalue(const Value& v) {
+    NativeValue n;
+    if (v.is_float()) { n.tag = NativeValue::Tag::Float; n.d = v.as_float(); }
+    else if (v.is_bool()) { n.tag = NativeValue::Tag::Bool; n.b = v.as_bool(); }
+    else { n.tag = NativeValue::Tag::Int; n.i = v.as_int(); }
+    return n;
+}
+
+Value de_nativevalue(const NativeValue& n) {
+    switch (n.tag) {
+        case NativeValue::Tag::Float: return Value::real(n.d);
+        case NativeValue::Tag::Bool:  return Value::boolean(n.b);
+        default:                      return Value::integer(n.i);
+    }
+}
+
 } // namespace
 
 VM::Result VM::start(const Chunk& chunk, std::vector<Value> params, NativeCtx& ctx,
-                     const FunctionTable* functions) {
+                     const FunctionTable* functions, const std::vector<CompiledFn>* native) {
     functions_ = functions;
+    native_    = native;
     frames_.clear();
     stack_.clear();
 
@@ -515,10 +536,25 @@ VM::Result VM::run_until_error(NativeCtx& ctx) {
                                 std::to_string(kMaxFrames) + " llamadas anidadas",
                                 in.loc);
 
-                const Chunk& callee = *(*functions_)[index];
-
                 std::vector<Value> args(static_cast<size_t>(argc));
                 for (int i = argc; i-- > 0;) args[static_cast<size_t>(i)] = pop();
+
+                // Modo mixto de --native (Fase 2): si esta funcion se compilo
+                // a codigo nativo, se llama directamente y no se abre marco
+                // de interprete ninguno -- el resultado acaba en la pila
+                // exactamente igual que tras un Op::Return normal, asi que el
+                // resto del bytecode que la invoco no distingue una cosa de
+                // la otra.
+                if (native_ && index < native_->size() && (*native_)[index]) {
+                    std::vector<NativeValue> nargs(args.size());
+                    for (size_t i = 0; i < args.size(); ++i) nargs[i] = a_nativevalue(args[i]);
+                    NativeValue r = (*native_)[index](nargs.data(),
+                                                       static_cast<int32_t>(nargs.size()));
+                    push(de_nativevalue(r));
+                    break;
+                }
+
+                const Chunk& callee = *(*functions_)[index];
 
                 Frame nf;
                 nf.chunk       = &callee;

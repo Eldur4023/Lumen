@@ -1317,6 +1317,11 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
     // El Module posee la tabla y sobrevive a cualquier peticion en vuelo: el
     // dispatcher mantiene vivo su shared_ptr mientras el handler se ejecuta.
     const FunctionTable* fn_table = &mod.functions;
+    // --native (Fase 2): resuelto una sola vez, como fn_table -- valido
+    // porque compile() ya termino de compilar nativo antes de llamar aqui
+    // (ver el comentario en Module::native, project.hpp).
+    const std::vector<CompiledFn>* native_table =
+        mod.native ? &mod.native->por_indice : nullptr;
     // Las plantillas viven en el modulo, como las funciones: el puntero es
     // estable mientras el modulo lo este, y el swap de recarga cambia los dos
     // a la vez.
@@ -1368,7 +1373,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
 
             mod.router.add_internal("GET", r.pattern,
                 lumen::App::make_ws_handler(
-                    [ws_chunk, ws_binds, ws_where, auth, fn_table, tpl_table]
+                    [ws_chunk, ws_binds, ws_where, auth, fn_table, native_table, tpl_table]
                     (lumen::WSConnection conn, lumen::Request& req,
                      lumen::Response& res) -> lumen::Task<void> {
                         NativeCtx    ctx{req, res};
@@ -1384,7 +1389,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
                         if (!prepare_args(ws_binds, fn_table, req, res, ctx, args)) co_return;
 
                         VM         vm;
-                        VM::Result result = vm.start(*ws_chunk, std::move(args), ctx, fn_table);
+                        VM::Result result = vm.start(*ws_chunk, std::move(args), ctx, fn_table, native_table);
 
                         while (result.status == VM::Status::Suspended) {
                             Value produced = Value::null();
@@ -1451,7 +1456,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
             ++mod.vm_routes;
             std::string sse_where = "SSE " + r.pattern;
             mod.router.add_internal("GET", r.pattern,
-                [sse_chunk, sse_binds, sse_where, auth, fn_table, tpl_table](lumen::Request& req,
+                [sse_chunk, sse_binds, sse_where, auth, fn_table, native_table, tpl_table](lumen::Request& req,
                                                         lumen::Response& res)
                     -> lumen::Task<void> {
                     NativeCtx    ctx{req, res};
@@ -1471,7 +1476,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
                     ctx.response_written = true;
 
                     VM         vm;
-                    VM::Result result = vm.start(*sse_chunk, std::move(args), ctx, fn_table);
+                    VM::Result result = vm.start(*sse_chunk, std::move(args), ctx, fn_table, native_table);
 
                     while (result.status == VM::Status::Suspended) {
                         Value produced = Value::null();
@@ -1544,7 +1549,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
 
         std::string where = r.method + " " + r.pattern;
         mod.router.add_internal(r.method, r.pattern,
-            [chunk, binds, where, auth, needs_upload, fn_table, tpl_table](lumen::Request& req, lumen::Response& res)
+            [chunk, binds, where, auth, needs_upload, fn_table, native_table, tpl_table](lumen::Request& req, lumen::Response& res)
                 -> lumen::Task<void> {
                 NativeCtx    ctx{req, res};
                 ctx.plantillas = tpl_table;
@@ -1574,7 +1579,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
                 VM  own_vm;
                 VM& vm = chunk->has_await ? own_vm : shared_vm;
 
-                VM::Result result = vm.start(*chunk, std::move(args), ctx, fn_table);
+                VM::Result result = vm.start(*chunk, std::move(args), ctx, fn_table, native_table);
 
                 // El VM no sabe esperar: cada vez que se detiene, el co_await
                 // de verdad ocurre aqui, sobre el motor, y se le devuelve el
@@ -1628,7 +1633,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
 // ─── Compilacion ─────────────────────────────────────────────────────────────
 
 std::shared_ptr<Module> compile(const std::vector<fs::path>& inputs,
-                                DiagnosticBag& diags) {
+                                DiagnosticBag& diags, bool native) {
     auto mod = std::make_shared<Module>();
     std::error_code ec;
 
@@ -1689,6 +1694,16 @@ std::shared_ptr<Module> compile(const std::vector<fs::path>& inputs,
         // metodos y constructores—, y solo despues los cuerpos.  Asi cualquiera
         // puede llamar a cualquiera sin importar el orden de declaracion.
         auto fns  = build_functions(*mod, diags);
+        mod->function_sigs = fns;
+
+        // --native (Fase 2): antes de construir rutas, para que puedan
+        // capturar mod->native.get() ya resuelto -- ver el comentario sobre
+        // NativeModule en project.hpp. Solo si lo demas compilo limpio: no
+        // tiene sentido invocar g++ sobre un programa que de todas formas no
+        // se va a publicar.
+        if (native && diags.empty())
+            mod->native = compilar_nativo(mod->program, fns, ".lumen-native", mod->native_aviso);
+
         auto sigs = build_class_signatures(*mod, diags);
         emit_class_bodies(*mod, sigs, fns, diags);
 

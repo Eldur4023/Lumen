@@ -33,6 +33,16 @@ struct FuncionNativa {
     std::string nombre_lumen;    // el nombre tal como aparece en el .lum
     std::string firma_cpp;       // "int64_t l_fib(int64_t l_n)"
     std::string cuerpo_cpp;      // "{ ... }", con llaves, indentado
+
+    // La funcion de arriba tiene la firma C++ que le corresponde por sus
+    // tipos reales -- util para ensamblar un .cpp legible, pero inutil para
+    // cargarla con dlsym() sin conocer esa firma de antemano. `simbolo_abi`
+    // es el nombre exportado `extern "C"` de un wrapper con la firma fija
+    // NativeFn (ver native_abi.hpp), y `wrapper_cpp` es su definicion
+    // completa: descomprime cada NativeValue al tipo real del parametro,
+    // llama a la funcion de arriba, y empaqueta el resultado de vuelta.
+    std::string simbolo_abi;     // "lumen_native_fib"
+    std::string wrapper_cpp;     // definicion extern "C" completa del wrapper
 };
 
 // `nombre_por_indice[i]` es el nombre Lumen de la funcion de indice `i` en
@@ -41,5 +51,13 @@ struct FuncionNativa {
 // nombre, porque el IR solo lleva el indice ya resuelto.
 std::optional<FuncionNativa> generar_funcion_nativa(const FnDecl& fn, const IrBlock& body,
                                                      const std::vector<std::string>& nombre_por_indice);
+
+// El texto C++ de la definicion de NativeValue, identico al de
+// native_abi.hpp: hace falta duplicarlo dentro del .cpp que se compila a
+// biblioteca compartida porque dlopen no comparte cabeceras del proyecto con
+// la biblioteca cargada, solo un ABI compatible en tiempo de enlazado -- y
+// dos definiciones textualmente identicas de un tipo POD lo son. Quien
+// ensambla el fichero final (native_build.cpp) antepone esto una sola vez.
+std::string abi_prelude();
 
 } // namespace lumen_script

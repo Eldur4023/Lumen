@@ -7,3 +7,7 @@ build/
 # Artefactos que deja la suite de pruebas.
 pruebas-suite.db*
 bench
+
+# --native (COMPILACION-NATIVA.md, seccion 11): el .cpp/.so que genera
+# compilar_nativo(), regenerados en cada arranque con --native.
+.lumen-native/

@@ -9,6 +9,8 @@
 #include <lumen/router.hpp>
 #include "bytecode.hpp"
 #include "ast.hpp"
+#include "emitter.hpp"
+#include "native_build.hpp"
 #include "plantilla.hpp"
 #include "diagnostic.hpp"
 
@@ -26,6 +28,19 @@ struct Module {
 
     // Funciones de usuario compiladas, indexadas por orden de declaracion.
     FunctionTable functions;
+
+    // Firmas de esas mismas funciones -- solo se guarda para poder ofrecerla
+    // a compilar_nativo() sin tener que reconstruirla; el resto del modulo
+    // ya no la necesita despues de compilar.
+    FunctionSigs function_sigs;
+
+    // --native (Fase 2 de COMPILACION-NATIVA.md): nulo salvo que se haya
+    // pedido `--native` y al menos una funcion se haya podido compilar. Un
+    // aviso no vacio en `native_aviso` es una degradacion parcial o total a
+    // bytecode -- nunca un motivo para no publicar el modulo -- que quien
+    // arranca el binario decide como mostrar.
+    std::unique_ptr<NativeModule> native;
+    std::string                   native_aviso;
 
     // Plantillas compiladas, indexadas por el orden en que el emisor las
     // encontro.  Cada render() del fuente tiene la suya, compilada contra las
@@ -66,8 +81,15 @@ bool resolve_inputs(const std::vector<std::string>& args,
 // los SourceFile que este Module posee, asi que destruirlo antes de formatear
 // los diagnosticos dejaria punteros colgando.  El exito se comprueba con
 // `diags.empty()`, y un modulo con errores simplemente no se publica.
+//
+// `native`, si es verdad, ademas intenta compilar a codigo nativo (Fase 2 de
+// --native) las funciones (`fn`) del programa que lo permitan, DESPUES de
+// que el resto compile sin errores -- nunca es lo que hace fallar
+// `diags.empty()`: un aviso queda en `Module::native_aviso` y las funciones
+// que no se pudieron compilar se sirven con bytecode, igual que si
+// `native` fuera falso.
 std::shared_ptr<Module> compile(const std::vector<std::filesystem::path>& inputs,
-                                DiagnosticBag& diags);
+                                DiagnosticBag& diags, bool native = false);
 
 // Formatea los diagnosticos de un intento fallido usando los ficheros leidos.
 std::string format_errors(const DiagnosticBag& diags,
