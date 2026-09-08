@@ -1299,10 +1299,21 @@ con `lumen_valor_de()` (`route_runtime_prelude()`): cuatro sobrecargas escalares
 sobre `LList<T>` que recorre con `lumen_len()`/`lumen_get()` y llama a `lumen_valor_de()` sobre cada
 elemento — nunca necesita más de un nivel de recursión real porque
 `tipo_elemento_contenedor_soportado` ya prohíbe `List<List<..>>`. `Comprobador::es_valor_json()`
-ahora acepta `Type::Kind::List` además de los escalares. `Dict<V>` como valor de respuesta sigue
-fuera (`LDict` no expone iterar sus pares). `tests/native_route_shadow.cpp` gana una ruta
-(`/rango/:n`, construye una `List<int>` con un bucle y la devuelve dentro de un dict junto a un
+ahora acepta `Type::Kind::List` además de los escalares. `tests/native_route_shadow.cpp` gana una
+ruta (`/rango/:n`, construye una `List<int>` con un bucle y la devuelve dentro de un dict junto a un
 escalar) como regresión permanente. 79/79 del corpus y las 8 suites de `ctest` en verde.
+
+**Lo mismo, cerrado también para `Dict<V>`.** `LDict` no exponía NINGÚN acceso indexado a sus pares
+(a propósito: leer por clave es ambiguo, ver el comentario de `tipo_soportado`) — pero recorrer
+TODOS los pares no tiene esa ambigüedad, así que `dict_runtime_prelude()` gana tres métodos nuevos
+sin ningún equivalente en el lenguaje Lumen (`lumen_len()`, `lumen_key_at(i)`, `lumen_val_at(i)`,
+solo para este puente) y `lumen_valor_de()` una sobrecarga sobre `LDict<V>` que los usa para construir
+un `Value::Dict` en el MISMO orden de inserción (`LDict`, igual que `Value::Dict`, es un vector, no
+un `map`). `Comprobador::es_valor_json()`/`Generador::valor_json()` tratan `List`/`Dict` igual a
+partir de aquí. `tests/native_route_shadow.cpp` gana una ruta (`/contadores/:n`, construye un
+`Dict<string,int>` con un bucle, con una clave calculada vía `"c" + str(i)` — ejercitando de paso la
+concatenación con `str()` recién añadido) como regresión permanente. 79/79 del corpus y las 8 suites
+de `ctest` en verde.
 
 ### Fase 5 — Asincronía y base de datos
 - `await` → `co_await` sobre los awaitables existentes; transacciones, pool, `last_id`.

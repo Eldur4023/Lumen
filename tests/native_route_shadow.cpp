@@ -115,7 +115,16 @@ int main() {
         "    while i < n:\n"
         "        xs.add(i * i)\n"
         "        i = i + 1\n"
-        "    return { \"n\": n, \"cuadrados\": xs }\n";
+        "    return { \"n\": n, \"cuadrados\": xs }\n"
+        "\n"
+        "get endpoint(\"/contadores/:n\", int n):\n"
+        "    require n >= 0 and n <= 10 else status(400)\n"
+        "    Dict<string, int> d = {\"base\": n}\n"
+        "    int i = 0\n"
+        "    while i < n:\n"
+        "        d[\"c\" + str(i)] = i * 2\n"
+        "        i = i + 1\n"
+        "    return { \"total\": d }\n";
 
     const auto dir  = std::filesystem::temp_directory_path() / "lumen_native_route_check";
     std::error_code ec;
@@ -230,6 +239,14 @@ int main() {
     // heterogeneo).
     comparar("List<int> ya construida en el retorno", "/rango/0");
     comparar("List<int> ya construida en el retorno", "/rango/5");
+
+    // Igual que la List<T> de arriba, pero un Dict<string,int> ya
+    // construido: lumen_valor_de() recorre TODOS los pares con
+    // lumen_len()/lumen_key_at()/lumen_val_at() (nuevos en LDict, sin
+    // equivalente en el lenguaje -- solo para este puente), preservando el
+    // orden de insercion (LDict es un vector, igual que Value::Dict).
+    comparar("Dict<string,int> ya construido en el retorno", "/contadores/0");
+    comparar("Dict<string,int> ya construido en el retorno", "/contadores/4");
 
     // Bug real, encontrado probando esto a proposito (no una precaucion
     // especulativa): una ruta nativa no tiene NINGUN wrapper de la ABI (a

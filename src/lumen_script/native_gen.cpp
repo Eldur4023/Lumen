@@ -239,12 +239,14 @@ public:
     // DictLit/ListLit tenga un tipo homogeneo -- un cuerpo JSON real casi
     // nunca lo es (bench/lumen/app.lum: un dict con int/string/double/bool
     // mezclados). Alcance: escalares, DictLit/ListLit anidados
-    // (recursivamente) de eso mismo, y una List<T> YA construida (un Ident,
-    // por ejemplo) -- convertida iterando LList<T> con lumen_valor_de()
-    // (route_runtime_prelude), nunca mas de un nivel porque
-    // tipo_elemento_contenedor_soportado ya prohibe List<List<..>>. Dict<V>
-    // como valor de respuesta queda fuera (LDict no expone iterar sus
-    // pares, solo has/set/keys).
+    // (recursivamente) de eso mismo, y una List<T>/Dict<V> YA construida
+    // (un Ident, por ejemplo) -- convertidas iterando LList<T>/LDict<V> con
+    // lumen_valor_de() (route_runtime_prelude), nunca mas de un nivel
+    // porque tipo_elemento_contenedor_soportado ya prohibe List<List<..>>/
+    // Dict<string,List<..>>. Iterar TODOS los pares de un LDict es una
+    // operacion bien definida (a diferencia de "leer una clave que puede
+    // faltar", que sigue fuera: vease el comentario de tipo_soportado), asi
+    // que no reabre esa ambiguedad.
     bool es_valor_json(const IrExpr& e) const {
         if (e.kind == IrExprKind::DictLit) {
             if (e.entries.empty()) return false;
@@ -263,7 +265,8 @@ public:
             return true;
         }
         auto t = tipo_provable(e);
-        return t && (es_escalar_json(t->kind()) || t->kind() == Type::Kind::List);
+        return t && (es_escalar_json(t->kind()) || t->kind() == Type::Kind::List ||
+                    t->kind() == Type::Kind::Dict);
     }
 
     // `require cond else status(N)` (el patron de guarda mas comun, ver el
@@ -1171,7 +1174,8 @@ public:
             case Type::Kind::Float:  return "Value::real(" + expr(e) + ")";
             case Type::Kind::Bool:   return "Value::boolean(" + expr(e) + ")";
             case Type::Kind::String: return "Value::str(" + expr(e) + ")";
-            case Type::Kind::List:   return "lumen_valor_de(" + expr(e) + ")";
+            case Type::Kind::List:
+            case Type::Kind::Dict:   return "lumen_valor_de(" + expr(e) + ")";
             default: return ""; // inalcanzable: es_valor_json() ya lo descarto
         }
     }
@@ -1918,6 +1922,16 @@ std::string dict_runtime_prelude() {
         "        for (const auto& kv : b_->v) ks.push_back(kv.first);\n"
         "        return LList<std::string>(std::move(ks));\n"
         "    }\n"
+        // Sin equivalente Lumen (ningun `d[k]`/metodo del lenguaje resuelve
+        // aqui, ver el comentario de arriba sobre por que leer por indice
+        // sigue fuera): SOLO para lumen_valor_de() (route_runtime_prelude),
+        // el puente a Value del valor de retorno de una ruta -- recorrer
+        // TODOS los pares es una operacion bien definida (a diferencia de
+        // "leer una clave que puede faltar"), asi que no reabre la
+        // ambiguedad que motivo dejar fuera la lectura por clave.
+        "    int64_t lumen_len() const { return (int64_t)b_->v.size(); }\n"
+        "    const std::string& lumen_key_at(int64_t i) const { return b_->v[(size_t)i].first; }\n"
+        "    const V& lumen_val_at(int64_t i) const { return b_->v[(size_t)i].second; }\n"
         "private:\n"
         "    void rel() { if (b_ && --b_->rc == 0) delete b_; }\n"
         "    LDictBox<V>* b_;\n"
@@ -1960,6 +1974,13 @@ std::string route_runtime_prelude() {
         "    Value::List out;\n"
         "    for (int64_t i = 0; i < l.lumen_len(); ++i) out.push_back(lumen_valor_de(l.lumen_get(i)));\n"
         "    return Value::list(std::move(out));\n"
+        "}\n"
+        "template <class V>\n"
+        "Value lumen_valor_de(const LDict<V>& d) {\n"
+        "    Value::Dict out;\n"
+        "    for (int64_t i = 0; i < d.lumen_len(); ++i)\n"
+        "        out[d.lumen_key_at(i)] = lumen_valor_de(d.lumen_val_at(i));\n"
+        "    return Value::dict(std::move(out));\n"
         "}\n";
 }
 
