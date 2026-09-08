@@ -1,5 +1,6 @@
 #include <lumen_script/native_gen.hpp>
 
+#include <cstdio>
 #include <map>
 #include <sstream>
 
@@ -10,6 +11,15 @@ namespace {
 // tabla de §7. `?` (optional) haria falta empaquetarlo (std::optional<T> o
 // un centinela) y esta fase no lo cubre todavia: una funcion con un
 // parametro/campo/retorno opcional se queda en bytecode por ahora.
+//
+// `string` entra aqui como std::string por VALOR, no con el refcount
+// intrusivo que describe §8 para listas/diccionarios/instancias -- porque en
+// Lumen Script una cadena es inmutable (concatenar produce una cadena nueva,
+// nunca muta la existente), asi que compartirla o copiarla es exactamente lo
+// mismo desde fuera: no hay manera de observar la diferencia. Compartir por
+// refcount es una optimizacion de rendimiento reservada para cuando haga
+// falta (la Fase 7 aplica el mismo razonamiento a clases, mediante analisis
+// de escape); por ahora, correcto antes que rapido.
 bool tipo_soportado(const Type& t) {
     if (t.is_optional()) return false;
     switch (t.kind()) {
@@ -17,20 +27,59 @@ bool tipo_soportado(const Type& t) {
         case Type::Kind::Float:
         case Type::Kind::Bool:
         case Type::Kind::Void:
+        case Type::Kind::String:
             return true;
         default:
             return false;
     }
 }
 
+// Subconjunto de tipo_soportado() que puede cruzar la ABI fija de
+// native_abi.hpp (NativeValue solo tiene un int64_t/double/bool en su
+// union): una funcion cuyos parametros y retorno caen todos aqui puede
+// recibir un wrapper `extern "C"` y ser invocada desde la VM; una que use
+// `string` en su frontera todavia no -- pero SI se genera su cuerpo C++
+// (ver generar_funcion_nativa), asi que otra funcion nativa que la llame
+// directamente (sin pasar por la ABI) se beneficia igual. Extender la ABI
+// para que tambien lleve cadenas queda para cuando una funcion con `string`
+// en la frontera sea, ella misma, el objetivo de una llamada desde bytecode.
+bool tipo_abi_soportado(const Type& t) {
+    return tipo_soportado(t) && t.kind() != Type::Kind::String;
+}
+
 std::string tipo_cpp(const Type& t) {
     switch (t.kind()) {
-        case Type::Kind::Int:   return "int64_t";
-        case Type::Kind::Float: return "double";
-        case Type::Kind::Bool:  return "bool";
-        case Type::Kind::Void:  return "void";
+        case Type::Kind::Int:    return "int64_t";
+        case Type::Kind::Float:  return "double";
+        case Type::Kind::Bool:   return "bool";
+        case Type::Kind::Void:   return "void";
+        case Type::Kind::String: return "std::string";
         default: return ""; // inalcanzable si tipo_soportado() dio el visto bueno
     }
+}
+
+// Escapa una cadena Lumen para que quepa, literal, en un fichero .cpp.
+std::string literal_string(const std::string& s) {
+    std::string out = "\"";
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\t': out += "\\t";  break;
+            case '\r': out += "\\r";  break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\x%02x", c);
+                    out += buf;
+                } else {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+    out += "\"";
+    return out;
 }
 
 // Prefijo fijo para todo identificador generado (variables, parametros,
@@ -71,12 +120,12 @@ bool expr_compilable(const IrExpr& e) {
         case IrExprKind::IntLit:
         case IrExprKind::FloatLit:
         case IrExprKind::BoolLit:
+        case IrExprKind::StringLit:
             return true;
 
-        // Sin representacion en esta fase (cadenas, contenedores, Json) o
-        // sin sentido fuera de una ruta/clase (this, un miembro, await).
+        // Sin representacion en esta fase (contenedores, Json) o sin sentido
+        // fuera de una ruta/clase (this, un miembro, await).
         case IrExprKind::NullLit:
-        case IrExprKind::StringLit:
         case IrExprKind::ListLit:
         case IrExprKind::DictLit:
         case IrExprKind::Member:
@@ -204,10 +253,11 @@ public:
 
     std::string expr(const IrExpr& e) const {
         switch (e.kind) {
-            case IrExprKind::IntLit:   return std::to_string(e.int_value) + "LL";
-            case IrExprKind::FloatLit: return literal_float(e.float_value);
-            case IrExprKind::BoolLit:  return e.bool_value ? "true" : "false";
-            case IrExprKind::Ident:    return nombre_cpp(e.text);
+            case IrExprKind::IntLit:    return std::to_string(e.int_value) + "LL";
+            case IrExprKind::FloatLit:  return literal_float(e.float_value);
+            case IrExprKind::BoolLit:   return e.bool_value ? "true" : "false";
+            case IrExprKind::StringLit: return "std::string(" + literal_string(e.text) + ")";
+            case IrExprKind::Ident:     return nombre_cpp(e.text);
 
             case IrExprKind::Unary:
                 return std::string("(") + (e.text == "not" ? "!" : "-") + expr(*e.lhs) + ")";
@@ -340,6 +390,16 @@ std::optional<FuncionNativa> generar_funcion_nativa(const FnDecl& fn, const IrBl
     // el resultado -- o, si la funcion es void, un NativeValue::Tag::Int a 0
     // que nadie mira (el llamante conoce el tipo de retorno declarado, igual
     // que ya conoce la aridad, asi que un valor void nunca se desempaqueta).
+    //
+    // Si la frontera de la funcion usa `string`, la ABI fija de hoy no la
+    // representa (ver tipo_abi_soportado): el cuerpo de arriba se genera
+    // igual -- otra funcion nativa que la llame directamente se beneficia --
+    // pero sin wrapper, se queda fuera del despacho desde la VM.
+    bool frontera_cruza_abi = tipo_abi_soportado(Type::from_declared(fn.return_type));
+    for (const auto& p : fn.params)
+        frontera_cruza_abi = frontera_cruza_abi && tipo_abi_soportado(Type::from_declared(p.type));
+    if (!frontera_cruza_abi) return out;
+
     out.simbolo_abi = "lumen_native_" + fn.name;
     std::string cuerpo_wrapper = "    (void)argc;\n";
     for (size_t i = 0; i < fn.params.size(); ++i) {

@@ -713,6 +713,32 @@ siendo válido para el generador de verdad, no solo para el código escrito a ma
 - **Aceptación:** los casos de clases y datos del corpus (`tests/casos/clases.lum`,
   `datos.lum`, `lenguaje.lum`) dan salidas idénticas en los dos backends.
 
+**Primer corte: `string`.** A diferencia de listas/diccionarios/instancias (§8), una cadena de
+Lumen Script es inmutable — concatenar produce una cadena *nueva*, nunca muta la existente — así
+que compartirla o copiarla es indistinguible desde fuera. `native_gen.cpp` representa `string`
+como `std::string` **por valor**, sin el refcount intrusivo que sí hará falta para listas,
+diccionarios y clases: es el mismo razonamiento que la Fase 7 aplicará a clases mediante análisis
+de escape, aquí no hace falta ningún análisis porque la inmutabilidad ya lo garantiza desde el
+principio. `tipo_soportado` acepta `string`; los literales, `+` (concatenación), `==`/`!=` y las
+comparaciones de orden salen gratis una vez que el tipo está aceptado, porque
+`operadores_binarios()` ya mapeaba esos símbolos al operador de C++ correspondiente y
+`std::string` los implementa con la misma semántica (lexicográfica) que `Value::equals`/`compare`.
+
+Aparece una frontera nueva que no existía con `int`/`float`/`bool`: la ABI fija de
+`native_abi.hpp` (`NativeValue`) no tiene sitio para una cadena — su unión solo lleva un
+`int64_t`/`double`/`bool`. Extenderla (con un puntero+longitud y una convención de propiedad para
+quién libera qué) es trabajo real, y no hacía falta para dar este primer paso: una función cuya
+frontera (parámetros o retorno) usa `string` **se compila igual** — su cuerpo entra en el `.cpp`
+generado sin condición — pero se queda **sin wrapper** `extern "C"`, así que la VM no puede
+llamarla directamente todavía (`tipo_abi_soportado`, más estricto que `tipo_soportado`, decide
+esto). Lo que sí gana esta fase: cualquier otra función nativa (con frontera `int`/`float`/`bool`,
+por tanto invocable desde la VM) que llame a esa función de cadenas **directamente en C++** —
+`Generador::expr` ya generaba una llamada directa a la función interna, nunca a través del
+wrapper — se beneficia igual, sin esperar a que la ABI se extienda. Validado en
+`tests/native_build_shadow.cpp` (`prueba_strings()`): `saluda(string) -> string` se compila sin
+wrapper, `usa_saluda(int) -> int` sí lo tiene y llama a `saluda` internamente concatenando y
+comparando cadenas, y su resultado por bytecode y por `--native` coincide.
+
 ### Fase 4 — Rutas HTTP síncronas
 - Handler generado como `Task<void>` (o función síncrona si no hay `await`, §9), registrado en
   el router igual que hoy.

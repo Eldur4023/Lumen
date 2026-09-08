@@ -63,7 +63,7 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
         std::string simbolo_abi;
     };
     std::vector<Generada> generadas;
-    std::string           codigo = "#include <cstdint>\n\n" + abi_prelude() + "\n";
+    std::string           codigo = "#include <cstdint>\n#include <string>\n\n" + abi_prelude() + "\n";
 
     for (const auto& [nombre, sig] : sigs) {
         const FnDecl* fn = buscar_fn(prog, nombre);
@@ -80,8 +80,15 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
         if (!generada) continue;
 
         codigo += generada->firma_cpp + " " + generada->cuerpo_cpp + "\n\n";
-        codigo += generada->wrapper_cpp + "\n\n";
-        generadas.push_back({sig.index, generada->simbolo_abi});
+        // Sin simbolo_abi: la funcion usa `string` en su frontera y todavia
+        // no cruza la ABI fija (ver tipo_abi_soportado en native_gen.cpp).
+        // Su cuerpo ya quedo arriba, asi que otra funcion nativa que la
+        // llame directamente se sigue beneficiando -- solo se queda fuera
+        // del despacho desde la VM (por_indice no tendra entrada para ella).
+        if (!generada->simbolo_abi.empty()) {
+            codigo += generada->wrapper_cpp + "\n\n";
+            generadas.push_back({sig.index, generada->simbolo_abi});
+        }
     }
 
     if (generadas.empty()) return nullptr; // nada que ofrecer nativo: no es un error
