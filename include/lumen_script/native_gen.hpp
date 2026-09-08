@@ -124,4 +124,12 @@ std::string error_runtime_prelude();
 // indice y usan lumen_native_fail() en vez de comportamiento indefinido.
 std::string list_runtime_prelude();
 
+// `Dict<string, V>` para V en int/float/bool/string: mismo diseño que
+// `LList<T>` (caja con refcount no atomico, semantica de referencia real),
+// una plantilla `LDict<V>`. Sin lectura por indice a proposito -- una clave
+// ausente da `null` en el VM (vm.cpp::GetIndex), un tipo distinto del valor
+// declarado que esta fase no puede representar (misma ambiguedad que
+// `a / b` entre dos int) -- solo escritura y los metodos `has`/`keys`.
+std::string dict_runtime_prelude();
+
 } // namespace lumen_script

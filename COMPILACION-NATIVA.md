@@ -897,6 +897,42 @@ mensaje de error en las dos vías, y el caso que de verdad importaba — dos var
 lista, mutar una a través de una y comprobar que la otra ve el cambio — coincide entre bytecode y
 `--native`. 79/79 del corpus real y el canario `LUMEN_SHADOW_CHECK` siguen en verde.
 
+**Cuarto corte: `Dict<string, V>`, con la misma semántica de referencia — y un límite deliberado.**
+`dict_runtime_prelude()` define `LDict<V>` con el mismo diseño que `LList<T>` (caja con refcount no
+atómico, semántica de referencia real). La sintaxis genérica de Lumen es siempre `Dict<K, V>` aunque
+`K` sea forzosamente `string` (§8 de la gramática) — `Type::from_declared` descarta `K` y solo
+conserva `V`; `Dict<int>` con un único argumento se interpreta como *clave* `int` (descartada) y
+*valor* `Json` por defecto, no como `Dict<string, int>` — un detalle de la gramática existente que
+esta fase se limitó a descubrir, no a decidir.
+
+El límite deliberado: **esta fase no admite leer un `Dict` por índice** (`d[k]`). El motivo es el
+mismo que ya obligó a rechazar `a / b` entre dos `int` — `d[k]` con una clave *ausente* da `null` en
+el VM (`vm.cpp::GetIndex`), un tipo distinto del valor declarado que esta fase no puede representar
+en una ranura de tipo fijo. `Comprobador::tipo_provable()` ya rechazaba cualquier `Index` sobre algo
+que no fuera `List` desde el corte anterior — aquí simplemente se documenta que es intencional para
+`Dict`, no un olvido. Sí se admite **escribir** por índice (`d[k] = v`, siempre válido en el VM, sin
+esa ambigüedad) y los dos métodos de `metodos_de()` para `Dict` que tienen sentido fuera de un
+contexto de ruta: `has`/`keys` (el tercero, `save`, solo existe sobre un `File` subido).
+
+Un literal `{k: v, ...}` reveló un límite real de C++, no un error propio: a diferencia de
+`LList{1, 2, 3}` (CTAD deduce `T` directamente de cada elemento), `LDict{{k1,v1}, {k2,v2}}` intenta
+deducir `V` *a través de* la construcción por lista de cada `std::pair<string,V>` — y la deducción de
+argumentos de plantilla no mira dentro de una lista de inicialización anidada de esa forma (se
+confirmó el rechazo directamente contra `g++`, con y sin guía de deducción explícita, antes de
+descartar el enfoque). La solución: con `V` ya demostrado por `tipo_provable()`, generar
+`LDict<V>{...}` con el argumento de plantilla explícito en vez de confiar en CTAD — lo que llevó a
+que `Generador` dejara de llevar solo un mapa de ranura→tipo y pasara a guardar una referencia al
+propio `Comprobador` ya usado con éxito, para poder volver a preguntarle el tipo de cualquier
+expresión (el valor de un `DictLit`, el elemento de un `for`) sin duplicar el análisis.
+
+Validado en `tests/native_build_shadow.cpp` (`prueba_diccionarios()`): un literal, escritura por
+índice, `has()`/`keys()`, paso como parámetro a otra función nativa (`Dict` en la frontera se queda
+sin *wrapper*, igual que `List`/`string`, pero compila igual — y `cuenta_claves()` recorre las claves
+devueltas por `keys()` con un `for`, ejercitando la cadena completa `Dict → List<string> → for`), y
+semántica de referencia (dos variables sobre el mismo diccionario). Coincide entre bytecode y
+`--native` en todos los casos. 79/79 del corpus real y el canario `LUMEN_SHADOW_CHECK` siguen en
+verde.
+
 ### Fase 4 — Rutas HTTP síncronas
 - Handler generado como `Task<void>` (o función síncrona si no hay `await`, §9), registrado en
   el router igual que hoy.

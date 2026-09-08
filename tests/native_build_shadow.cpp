@@ -335,6 +335,80 @@ static bool prueba_listas() {
 // distinto al bytecode (o, para division/modulo, tumbaba el proceso
 // entero). Estas pruebas fijan la correccion (Comprobador::tipo_provable en
 // native_gen.cpp) para que no se pueda perder sin que ctest lo note.
+// Dict<string, int>: literal, escritura por indice, has()/keys(), paso como
+// parametro a otra funcion nativa (Dict en la frontera se queda sin
+// wrapper, igual que List/string, pero compila igual), y semantica de
+// REFERENCIA (dos variables sobre el mismo diccionario). A proposito NO
+// prueba lectura por indice (`d[k]`): esta fase la deja fuera porque una
+// clave ausente da `null` en el VM, un tipo distinto del valor declarado
+// que no se puede representar en una ranura de tipo fijo (ver el
+// comentario de tipo_soportado en native_gen.cpp) -- no hay nada que
+// comparar porque ese caso nunca deberia compilar a nativo.
+static bool prueba_diccionarios() {
+    const std::string src =
+        "fn int cuenta_claves(Dict<string, int> d):\n"
+        "    List<string> ks = d.keys()\n"
+        "    int total = 0\n"
+        "    for string k in ks:\n"
+        "        total = total + 1\n"
+        "    return total\n"
+        "\n"
+        "fn bool usa_dict(int n):\n"
+        "    Dict<string, int> d = {\"a\": 1, \"b\": 2}\n"
+        "    d[\"c\"] = n\n"
+        "    bool tiene_a = d.has(\"a\")\n"
+        "    bool tiene_z = d.has(\"z\")\n"
+        "    return tiene_a and (not tiene_z) and (cuenta_claves(d) == 3)\n"
+        "\n"
+        "fn bool alias(int n):\n"
+        "    Dict<string, int> a = {\"x\": 1}\n"
+        "    Dict<string, int> b = a\n"
+        "    b[\"y\"] = n\n"
+        "    return a.has(\"y\")\n";
+
+    SourceFile    file;
+    DiagnosticBag diag_parse;
+    Program       prog;
+    if (!parse_program(src, file, diag_parse, prog)) {
+        std::printf("FALLA (diccionarios): no parsea (%s)\n",
+                    diag_parse.items().empty() ? "?" : diag_parse.items().front().message.c_str());
+        return false;
+    }
+
+    FunctionSigs                  sigs = firmar(prog);
+    FunctionTable                 tabla_vm;
+    std::unique_ptr<NativeModule> nativo;
+    const auto cache_dir = std::filesystem::temp_directory_path() / "lumen_native_build_check_dict";
+    if (!compilar_las_dos_vias(prog, sigs, tabla_vm, nativo, cache_dir)) return false;
+
+    // cuenta_claves(Dict<...>) no cruza la ABI (Dict, como List/string, se
+    // queda sin wrapper); usa_dict/alias son int->bool, las dos deberian
+    // compilar.
+    if (!nativo || nativo->compiladas() != 2) {
+        std::printf("FALLA (diccionarios): se esperaban 2 funciones con wrapper, hay %zu\n",
+                    nativo ? nativo->compiladas() : 0);
+        return false;
+    }
+
+    bool ok = true;
+    auto comparar_bool = [&](const char* nombre, long long arg) {
+        const Chunk& chunk = *tabla_vm[sigs.at(nombre).index];
+        VM::Result sin_n = ejecutar_result(chunk, {Value::integer(arg)}, &tabla_vm, nullptr);
+        VM::Result con_n = ejecutar_result(chunk, {Value::integer(arg)}, &tabla_vm, nativo.get());
+        if (sin_n.status != VM::Status::Done || con_n.status != VM::Status::Done ||
+            !sin_n.value.as_bool() || !con_n.value.as_bool()) {
+            std::printf("  FALLA %s(%lld): se esperaba 'true' en las dos vias (bytecode=%d "
+                        "nativo=%d)\n", nombre, arg, sin_n.value.as_bool(), con_n.value.as_bool());
+            ok = false;
+        } else {
+            std::printf("  ok    %s(%lld): bytecode y VM+nativo coinciden\n", nombre, arg);
+        }
+    };
+    comparar_bool("usa_dict", 9);
+    comparar_bool("alias", 5);
+    return ok;
+}
+
 static bool prueba_tipos_dinamicos() {
     bool ok = true;
 
@@ -575,6 +649,7 @@ int main() {
     if (!prueba_strings()) ++fallos;
     if (!prueba_metodos_string()) ++fallos;
     if (!prueba_listas()) ++fallos;
+    if (!prueba_diccionarios()) ++fallos;
     if (!prueba_tipos_dinamicos()) ++fallos;
 
     if (fallos == 0) {

@@ -7,10 +7,10 @@
 namespace lumen_script {
 namespace {
 
-// Los unicos elementos de List que esta fase sabe representar -- un nivel,
-// sin anidar (List<List<int>> queda fuera: su elemento no es ninguno de
-// estos cuatro).
-bool tipo_elemento_lista_soportado(const Type& elem) {
+// Los unicos elementos de List o valores de Dict que esta fase sabe
+// representar -- un nivel, sin anidar (List<List<int>>, Dict<string,List<int>>
+// quedan fuera: su elemento/valor no es ninguno de estos cuatro).
+bool tipo_elemento_contenedor_soportado(const Type& elem) {
     if (elem.is_optional()) return false;
     switch (elem.kind()) {
         case Type::Kind::Int:
@@ -32,9 +32,19 @@ bool tipo_elemento_lista_soportado(const Type& elem) {
 // intrusivo que describe §8 para listas/diccionarios/instancias -- porque en
 // Lumen Script una cadena es inmutable (concatenar produce una cadena nueva,
 // nunca muta la existente), asi que compartirla o copiarla es exactamente lo
-// mismo desde fuera: no hay manera de observar la diferencia. `List`, en
-// cambio, SI es mutable (`.add()`) y SI necesita semantica de referencia
-// real -- ver LList en list_runtime_prelude() y el comentario de §8.
+// mismo desde fuera: no hay manera de observar la diferencia. `List`/`Dict`,
+// en cambio, SI son mutables (`.add()`/asignar por indice) y SI necesitan
+// semantica de referencia real -- ver LList/LDict en list_runtime_prelude()/
+// dict_runtime_prelude() y el comentario de §8.
+//
+// Dict NO admite lectura por indice en esta fase (`d[k]` con `k` ausente):
+// el VM devuelve `null` en ese caso (vm.cpp::GetIndex), un tipo distinto del
+// valor declarado que esta fase no puede representar en una ranura de tipo
+// fijo -- la misma clase de ambiguedad que `a / b` entre dos int (ver la
+// correccion critica de mas arriba), asi que se trata igual: no demostrable,
+// se queda fuera (Comprobador::tipo_provable, caso Index). Si SE admite
+// escribir (`d[k] = v`, siempre valido en el VM) y los dos metodos que
+// reconoce metodos_de() para Dict: `has`/`keys`.
 bool tipo_soportado(const Type& t) {
     if (t.is_optional()) return false;
     switch (t.kind()) {
@@ -45,7 +55,8 @@ bool tipo_soportado(const Type& t) {
         case Type::Kind::String:
             return true;
         case Type::Kind::List:
-            return tipo_elemento_lista_soportado(t.element());
+        case Type::Kind::Dict:
+            return tipo_elemento_contenedor_soportado(t.element());
         default:
             return false;
     }
@@ -57,14 +68,15 @@ bool es_numerico(Type::Kind k) { return k == Type::Kind::Int || k == Type::Kind:
 // native_abi.hpp (NativeValue solo tiene un int64_t/double/bool en su
 // union): una funcion cuyos parametros y retorno caen todos aqui puede
 // recibir un wrapper `extern "C"` y ser invocada desde la VM; una que use
-// `string`/`List` en su frontera todavia no -- pero SI se genera su cuerpo
-// C++ (ver generar_funcion_nativa), asi que otra funcion nativa que la
-// llame directamente (sin pasar por la ABI) se beneficia igual. Extender la
-// ABI para que tambien lleve esos tipos queda para cuando una funcion con
-// uno de ellos en la frontera sea, ella misma, el objetivo de una llamada
-// desde bytecode.
+// `string`/`List`/`Dict` en su frontera todavia no -- pero SI se genera su
+// cuerpo C++ (ver generar_funcion_nativa), asi que otra funcion nativa que
+// la llame directamente (sin pasar por la ABI) se beneficia igual. Extender
+// la ABI para que tambien lleve esos tipos queda para cuando una funcion
+// con uno de ellos en la frontera sea, ella misma, el objetivo de una
+// llamada desde bytecode.
 bool tipo_abi_soportado(const Type& t) {
-    return tipo_soportado(t) && t.kind() != Type::Kind::String && t.kind() != Type::Kind::List;
+    return tipo_soportado(t) && t.kind() != Type::Kind::String && t.kind() != Type::Kind::List &&
+           t.kind() != Type::Kind::Dict;
 }
 
 std::string tipo_cpp(const Type& t) {
@@ -75,6 +87,7 @@ std::string tipo_cpp(const Type& t) {
         case Type::Kind::Void:   return "void";
         case Type::Kind::String: return "std::string";
         case Type::Kind::List:   return "LList<" + tipo_cpp(t.element()) + ">";
+        case Type::Kind::Dict:   return "LDict<" + tipo_cpp(t.element()) + ">";
         default: return ""; // inalcanzable si tipo_soportado() dio el visto bueno
     }
 }
@@ -194,12 +207,6 @@ public:
     // tiene garantizado que su valor real coincide siempre.
     void registrar(int slot, Type t) { ranura_tipos_.insert_or_assign(slot, std::move(t)); }
 
-    // Expuesto para que Generador pueda resolver el tipo C++ de la variable
-    // de un `for` (la unica ranura cuyo tipo no viene de una anotacion
-    // explicita en el .lum, sino del elemento de la lista que se recorre --
-    // ver el caso IrStmtKind::For mas abajo).
-    const std::map<int, Type>& ranura_tipos() const { return ranura_tipos_; }
-
     // Nullopt si no se puede demostrar; si no, el Type exacto que el VM
     // SIEMPRE produciria para esta expresion, con los mismos valores.
     std::optional<Type> tipo_provable(const IrExpr& e) const {
@@ -212,7 +219,6 @@ public:
             // Sin representacion en esta fase, o sin sentido fuera de una
             // ruta/clase.
             case IrExprKind::NullLit:
-            case IrExprKind::DictLit:
             case IrExprKind::Member:
             case IrExprKind::Await:
             case IrExprKind::This:
@@ -229,7 +235,7 @@ public:
             case IrExprKind::ListLit: {
                 if (e.items.empty() || !e.items[0]) return std::nullopt;
                 auto t0 = tipo_provable(*e.items[0]);
-                if (!t0 || !tipo_elemento_lista_soportado(*t0)) return std::nullopt;
+                if (!t0 || !tipo_elemento_contenedor_soportado(*t0)) return std::nullopt;
                 for (size_t i = 1; i < e.items.size(); ++i) {
                     if (!e.items[i]) return std::nullopt;
                     auto ti = tipo_provable(*e.items[i]);
@@ -238,8 +244,33 @@ public:
                 return Type::list_of(*t0);
             }
 
+            // {k: v, ...}: cada clave demostrablemente string, cada valor
+            // demostrablemente el MISMO tipo (igual criterio que ListLit;
+            // un diccionario vacio tambien se queda fuera, no hay de donde
+            // inferir el tipo del valor).
+            case IrExprKind::DictLit: {
+                if (e.entries.empty()) return std::nullopt;
+                std::optional<Type> tv;
+                for (const auto& entry : e.entries) {
+                    if (!entry.key || !entry.value) return std::nullopt;
+                    auto tk = tipo_provable(*entry.key);
+                    if (!tk || tk->kind() != Type::Kind::String) return std::nullopt;
+                    auto tval = tipo_provable(*entry.value);
+                    if (!tval || !tipo_elemento_contenedor_soportado(*tval)) return std::nullopt;
+                    if (!tv) tv = tval;
+                    else if (*tv != *tval) return std::nullopt;
+                }
+                return Type::dict_of(*tv);
+            }
+
             // xs[i]: object es el receptor, lhs el indice (ver el
-            // comentario de IrExpr en ir.hpp).
+            // comentario de IrExpr en ir.hpp). Solo List: leer un Dict por
+            // indice puede dar `null` si la clave no existe (vm.cpp::
+            // GetIndex) -- un tipo distinto del valor declarado, la misma
+            // ambiguedad que "a / b" entre dos int (ver la correccion
+            // critica). No demostrable, se queda sin compilar a proposito;
+            // Dict SI admite escribir por indice (ver Assign mas abajo, sin
+            // esa ambiguedad: el VM siempre acepta la escritura).
             case IrExprKind::Index: {
                 if (!e.object || !e.lhs) return std::nullopt;
                 auto tobj = tipo_provable(*e.object);
@@ -355,6 +386,23 @@ public:
                         if (!targ || *targ != tobj->element()) return std::nullopt;
                         return tobj;
                     }
+                    // Los dos metodos de Dict que reconoce metodos_de()
+                    // (natives.cpp: kDict) sin depender de un contexto de
+                    // ruta (el tercero, "save", solo existe sobre un File
+                    // subido): "has" comprueba una clave, "keys" devuelve
+                    // List<string> con todas -- ninguno de los dos tiene la
+                    // ambiguedad de leer un valor por indice.
+                    if (tobj->kind() == Type::Kind::Dict && e.call_name == "has") {
+                        if (e.args.size() != 1 || !e.args[0].value) return std::nullopt;
+                        auto tk = tipo_provable(*e.args[0].value);
+                        return (tk && tk->kind() == Type::Kind::String)
+                                   ? std::optional<Type>(Type::primitive(Type::Kind::Bool))
+                                   : std::nullopt;
+                    }
+                    if (tobj->kind() == Type::Kind::Dict && e.call_name == "keys") {
+                        if (!e.args.empty()) return std::nullopt;
+                        return Type::list_of(Type::primitive(Type::Kind::String));
+                    }
                     return std::nullopt;
                 }
                 if (e.call_shape == IrCallShape::UserFunctionCall) {
@@ -423,18 +471,24 @@ public:
                 if (s.assign_target == IrAssignTarget::Index) {
                     // xs[i] = v: solo sobre una variable (una expresion
                     // temporal -- p.ej. el resultado de una llamada -- no
-                    // tiene sentido mutarla in place) de tipo List, con el
-                    // indice Int y el valor exactamente del tipo del
-                    // elemento.
+                    // tiene sentido mutarla in place). List exige indice
+                    // Int; Dict exige indice string (y, a diferencia de
+                    // leer, escribir SIEMPRE es valido en el VM -- sin la
+                    // ambiguedad de una clave ausente, ver el caso Index en
+                    // tipo_provable()). En los dos casos, el valor tiene que
+                    // ser exactamente el tipo del elemento.
                     if (!s.assign_object || s.assign_object->kind != IrExprKind::Ident ||
                         !s.assign_index)
                         return false;
                     auto tobj = tipo_provable(*s.assign_object);
                     auto tidx = tipo_provable(*s.assign_index);
                     auto tval = tipo_provable(*s.value);
-                    if (!tobj || tobj->kind() != Type::Kind::List) return false;
-                    if (!tidx || tidx->kind() != Type::Kind::Int) return false;
-                    return tval && *tval == tobj->element();
+                    if (!tobj || !tidx || !tval) return false;
+                    if (tobj->kind() == Type::Kind::List)
+                        return tidx->kind() == Type::Kind::Int && *tval == tobj->element();
+                    if (tobj->kind() == Type::Kind::Dict)
+                        return tidx->kind() == Type::Kind::String && *tval == tobj->element();
+                    return false;
                 }
                 return false; // Session/Member: sesion o clase, fuera de esta fase
             }
@@ -455,9 +509,9 @@ public:
             // `for x in xs:`: s.target es el iterable, s.name/s.slot la
             // variable del bucle. El tipo de esa variable no viene de una
             // anotacion en el .lum (Lumen no la exige) -- se DERIVA aqui
-            // del elemento de `xs`, la misma fuente de verdad que usara
-            // Generador para declarar la variable C++ correspondiente (ver
-            // Comprobador::ranura_tipos()).
+            // del elemento de `xs`; Generador vuelve a preguntar
+            // tipo_provable(*s.target) para declarar la variable C++
+            // correspondiente (ver Generador::stmt, mismo caso).
             //
             // Require y Try no son "primitivos y control de flujo" en el
             // sentido estrecho de esta fase todavia -- Try en concreto
@@ -511,9 +565,13 @@ const std::map<std::string, std::string>& operadores_binarios() {
 
 class Generador {
 public:
-    Generador(const std::vector<std::string>& nombre_por_indice,
-             const std::map<int, Type>& ranura_tipos)
-        : nombre_por_indice_(nombre_por_indice), ranura_tipos_(ranura_tipos) {}
+    // `comprobador` es el mismo (ya usado, ya con exito) que decidio que
+    // esta funcion se puede generar -- Generador lo reusa para volver a
+    // preguntar el tipo de una expresion cuando el C++ que emite lo
+    // necesita explicito (DictLit, la variable de un `for`): no vuelve a
+    // decidir nada, solo consulta lo que tipo_provable() ya demostro.
+    Generador(const std::vector<std::string>& nombre_por_indice, const Comprobador& comprobador)
+        : nombre_por_indice_(nombre_por_indice), comprobador_(comprobador) {}
 
     // Ranura -> nombre C++ ya calculado, para poder generar `nombre = ...`
     // en un Assign(Local): el IrStmt solo trae `assign_slot` (lo unico que
@@ -546,6 +604,25 @@ public:
                 for (size_t i = 0; i < e.items.size(); ++i) {
                     if (i) s += ", ";
                     s += expr(*e.items[i]);
+                }
+                s += "}";
+                return s;
+            }
+
+            // A diferencia de ListLit, aqui NO basta con CTAD: deducir V a
+            // traves de una lista de std::pair anidados esta fuera de lo
+            // que el estandar deja deducir (cada elemento es el resultado
+            // de list-init de std::pair<string,V>, y eso no participa en la
+            // deduccion de argumentos de plantilla de LDict) -- se
+            // comprobo directamente contra g++, que lo rechaza. Con V
+            // explicito (tipo_provable() ya lo demostro) no hace falta
+            // deducir nada.
+            case IrExprKind::DictLit: {
+                const Type tipo = *comprobador_.tipo_provable(e);
+                std::string s = "LDict<" + tipo_cpp(tipo.element()) + ">{";
+                for (size_t i = 0; i < e.entries.size(); ++i) {
+                    if (i) s += ", ";
+                    s += "{" + expr(*e.entries[i].key) + ", " + expr(*e.entries[i].value) + "}";
                 }
                 s += "}";
                 return s;
@@ -588,6 +665,15 @@ public:
                 if (e.call_shape == IrCallShape::BuiltinMethodCall &&
                     e.object->type.kind() == Type::Kind::List)
                     return expr(*e.object) + ".lumen_add(" + expr(*e.args[0].value) + ")";
+
+                // "has"/"keys" sobre un Dict: mismo criterio, sintaxis de
+                // metodo nativo (LDict::lumen_has/lumen_keys).
+                if (e.call_shape == IrCallShape::BuiltinMethodCall &&
+                    e.object->type.kind() == Type::Kind::Dict) {
+                    if (e.call_name == "has")
+                        return expr(*e.object) + ".lumen_has(" + expr(*e.args[0].value) + ")";
+                    return expr(*e.object) + ".lumen_keys()"; // "keys": sin argumentos
+                }
 
                 // BuiltinMethodCall (metodos de string, ver
                 // metodo_string_soportado): funcion libre de
@@ -670,7 +756,7 @@ public:
             // verdad, no hace falta ningun parcheo de saltos como en el
             // bytecode.
             case IrStmtKind::For: {
-                const std::string tipo_var = tipo_cpp(ranura_tipos_.at(s.slot));
+                const std::string tipo_var = tipo_cpp(comprobador_.tipo_provable(*s.target)->element());
                 std::string r = "{\n";
                 r += pad(indent + 1) + "const auto& l__for_items = " + expr(*s.target) + ";\n";
                 r += pad(indent + 1) + "const int64_t l__for_count = l__for_items.lumen_len();\n";
@@ -691,7 +777,7 @@ public:
 
 private:
     const std::vector<std::string>& nombre_por_indice_;
-    const std::map<int, Type>&       ranura_tipos_;
+    const Comprobador&               comprobador_;
     std::map<int, std::string>      ranura_a_nombre_;
 
     static std::string pad(int indent) { return std::string(static_cast<size_t>(indent) * 4, ' '); }
@@ -735,12 +821,11 @@ std::optional<FuncionNativa> generar_funcion_nativa(const FnDecl& fn, const IrBl
     }
     out.firma_cpp = tipo_cpp(retorno_decl) + " " + nombre_cpp(fn.name) + "(" + params + ")";
 
-    // ranura_tipos() ya trae el tipo de cada parametro (se registraron
-    // arriba) y de cada VarDecl/`for` que Comprobador acepto al recorrer el
-    // cuerpo -- Generador la reusa tal cual, en vez de volver a calcularla,
-    // para el tipo C++ de la variable de un `for` (ver el caso
-    // IrStmtKind::For en Generador::stmt).
-    Generador gen(nombre_por_indice, comprobador.ranura_tipos());
+    // `comprobador` ya demostro el tipo de cada expresion del cuerpo --
+    // Generador la reusa (Comprobador::tipo_provable) en vez de volver a
+    // decidir nada, para el tipo C++ de la variable de un `for` y el valor
+    // de un DictLit (ver esos casos en Generador::expr/stmt).
+    Generador gen(nombre_por_indice, comprobador);
     for (size_t i = 0; i < fn.params.size(); ++i)
         gen.registrar(static_cast<int>(i), fn.params[i].name);
     out.cuerpo_cpp = "{\n" + gen.block(body, 1) + "}";
@@ -907,6 +992,10 @@ std::string list_runtime_prelude() {
         "    LList(std::initializer_list<T> init) : b_(new LListBox<T>()) {\n"
         "        b_->v.assign(init.begin(), init.end());\n"
         "    }\n"
+        // Para LDict::lumen_keys(): un vector ya calculado en tiempo de
+        // ejecucion (las claves de un diccionario), no una lista literal
+        // conocida al generar -- initializer_list no sirve aqui.
+        "    explicit LList(std::vector<T> v) : b_(new LListBox<T>()) { b_->v = std::move(v); }\n"
         "    LList(const LList& o) : b_(o.b_) { ++b_->rc; }\n"
         "    LList(LList&& o) noexcept : b_(o.b_) { o.b_ = nullptr; }\n"
         "    LList& operator=(const LList& o) {\n"
@@ -938,6 +1027,59 @@ std::string list_runtime_prelude() {
         "};\n"
         "template <class T>\n"
         "LList(std::initializer_list<T>) -> LList<T>;\n";
+}
+
+std::string dict_runtime_prelude() {
+    // Mismo diseño que LList (caja con refcount no atomico, semantica de
+    // referencia real): un vector de pares en vez de una tabla hash de
+    // verdad -- Value::Dict en value.hpp hace lo mismo por la misma razon
+    // (los diccionarios tipicos de una respuesta HTTP tienen entre 3 y 10
+    // claves; un recorrido lineal les gana al arbol/tabla hasta bastante
+    // mas que eso). Sin `lumen_get`: leer por indice queda fuera de esta
+    // fase a proposito (ver el comentario de tipo_soportado() sobre por
+    // que), asi que no hace falta ni decidir que devolver en una clave
+    // ausente.
+    return
+        "template <class V>\n"
+        "struct LDictBox { long rc; std::vector<std::pair<std::string, V>> v; LDictBox() : rc(1) {} };\n"
+        "template <class V>\n"
+        "class LDict {\n"
+        "public:\n"
+        "    LDict() : b_(new LDictBox<V>()) {}\n"
+        "    LDict(std::initializer_list<std::pair<std::string, V>> init) : b_(new LDictBox<V>()) {\n"
+        "        for (const auto& kv : init) lumen_set(kv.first, kv.second);\n"
+        "    }\n"
+        "    LDict(const LDict& o) : b_(o.b_) { ++b_->rc; }\n"
+        "    LDict(LDict&& o) noexcept : b_(o.b_) { o.b_ = nullptr; }\n"
+        "    LDict& operator=(const LDict& o) {\n"
+        "        if (b_ != o.b_) { rel(); b_ = o.b_; ++b_->rc; }\n"
+        "        return *this;\n"
+        "    }\n"
+        "    LDict& operator=(LDict&& o) noexcept {\n"
+        "        if (this != &o) { rel(); b_ = o.b_; o.b_ = nullptr; }\n"
+        "        return *this;\n"
+        "    }\n"
+        "    ~LDict() { rel(); }\n"
+        "    bool lumen_has(const std::string& k) const {\n"
+        "        for (const auto& kv : b_->v) if (kv.first == k) return true;\n"
+        "        return false;\n"
+        "    }\n"
+        "    void lumen_set(const std::string& k, V val) const {\n"
+        "        for (auto& kv : b_->v) if (kv.first == k) { kv.second = std::move(val); return; }\n"
+        "        b_->v.emplace_back(k, std::move(val));\n"
+        "    }\n"
+        "    LList<std::string> lumen_keys() const {\n"
+        "        std::vector<std::string> ks;\n"
+        "        ks.reserve(b_->v.size());\n"
+        "        for (const auto& kv : b_->v) ks.push_back(kv.first);\n"
+        "        return LList<std::string>(std::move(ks));\n"
+        "    }\n"
+        "private:\n"
+        "    void rel() { if (b_ && --b_->rc == 0) delete b_; }\n"
+        "    LDictBox<V>* b_;\n"
+        "};\n"
+        "template <class V>\n"
+        "LDict(std::initializer_list<std::pair<std::string, V>>) -> LDict<V>;\n";
 }
 
 } // namespace lumen_script

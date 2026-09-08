@@ -122,9 +122,9 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
 
     std::string codigo =
         "#include <cctype>\n#include <cstdint>\n#include <initializer_list>\n#include <string>\n"
-        "#include <vector>\n\n" +
+        "#include <utility>\n#include <vector>\n\n" +
         abi_prelude() + "\n" + error_runtime_prelude() + "\n" + list_runtime_prelude() + "\n" +
-        string_runtime_prelude() + "\n" + prototipos + "\n" + cuerpos;
+        dict_runtime_prelude() + "\n" + string_runtime_prelude() + "\n" + prototipos + "\n" + cuerpos;
 
     std::error_code ec;
     std::filesystem::create_directories(cache_dir, ec);
