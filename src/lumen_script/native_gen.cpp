@@ -238,13 +238,13 @@ public:
     // ruta (Fase 4)? A diferencia de tipo_provable(), NO exige que un
     // DictLit/ListLit tenga un tipo homogeneo -- un cuerpo JSON real casi
     // nunca lo es (bench/lumen/app.lum: un dict con int/string/double/bool
-    // mezclados). Alcance de este primer corte: escalares, y DictLit/ListLit
-    // anidados (recursivamente) de eso mismo -- una List<T> YA construida
-    // (un Ident, por ejemplo) queda fuera todavia a proposito: convertirla
-    // requeriria iterar LList<T> en el .cpp generado (un lumen_valor_de()
-    // que hoy no existe), y ningun caso de prueba lo necesita todavia. Dict
-    // <V> como valor de respuesta tambien queda fuera (LDict no expone
-    // iterar sus pares, solo has/set/keys).
+    // mezclados). Alcance: escalares, DictLit/ListLit anidados
+    // (recursivamente) de eso mismo, y una List<T> YA construida (un Ident,
+    // por ejemplo) -- convertida iterando LList<T> con lumen_valor_de()
+    // (route_runtime_prelude), nunca mas de un nivel porque
+    // tipo_elemento_contenedor_soportado ya prohibe List<List<..>>. Dict<V>
+    // como valor de respuesta queda fuera (LDict no expone iterar sus
+    // pares, solo has/set/keys).
     bool es_valor_json(const IrExpr& e) const {
         if (e.kind == IrExprKind::DictLit) {
             if (e.entries.empty()) return false;
@@ -263,7 +263,7 @@ public:
             return true;
         }
         auto t = tipo_provable(e);
-        return t && es_escalar_json(t->kind());
+        return t && (es_escalar_json(t->kind()) || t->kind() == Type::Kind::List);
     }
 
     // `require cond else status(N)` (el patron de guarda mas comun, ver el
@@ -1171,6 +1171,7 @@ public:
             case Type::Kind::Float:  return "Value::real(" + expr(e) + ")";
             case Type::Kind::Bool:   return "Value::boolean(" + expr(e) + ")";
             case Type::Kind::String: return "Value::str(" + expr(e) + ")";
+            case Type::Kind::List:   return "lumen_valor_de(" + expr(e) + ")";
             default: return ""; // inalcanzable: es_valor_json() ya lo descarto
         }
     }
@@ -1943,6 +1944,22 @@ std::string route_runtime_prelude() {
         "    if (t == \"true\" || t == \"1\")  { out = true;  return true; }\n"
         "    if (t == \"false\" || t == \"0\") { out = false; return true; }\n"
         "    return false;\n"
+        "}\n"
+        // El puente a Value para el valor de retorno de una ruta cuando ya
+        // es una List<T> construida (un Ident, tipicamente) -- ver
+        // Generador::valor_json(). Solo un nivel: T es siempre un escalar
+        // (tipo_elemento_contenedor_soportado prohibe List<List<..>>), asi
+        // que la sobrecarga de LList<T> nunca necesita recursion real, solo
+        // reusar las de escalar sobre cada elemento.
+        "inline Value lumen_valor_de(int64_t v)            { return Value::integer(v); }\n"
+        "inline Value lumen_valor_de(double v)              { return Value::real(v); }\n"
+        "inline Value lumen_valor_de(bool v)                { return Value::boolean(v); }\n"
+        "inline Value lumen_valor_de(const std::string& v)  { return Value::str(v); }\n"
+        "template <class T>\n"
+        "Value lumen_valor_de(const LList<T>& l) {\n"
+        "    Value::List out;\n"
+        "    for (int64_t i = 0; i < l.lumen_len(); ++i) out.push_back(lumen_valor_de(l.lumen_get(i)));\n"
+        "    return Value::list(std::move(out));\n"
         "}\n";
 }
 

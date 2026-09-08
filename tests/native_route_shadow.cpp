@@ -106,7 +106,16 @@ int main() {
         "\n"
         "get endpoint(\"/mod/:a/:b\", int a, int b):\n"
         "    int r = a % b\n"
-        "    return { \"r\": r }\n";
+        "    return { \"r\": r }\n"
+        "\n"
+        "get endpoint(\"/rango/:n\", int n):\n"
+        "    require n >= 0 and n <= 10 else status(400)\n"
+        "    List<int> xs = [n]\n"
+        "    int i = 0\n"
+        "    while i < n:\n"
+        "        xs.add(i * i)\n"
+        "        i = i + 1\n"
+        "    return { \"n\": n, \"cuadrados\": xs }\n";
 
     const auto dir  = std::filesystem::temp_directory_path() / "lumen_native_route_check";
     std::error_code ec;
@@ -212,6 +221,15 @@ int main() {
     comparar("return status(204)", "/saluda/10");             // n <= 50
     comparar("guarda con redirect(url, codigo)", "/ir/0");    // n < 1
     comparar("return redirect(url)", "/ir/5");
+
+    // Una List<int> YA construida (no un ListLit) dentro del dict de
+    // retorno: Generador::valor_json() la convierte con lumen_valor_de(),
+    // iterando LList<T> con lumen_len()/lumen_get() -- a diferencia de un
+    // DictLit/ListLit literal, esta rama no exige homogeneidad porque la
+    // lista YA es homogenea por construccion (es un tipo nativo, no JSON
+    // heterogeneo).
+    comparar("List<int> ya construida en el retorno", "/rango/0");
+    comparar("List<int> ya construida en el retorno", "/rango/5");
 
     // Bug real, encontrado probando esto a proposito (no una precaucion
     // especulativa): una ruta nativa no tiene NINGUN wrapper de la ABI (a

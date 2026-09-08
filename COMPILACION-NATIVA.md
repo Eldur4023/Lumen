@@ -1291,6 +1291,19 @@ falla de verdad no reabre ningún hueco: ya había red de seguridad esperándolo
 (incluida la cadena inválida, comparando el mismo `Status::Error` con el mismo mensaje en las dos
 vías) como regresión permanente. 79/79 del corpus y las 8 suites de `ctest` en verde.
 
+**Cierre del "pendiente" original: `List<T>` YA construida como valor de retorno de una ruta.**
+`Generador::valor_json()` tenía un hueco a propósito desde el primer incremento del puente a `Value`:
+una `List<T>` que ya existe como variable (no un `ListLit` literal) no se convertía — habría exigido
+iterar `LList<T>` en el `.cpp` generado, y ningún caso de prueba lo necesitaba todavía. Cerrado ahora
+con `lumen_valor_de()` (`route_runtime_prelude()`): cuatro sobrecargas escalares más una plantilla
+sobre `LList<T>` que recorre con `lumen_len()`/`lumen_get()` y llama a `lumen_valor_de()` sobre cada
+elemento — nunca necesita más de un nivel de recursión real porque
+`tipo_elemento_contenedor_soportado` ya prohíbe `List<List<..>>`. `Comprobador::es_valor_json()`
+ahora acepta `Type::Kind::List` además de los escalares. `Dict<V>` como valor de respuesta sigue
+fuera (`LDict` no expone iterar sus pares). `tests/native_route_shadow.cpp` gana una ruta
+(`/rango/:n`, construye una `List<int>` con un bucle y la devuelve dentro de un dict junto a un
+escalar) como regresión permanente. 79/79 del corpus y las 8 suites de `ctest` en verde.
+
 ### Fase 5 — Asincronía y base de datos
 - `await` → `co_await` sobre los awaitables existentes; transacciones, pool, `last_id`.
 - **Aceptación:** el banco de pruebas completo (`bench/run_all.sh`) corre en modo `--native`
