@@ -50,17 +50,18 @@ public:
 
 private:
     friend std::unique_ptr<NativeModule> compilar_nativo(const Program&, const FunctionSigs&,
+                                                          const ClassSigs&,
                                                           const std::filesystem::path&,
                                                           std::string&);
     void* handle_ = nullptr;
 };
 
 // Genera, compila con el compilador de C++ del sistema, y carga como
-// biblioteca compartida las funciones de `prog` que native_gen.cpp sabe
-// representar. `cache_dir` es donde queda el .cpp/.so generados (se crea si
-// hace falta) -- hoy siempre se regenera; el cacheado por hash de fuentes
-// que describe la seccion 11 del documento queda para cuando de verdad haga
-// falta.
+// biblioteca compartida las funciones de `prog` (sueltas, y metodos/
+// constructores de `clases`) que native_gen.cpp sabe representar.
+// `cache_dir` es donde queda el .cpp/.so generados (se crea si hace falta)
+// -- hoy siempre se regenera; el cacheado por hash de fuentes que describe
+// la seccion 11 del documento queda para cuando de verdad haga falta.
 //
 // Esto NUNCA tumba la compilacion del modulo -- a diferencia del resto del
 // compilador, un fallo aqui (falta `g++`, un error de enlazado, dlopen sin
@@ -70,6 +71,7 @@ private:
 // nullptr tanto si nada se pudo generar (no es un error, `aviso` queda
 // vacio) como si `g++`/dlopen fallaron.
 std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const FunctionSigs& sigs,
+                                              const ClassSigs& clases,
                                               const std::filesystem::path& cache_dir,
                                               std::string& aviso);
 

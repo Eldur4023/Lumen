@@ -81,7 +81,7 @@ static bool compilar_las_dos_vias(Program& prog, FunctionSigs& sigs, FunctionTab
     std::error_code ec;
     std::filesystem::remove_all(cache_dir, ec);
     std::string aviso;
-    nativo = compilar_nativo(prog, sigs, cache_dir, aviso);
+    nativo = compilar_nativo(prog, sigs, ClassSigs{}, cache_dir, aviso);
     if (!aviso.empty()) std::printf("aviso de compilar_nativo(): %s\n", aviso.c_str());
     return true;
 }
@@ -429,7 +429,7 @@ static bool prueba_tipos_dinamicos() {
         std::error_code ec;
         auto cache = std::filesystem::temp_directory_path() / "lumen_native_build_check_reasig";
         std::filesystem::remove_all(cache, ec);
-        auto nativo = compilar_nativo(prog, sigs, cache, aviso);
+        auto nativo = compilar_nativo(prog, sigs, ClassSigs{}, cache, aviso);
         std::filesystem::remove_all(cache, ec);
         if (nativo) {
             std::printf("  FALLA reasignacion de tipo: se compilo a nativo (deberia caer a "
@@ -610,7 +610,7 @@ int main() {
     std::filesystem::remove_all(cache_dir, ec);
 
     std::string aviso;
-    auto        nativo = compilar_nativo(prog, sigs, cache_dir, aviso);
+    auto        nativo = compilar_nativo(prog, sigs, ClassSigs{}, cache_dir, aviso);
     if (!aviso.empty()) std::printf("aviso de compilar_nativo(): %s\n", aviso.c_str());
     if (!nativo) {
         std::printf("FALLA: compilar_nativo() no compilo nada (deberia, fib/cuenta_primos "

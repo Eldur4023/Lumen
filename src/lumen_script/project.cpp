@@ -1695,16 +1695,18 @@ std::shared_ptr<Module> compile(const std::vector<fs::path>& inputs,
         auto fns  = build_functions(*mod, diags);
         mod->function_sigs = fns;
 
-        // --native (Fase 2): antes de construir rutas, para que puedan
-        // capturar mod->native.get() ya resuelto -- ver el comentario sobre
-        // NativeModule en project.hpp. Solo si lo demas compilo limpio: no
-        // tiene sentido invocar g++ sobre un programa que de todas formas no
-        // se va a publicar.
-        if (native && diags.empty())
-            mod->native = compilar_nativo(mod->program, fns, ".lumen-native", mod->native_aviso);
-
         auto sigs = build_class_signatures(*mod, diags);
         emit_class_bodies(*mod, sigs, fns, diags);
+
+        // --native (Fase 3): despues de las firmas/cuerpos de clase (necesita
+        // ClassSigs para constructores/metodos) y antes de construir rutas,
+        // para que puedan capturar mod->native.get() ya resuelto -- ver el
+        // comentario sobre NativeModule en project.hpp. Solo si lo demas
+        // compilo limpio: no tiene sentido invocar g++ sobre un programa que
+        // de todas formas no se va a publicar.
+        if (native && diags.empty())
+            mod->native = compilar_nativo(mod->program, fns, sigs, ".lumen-native",
+                                          mod->native_aviso);
 
         ClassTable classes;
         build_classes(mod->program, fns, sigs, &mod->program.imports, classes, diags);

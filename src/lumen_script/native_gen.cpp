@@ -45,7 +45,15 @@ bool tipo_elemento_contenedor_soportado(const Type& elem) {
 // se queda fuera (Comprobador::tipo_provable, caso Index). Si SE admite
 // escribir (`d[k] = v`, siempre valido en el VM) y los dos metodos que
 // reconoce metodos_de() para Dict: `has`/`keys`.
-bool tipo_soportado(const Type& t) {
+// `clases`, cuando se pasa, permite ademas Type::Kind::Class -- solo si esa
+// clase concreta tiene entrada en la tabla (construir_clases() solo mete
+// las que son representables: todos los campos escalares, ninguno
+// opcional). Sin `clases` (el valor por defecto), cualquier Class se
+// rechaza -- es lo que ya quiere tipo_elemento_contenedor_soportado() (una
+// clase nunca es valida como elemento de List/Dict; el lenguaje tampoco lo
+// permite como campo de otra clase) y tipo_abi_soportado() (una clase
+// nunca cruza la ABI, sea representable o no).
+bool tipo_soportado(const Type& t, const TablaClases* clases = nullptr) {
     if (t.is_optional()) return false;
     switch (t.kind()) {
         case Type::Kind::Int:
@@ -57,6 +65,8 @@ bool tipo_soportado(const Type& t) {
         case Type::Kind::List:
         case Type::Kind::Dict:
             return tipo_elemento_contenedor_soportado(t.element());
+        case Type::Kind::Class:
+            return clases && clases->count(t.class_name()) > 0;
         default:
             return false;
     }
@@ -88,6 +98,7 @@ std::string tipo_cpp(const Type& t) {
         case Type::Kind::String: return "std::string";
         case Type::Kind::List:   return "LList<" + tipo_cpp(t.element()) + ">";
         case Type::Kind::Dict:   return "LDict<" + tipo_cpp(t.element()) + ">";
+        case Type::Kind::Class:  return "L" + t.class_name();
         default: return ""; // inalcanzable si tipo_soportado() dio el visto bueno
     }
 }
@@ -194,9 +205,14 @@ bool metodo_string_devuelve_bool(const std::string& nombre) {
 // comparar eso (incluido el elemento, recursivamente).
 class Comprobador {
 public:
-    explicit Comprobador(const std::vector<std::string>& nombre_por_indice,
-                        const TablaFirmas& firmas)
-        : nombre_por_indice_(nombre_por_indice), firmas_(firmas) {}
+    Comprobador(const std::vector<std::string>& nombre_por_indice, const TablaFirmas& firmas,
+               const TablaClases& clases, const TablaRoles& roles)
+        : nombre_por_indice_(nombre_por_indice), firmas_(firmas), clases_(clases), roles_(roles) {}
+
+    // Expuesto para que Generador pueda traducir un ConstructorCall/
+    // ClassMethodCall a la clase (y, para un metodo, el nombre) que
+    // corresponde a su call_index -- ver esos casos en Generador::expr.
+    const TablaRoles& roles() const { return roles_; }
 
     // Ranura -> tipo declarado, en el orden en que VarDecl/parametros/`for`
     // los van presentando -- igual que Generador::ranura_a_nombre_, pero de
@@ -217,12 +233,40 @@ public:
             case IrExprKind::StringLit: return Type::primitive(Type::Kind::String);
 
             // Sin representacion en esta fase, o sin sentido fuera de una
-            // ruta/clase.
+            // ruta.
             case IrExprKind::NullLit:
-            case IrExprKind::Member:
             case IrExprKind::Await:
-            case IrExprKind::This:
                 return std::nullopt;
+
+            // El unico nodo del IR que YA lleva el nombre de la clase
+            // directamente en su tipo (e.type = Type::class_ref(cls),
+            // puesto por tipo_de() -- ver check_method/check_ctor: "this"
+            // se declara con exactamente ese tipo). No hace falta pasar
+            // por ranura_tipos_: "this" no es reasignable (no existe
+            // "this = x" en la gramatica), asi que su tipo es solido sin
+            // necesitar la induccion que protege a un Ident normal.
+            case IrExprKind::This:
+                if (e.type.kind() != Type::Kind::Class || !clases_.count(e.type.class_name()))
+                    return std::nullopt;
+                return e.type;
+
+            // o.campo (incluido this.campo): demostrable solo si `o` es
+            // demostrablemente una instancia de una clase representable
+            // (TablaClases) que de verdad tiene ese campo -- resuelto por
+            // NOMBRE aqui, en tiempo de generacion, no en tiempo de
+            // ejecucion (una clase tipica tiene unos pocos campos; no hay
+            // ninguna busqueda que ahorrar en runtime, a diferencia de
+            // GetMember en el VM).
+            case IrExprKind::Member: {
+                if (!e.object) return std::nullopt;
+                auto tobj = tipo_provable(*e.object);
+                if (!tobj || tobj->kind() != Type::Kind::Class) return std::nullopt;
+                auto cit = clases_.find(tobj->class_name());
+                if (cit == clases_.end()) return std::nullopt;
+                for (const auto& c : cit->second.campos)
+                    if (c.nombre == e.text) return c.tipo;
+                return std::nullopt;
+            }
 
             case IrExprKind::Ident: {
                 auto it = ranura_tipos_.find(e.slot);
@@ -419,6 +463,60 @@ public:
                     }
                     return fit->second.retorno;
                 }
+                // ClassName(args...): solo el constructor SIN cuerpo
+                // (automapeo) -- ver RolFuncion::tiene_cuerpo. El automapeo
+                // exige un argumento POR CADA campo, en el mismo orden de
+                // declaracion (generar_clase_runtime genera el unico
+                // constructor de la clase C++ con esa misma firma
+                // posicional): si el numero no coincide, no es este
+                // constructor (uno con menos parametros que campos, que
+                // dejaria alguno en null, no se genera nunca -- ver
+                // construir_clases).
+                if (e.call_shape == IrCallShape::ConstructorCall) {
+                    auto rit = roles_.find(e.call_index);
+                    if (rit == roles_.end() || !rit->second.metodo.empty() ||
+                        rit->second.tiene_cuerpo)
+                        return std::nullopt;
+                    auto cit = clases_.find(rit->second.clase);
+                    if (cit == clases_.end()) return std::nullopt;
+                    const auto& campos = cit->second.campos;
+                    if (campos.size() != e.args.size()) return std::nullopt;
+                    for (size_t i = 0; i < e.args.size(); ++i) {
+                        if (!e.args[i].value) return std::nullopt;
+                        auto ta = tipo_provable(*e.args[i].value);
+                        if (!ta || *ta != campos[i].tipo) return std::nullopt;
+                    }
+                    return Type::class_ref(rit->second.clase);
+                }
+                // receptor.metodo(args...): el receptor tiene que ser
+                // demostrablemente una instancia de la MISMA clase que
+                // check_call ya resolvio para este call_index -- una
+                // comprobacion redundante en la practica (los dos vienen
+                // del mismo check_call, sobre el mismo `e.object`), pero
+                // barata, y consistente con no confiar en nada que no se
+                // pueda demostrar aqui mismo (ver el comentario de la
+                // clase).
+                if (e.call_shape == IrCallShape::ClassMethodCall) {
+                    if (!e.object) return std::nullopt;
+                    auto trec = tipo_provable(*e.object);
+                    if (!trec || trec->kind() != Type::Kind::Class) return std::nullopt;
+                    auto rit = roles_.find(e.call_index);
+                    if (rit == roles_.end() || rit->second.metodo.empty() ||
+                        rit->second.clase != trec->class_name())
+                        return std::nullopt;
+                    auto cit = clases_.find(rit->second.clase);
+                    if (cit == clases_.end()) return std::nullopt;
+                    auto mit = cit->second.metodos.find(rit->second.metodo);
+                    if (mit == cit->second.metodos.end() ||
+                        mit->second.params.size() != e.args.size())
+                        return std::nullopt;
+                    for (size_t i = 0; i < e.args.size(); ++i) {
+                        if (!e.args[i].value) return std::nullopt;
+                        auto ta = tipo_provable(*e.args[i].value);
+                        if (!ta || *ta != mit->second.params[i]) return std::nullopt;
+                    }
+                    return mit->second.retorno;
+                }
                 return std::nullopt;
             }
         }
@@ -443,7 +541,7 @@ public:
                 return s.value && tipo_provable(*s.value).has_value();
 
             case IrStmtKind::VarDecl: {
-                if (!tipo_soportado(s.decl_type)) return false;
+                if (!tipo_soportado(s.decl_type, &clases_)) return false;
                 if (s.value) {
                     auto t = tipo_provable(*s.value);
                     if (!t || *t != s.decl_type) return false;
@@ -490,7 +588,28 @@ public:
                         return tidx->kind() == Type::Kind::String && *tval == tobj->element();
                     return false;
                 }
-                return false; // Session/Member: sesion o clase, fuera de esta fase
+                if (s.assign_target == IrAssignTarget::Member) {
+                    // o.campo = v (incluido this.campo = v): igual que
+                    // Index, solo sobre una variable (This o Ident) -- una
+                    // instancia demostrablemente de una clase representable
+                    // que de verdad tiene ese campo, con el valor exacto de
+                    // su tipo declarado.
+                    if (!s.assign_object ||
+                        (s.assign_object->kind != IrExprKind::Ident &&
+                         s.assign_object->kind != IrExprKind::This))
+                        return false;
+                    auto tobj = tipo_provable(*s.assign_object);
+                    if (!tobj || tobj->kind() != Type::Kind::Class) return false;
+                    auto cit = clases_.find(tobj->class_name());
+                    if (cit == clases_.end()) return false;
+                    const Type* campo_tipo = nullptr;
+                    for (const auto& c : cit->second.campos)
+                        if (c.nombre == s.assign_field) { campo_tipo = &c.tipo; break; }
+                    if (!campo_tipo) return false;
+                    auto tval = tipo_provable(*s.value);
+                    return tval && *tval == *campo_tipo;
+                }
+                return false; // Session: fuera de esta fase (requiere una ruta)
             }
 
             case IrStmtKind::If:
@@ -535,6 +654,8 @@ public:
 private:
     const std::vector<std::string>& nombre_por_indice_;
     const TablaFirmas&               firmas_;
+    const TablaClases&               clases_;
+    const TablaRoles&                roles_;
     std::map<int, Type>              ranura_tipos_;
 };
 
@@ -631,6 +752,19 @@ public:
             case IrExprKind::Index:
                 return expr(*e.object) + ".lumen_get(" + expr(*e.lhs) + ")";
 
+            // "l_this" es el nombre fijo del receptor en un metodo generado
+            // (ver generar_metodo_nativo) -- This no lleva `text` en el IR
+            // (solo `slot`), a diferencia de un Ident normal.
+            case IrExprKind::This:
+                return "l_this";
+
+            // o.campo: el nombre del accesor lo pone generar_clase_runtime
+            // ("campo_" + nombre de campo), resuelto en tiempo de
+            // generacion -- Comprobador::tipo_provable() ya demostro que
+            // `o` es de una clase que de verdad tiene ese campo.
+            case IrExprKind::Member:
+                return expr(*e.object) + ".campo_" + e.text + "()";
+
             case IrExprKind::Unary:
                 return std::string("(") + (e.text == "not" ? "!" : "-") + expr(*e.lhs) + ")";
 
@@ -658,6 +792,36 @@ public:
             }
 
             case IrExprKind::Call: {
+                // ClassName(args...): el UNICO constructor de la clase C++
+                // generada (generar_clase_runtime) es, a proposito, el
+                // automapeo -- un valor por campo, en orden -- asi que
+                // llamarlo directamente ES la logica del constructor sin
+                // cuerpo que tipo_provable() ya demostro. No hace falta
+                // ningun simbolo `l_new_X` aparte.
+                if (e.call_shape == IrCallShape::ConstructorCall) {
+                    const auto& rol = comprobador_.roles().at(e.call_index);
+                    std::string s = "L" + rol.clase + "(";
+                    for (size_t i = 0; i < e.args.size(); ++i) {
+                        if (i) s += ", ";
+                        s += expr(*e.args[i].value);
+                    }
+                    s += ")";
+                    return s;
+                }
+                // receptor.metodo(args...): funcion libre nombrada
+                // "l_<Clase>_<metodo>" (ver generar_metodo_nativo) -- no
+                // "l_<metodo>" solo, porque dos clases distintas pueden
+                // compartir el nombre de un metodo. El receptor va primero,
+                // como cualquier llamada a metodo en el IR (ver
+                // Emitter::emit_call, IrCallShape::ClassMethodCall).
+                if (e.call_shape == IrCallShape::ClassMethodCall) {
+                    const auto& rol = comprobador_.roles().at(e.call_index);
+                    std::string s = "l_" + rol.clase + "_" + rol.metodo + "(" + expr(*e.object);
+                    for (const auto& a : e.args) s += ", " + expr(*a.value);
+                    s += ")";
+                    return s;
+                }
+
                 // "add" sobre una List: sintaxis de metodo nativo
                 // (LList::lumen_add), no funcion libre como los de string
                 // -- es el unico metodo que Comprobador acepta sobre un
@@ -724,6 +888,9 @@ public:
                 if (s.assign_target == IrAssignTarget::Index)
                     return expr(*s.assign_object) + ".lumen_set(" + expr(*s.assign_index) +
                            ", " + expr(*s.value) + ");";
+                if (s.assign_target == IrAssignTarget::Member)
+                    return expr(*s.assign_object) + ".campo_" + s.assign_field + "() = " +
+                           expr(*s.value) + ";";
                 // Local: stmt_compilable() ya garantizo esto. El nombre C++
                 // es el que se registro cuando esa ranura se declaro (un
                 // parametro o un VarDecl anterior).
@@ -796,13 +963,15 @@ private:
 
 std::optional<FuncionNativa> generar_funcion_nativa(const FnDecl& fn, const IrBlock& body,
                                                      const std::vector<std::string>& nombre_por_indice,
-                                                     const TablaFirmas& firmas) {
+                                                     const TablaFirmas& firmas,
+                                                     const TablaClases& clases,
+                                                     const TablaRoles& roles) {
     const Type retorno_decl = Type::from_declared(fn.return_type);
-    if (!tipo_soportado(retorno_decl)) return std::nullopt;
+    if (!tipo_soportado(retorno_decl, &clases)) return std::nullopt;
     for (const auto& p : fn.params)
-        if (!tipo_soportado(Type::from_declared(p.type))) return std::nullopt;
+        if (!tipo_soportado(Type::from_declared(p.type), &clases)) return std::nullopt;
 
-    Comprobador comprobador(nombre_por_indice, firmas);
+    Comprobador comprobador(nombre_por_indice, firmas, clases, roles);
     // check_function declara los parametros, en orden, antes que nada mas
     // (ver Emitter::check_function): la ranura i-esima es siempre el
     // parametro i-esimo -- mismo orden que Generador::registrar() mas abajo.
@@ -885,6 +1054,157 @@ std::optional<FuncionNativa> generar_funcion_nativa(const FnDecl& fn, const IrBl
                       "(const NativeValue* args, int32_t argc) {\n" +
                       cuerpo_wrapper;
     return out;
+}
+
+std::optional<FuncionNativa> generar_metodo_nativo(const std::string& clase, const FnDecl& fn,
+                                                    const IrBlock& body,
+                                                    const std::vector<std::string>& nombre_por_indice,
+                                                    const TablaFirmas& firmas,
+                                                    const TablaClases& clases,
+                                                    const TablaRoles& roles) {
+    auto cit = clases.find(clase);
+    if (cit == clases.end()) return std::nullopt; // la propia clase no es representable
+
+    const Type retorno_decl = Type::from_declared(fn.return_type);
+    if (!tipo_soportado(retorno_decl, &clases)) return std::nullopt;
+    for (const auto& p : fn.params)
+        if (!tipo_soportado(Type::from_declared(p.type), &clases)) return std::nullopt;
+
+    Comprobador comprobador(nombre_por_indice, firmas, clases, roles);
+    // check_method declara "this" ANTES que los parametros (ranura 0), al
+    // reves que check_function -- ver el comentario de Emitter::check_method.
+    comprobador.registrar(0, Type::class_ref(clase));
+    for (size_t i = 0; i < fn.params.size(); ++i)
+        comprobador.registrar(static_cast<int>(i + 1), Type::from_declared(fn.params[i].type));
+    if (!comprobador.block_compilable(body, retorno_decl)) return std::nullopt;
+
+    FuncionNativa out;
+    out.nombre_lumen = fn.name;
+
+    std::string params = "L" + clase + " l_this";
+    for (size_t i = 0; i < fn.params.size(); ++i)
+        params += ", " + tipo_cpp(Type::from_declared(fn.params[i].type)) + " " +
+                  nombre_cpp(fn.params[i].name);
+    out.firma_cpp = tipo_cpp(retorno_decl) + " l_" + clase + "_" + fn.name + "(" + params + ")";
+
+    Generador gen(nombre_por_indice, comprobador);
+    // "this" no necesita registrarse por nombre (This tiene su propio caso
+    // en Generador::expr, "l_this" fijo); los parametros si, para poder
+    // resolver un Assign(Local) por su nombre C++.
+    for (size_t i = 0; i < fn.params.size(); ++i)
+        gen.registrar(static_cast<int>(i + 1), fn.params[i].name);
+    out.cuerpo_cpp = "{\n" + gen.block(body, 1) + "}";
+
+    // Nunca cruza la ABI -- el receptor es siempre de tipo clase, y una
+    // clase nunca es tipo_abi_soportado() (igual que string/List/Dict).
+    // simbolo_abi/wrapper_cpp quedan vacios: solo invocable directamente en
+    // C++ desde otra funcion nativa (otro metodo, o una funcion suelta cuyo
+    // cuerpo pasa una instancia sin construirla -- ver el comentario sobre
+    // classes_ == nullptr en compilar_nativo).
+    return out;
+}
+
+std::string generar_clase_runtime(const std::string& nombre_clase, const ClaseNativa& clase) {
+    const std::string tipo = "L" + nombre_clase;
+    const std::string caja = tipo + "_Box";
+
+    // Parametros del UNICO constructor -- el de la clase C++ y el de su
+    // caja -- en el orden de `clase.campos`: es, a la vez, el layout del
+    // struct y el automapeo del unico constructor Lumen que esta fase
+    // compila (ver RolFuncion::tiene_cuerpo en construir_clases()).
+    std::string params_tipados, params_nombres;
+    for (size_t i = 0; i < clase.campos.size(); ++i) {
+        if (i) { params_tipados += ", "; params_nombres += ", "; }
+        params_tipados += tipo_cpp(clase.campos[i].tipo) + " " + nombre_cpp(clase.campos[i].nombre);
+        params_nombres += nombre_cpp(clase.campos[i].nombre);
+    }
+
+    std::string s = "struct " + caja + " {\n    long rc;\n";
+    for (const auto& c : clase.campos) s += "    " + tipo_cpp(c.tipo) + " f_" + c.nombre + ";\n";
+    s += "    " + caja + "(" + params_tipados + ") : rc(1)";
+    for (const auto& c : clase.campos) s += ", f_" + c.nombre + "(" + nombre_cpp(c.nombre) + ")";
+    s += " {}\n};\n";
+
+    // Semantica de referencia real (§8), mismo diseño que LList/LDict:
+    // copiar una instancia copia el puntero a la caja, no los campos -- dos
+    // variables sobre la misma instancia ven las mutaciones la una de la
+    // otra, igual que Value::Dict en el VM (que es, hoy, la representacion
+    // de CUALQUIER instancia -- ver el comentario de §7/§8).
+    s += "class " + tipo + " {\npublic:\n";
+    s += "    " + tipo + "(" + params_tipados + ") : b_(new " + caja + "(" + params_nombres + ")) {}\n";
+    s += "    " + tipo + "(const " + tipo + "& o) : b_(o.b_) { ++b_->rc; }\n";
+    s += "    " + tipo + "(" + tipo + "&& o) noexcept : b_(o.b_) { o.b_ = nullptr; }\n";
+    s += "    " + tipo + "& operator=(const " + tipo + "& o) {\n"
+         "        if (b_ != o.b_) { rel(); b_ = o.b_; ++b_->rc; }\n"
+         "        return *this;\n"
+         "    }\n";
+    s += "    " + tipo + "& operator=(" + tipo + "&& o) noexcept {\n"
+         "        if (this != &o) { rel(); b_ = o.b_; o.b_ = nullptr; }\n"
+         "        return *this;\n"
+         "    }\n";
+    s += "    ~" + tipo + "() { rel(); }\n";
+    // Un accesor por campo, "campo_<nombre>()", que devuelve una REFERENCIA
+    // -- sirve para leer (Member) y para escribir (Assign Member: "x.campo_f()
+    // = v") con el mismo metodo, sin necesitar un getter y un setter por
+    // separado (ver Generador::expr/stmt, casos Member).
+    for (const auto& c : clase.campos)
+        s += "    " + tipo_cpp(c.tipo) + "& campo_" + c.nombre + "() const { return b_->f_" +
+             c.nombre + "; }\n";
+    s += "private:\n    void rel() { if (b_ && --b_->rc == 0) delete b_; }\n    " + caja +
+         "* b_;\n};\n";
+    return s;
+}
+
+void construir_clases(const Program& prog, const ClassSigs& clases_sig, TablaClases& clases,
+                      TablaRoles& roles) {
+    for (const auto& c : prog.classes) {
+        // Solo entra si TODOS los campos son representables (escalares, no
+        // opcionales) -- el lenguaje ya restringe los campos de clase a
+        // escalares (project.cpp), asi que en la practica el unico motivo
+        // real para quedar fuera es un campo `?`.
+        ClaseNativa cn;
+        bool todos_soportados = true;
+        for (const auto& f : c.fields) {
+            Type t = Type::from_declared(f.type);
+            if (t.is_optional() || !tipo_elemento_contenedor_soportado(t)) {
+                todos_soportados = false;
+                break;
+            }
+            cn.campos.push_back({f.name, t});
+        }
+        if (!todos_soportados) continue;
+
+        auto sig_it = clases_sig.find(c.name);
+        if (sig_it == clases_sig.end()) continue; // no deberia pasar: viene del mismo prog
+
+        for (const auto& m : c.methods) {
+            auto fsig_it = sig_it->second.methods.find(m.name);
+            if (fsig_it == sig_it->second.methods.end()) continue;
+            FirmaNativa firma;
+            firma.retorno = Type::from_declared(m.return_type);
+            for (const auto& p : m.params) firma.params.push_back(Type::from_declared(p.type));
+            cn.metodos[m.name] = std::move(firma);
+            roles[static_cast<int>(fsig_it->second.index)] = RolFuncion{c.name, m.name, true};
+        }
+
+        for (const auto& ct : c.ctors) {
+            auto idx_it = sig_it->second.ctors.find(ct.params.size());
+            if (idx_it == sig_it->second.ctors.end()) continue;
+            roles[static_cast<int>(idx_it->second)] = RolFuncion{c.name, "", ct.has_body};
+        }
+        // El constructor implicito que build_class_signatures() sintetiza
+        // cuando la clase no declara ninguno (project.cpp): "un parametro
+        // por campo, en orden", sin cuerpo. No vive en Program::classes
+        // (se sintetiza aparte, dentro de compile()), asi que se repite la
+        // misma regla aqui.
+        if (c.ctors.empty() && !c.fields.empty()) {
+            auto idx_it = sig_it->second.ctors.find(c.fields.size());
+            if (idx_it != sig_it->second.ctors.end())
+                roles[static_cast<int>(idx_it->second)] = RolFuncion{c.name, "", false};
+        }
+
+        clases[c.name] = std::move(cn);
+    }
 }
 
 std::string abi_prelude() {

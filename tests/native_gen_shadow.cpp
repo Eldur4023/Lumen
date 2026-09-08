@@ -131,7 +131,8 @@ int main() {
     // aceptable que silenciar.
     std::string codigo = "#include <cstdint>\n#include <string>\n\n" + error_runtime_prelude() + "\n";
     for (size_t i = 0; i < prog.functions.size(); ++i) {
-        auto f = generar_funcion_nativa(prog.functions[i], cuerpos[i], por_indice, firmas);
+        auto f = generar_funcion_nativa(prog.functions[i], cuerpos[i], por_indice, firmas,
+                                        TablaClases{}, TablaRoles{});
         if (!f) {
             std::printf("FALLA: '%s' no se pudo generar a C++ (deberia, para el criterio de "
                         "esta fase)\n", prog.functions[i].name.c_str());

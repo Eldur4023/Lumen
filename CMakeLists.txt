@@ -227,6 +227,14 @@ add_executable(prueba_native_build tests/native_build_shadow.cpp)
 target_link_libraries(prueba_native_build PRIVATE lumen_script)
 add_test(NAME native_build_shadow COMMAND prueba_native_build)
 
+# Clases de usuario: genera el C++ de una clase y sus metodos directamente
+# (sin pasar por compilar_nativo(), que hoy no tiene nada que ofrecer para un
+# programa solo-clases -- ver el comentario en tests/native_class_shadow.cpp)
+# y compara su ejecucion contra la VM.
+add_executable(prueba_native_class tests/native_class_shadow.cpp)
+target_link_libraries(prueba_native_class PRIVATE lumen_script)
+add_test(NAME native_class_shadow COMMAND prueba_native_class)
+
 # El traductor de marcadores de postgres es una funcion pura: se prueba sin
 # servidor incluyendo el .cpp del driver, para probar EL codigo y no una copia.
 if(LUMEN_POSTGRES AND PQ_INC AND PQ_LIB)

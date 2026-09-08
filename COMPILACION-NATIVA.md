@@ -933,6 +933,90 @@ semántica de referencia (dos variables sobre el mismo diccionario). Coincide en
 `--native` en todos los casos. 79/79 del corpus real y el canario `LUMEN_SHADOW_CHECK` siguen en
 verde.
 
+**Quinto corte, el último de la fase: clases de usuario.** Confirmado contra la investigación del
+compilador real (no asumido): una clase en Lumen Script no tiene herencia, ni interfaces, ni
+despacho dinámico, ni sobrecarga de métodos — solo sobrecarga de *constructores*, distinguidos por
+aridad (`ClassSig::ctors`, un `map<aridad, índice>`). Los campos están restringidos por el propio
+compilador a escalares (`project.cpp`), así que una instancia es, por construcción, un registro
+plano — la única complicación real es que un campo puede ser `?` (opcional), y esta fase, como en
+todo lo demás, deja `?` fuera.
+
+`generar_clase_runtime()` genera, por clase, un `struct <Clase>_Box` (campos con prefijo `f_`, para
+no chocar con el propio `rc`) y una clase envoltorio `L<Clase>` con semántica de referencia real
+(§8) — mismo diseño que `LList`/`LDict`, sin plantilla porque cada clase tiene su propio conjunto
+fijo de campos tipados, no un elemento homogéneo. Un único accesor por campo,
+`campo_<nombre>()`, que devuelve una **referencia** — sirve para leer (`Member`) y para escribir
+(`Assign` a `Member`: `p.campo_x() = v`) sin necesitar un par *getter*/*setter*. El único
+constructor de `L<Clase>` (aparte de copia/movimiento) toma un valor por campo, en el orden de
+declaración — y es, a la vez, la única forma de construir una instancia en C++ y el automapeo del
+único constructor Lumen que esta fase compila (ver el límite de abajo): no hace falta ningún
+símbolo `l_new_X` aparte, `ClassName(args...)` en el IR se traduce, literal, a `LClassName(args...)`.
+
+Un método se genera como **función libre**, no como método C++ de `L<Clase>` — mismo patrón que ya
+usa el resto del backend (prototipos antes que cuerpos, para que el orden de declaración en el
+`.lum` no importe) y evita que la clase C++ necesite conocer, dentro de su propia definición, el
+cuerpo (potencialmente arbitrario) de cada método. El receptor va como primer parámetro explícito
+(`L<Clase> l_this`), igual que en el IR (`this` ocupa la ranura 0 en un método — al revés que en un
+constructor, donde ocupa la última — ver `Emitter::check_method`/`check_ctor`). El símbolo se
+nombra `l_<Clase>_<método>`, no solo `l_<método>`: Lumen no tiene sobrecarga, pero dos clases
+*distintas* sí pueden compartir el nombre de un método, y cada clase es su propio espacio de
+nombres.
+
+**El límite deliberado, más estrecho que en los cortes anteriores: solo el constructor SIN
+cuerpo.** El constructor con cuerpo tiene un problema real que ningún otro corte de esta fase tenía
+todavía: `emit_ctor` arranca la instancia con **todos** los campos a `null` (`MakeDict`) y solo
+sobrescribe los que el cuerpo toca explícitamente — verificar que un cuerpo arbitrario (con
+`if`/`while`) deja **todos** los campos con su tipo declarado en **todas** las rutas posibles exige
+un análisis de asignación definida que esta fase no hace. El constructor sin cuerpo (declarado así,
+o el implícito que sintetiza `project.cpp` cuando la clase no declara ninguno) no tiene ese
+problema: automapea un parámetro a cada campo, en el mismo orden, así que cubre todos los campos
+por construcción — es exactamente la firma del único constructor C++ que genera
+`generar_clase_runtime()`. `Comprobador::tipo_provable()` exige, para un `ConstructorCall`, que el
+número de argumentos sea igual al de campos (rechaza un constructor sin cuerpo con MENOS parámetros
+que campos, que dejaría alguno en `null`) y que cada uno demuestre exactamente el tipo del campo en
+la MISMA posición (`RolFuncion::tiene_cuerpo` descarta cualquier constructor con cuerpo, sea cual
+sea su aridad).
+
+**El límite que importa de verdad: esta pieza es correcta, pero hoy es inalcanzable.** A diferencia
+de `string`/`List`/`Dict` (verificados sirviendo HTTP de verdad), no hay manera de ejercitar una
+clase nativa desde un programa Lumen en ejecución todavía, por dos motivos estructurales, no por
+ningún descuido de esta fase:
+
+1. **Una función suelta no puede tocar una clase.** Confirmado contra el compilador real (no
+   asumido): `build_functions()` en `project.cpp` construye el `Emitter` de cada `fn` con
+   `classes_ = nullptr` — el checker real *nunca* resuelve `ConstructorCall`/`ClassMethodCall`
+   dentro de una función suelta, solo dentro de una ruta o un método (que sí reciben `ClassSigs`).
+   `fn int f(): Punto(1, 2)` es, literalmente, un error de compilación hoy. `compilar_nativo()`
+   respeta esto a propósito, con el mismo `classes_ = nullptr` en el `Emitter` de cada función
+   suelta — pasarle `ClassSigs` ahí haría a esta fase *más permisiva* que el compilador real, la
+   misma familia de divergencia que motivó la corrección crítica de más arriba.
+2. **Un método nunca cruza la ABI.** El receptor es siempre de tipo clase, y una clase nunca es
+   `tipo_abi_soportado()` — así que ningún método tiene nunca un *wrapper*, y no hay ninguna otra
+   vía hoy (las rutas, que sí podrían llamar a un método, no se compilan a nativo hasta la Fase 4)
+   para que el VM llegue a invocar código de clase nativo.
+
+`compilar_nativo()` maneja esto con seguridad — un programa con clases pero sin ninguna función
+suelta que cruce la ABI simplemente no tiene nada que ofrecer (`generadas.empty()` → `nullptr`, sin
+aviso de error) — pero significa que, hasta que la Fase 4 compile rutas, el código que genera esta
+pieza no tiene ningún punto de entrada real desde `--native`. Sigue siendo trabajo necesario, no
+prematuro: es exactamente lo que la Fase 4 va a necesitar para que una ruta que construye y usa una
+instancia se pueda compilar — y, mientras tanto, no hace daño: probado contra
+`tests/casos/clases.lum` (el caso canónico del corpus real, con `Alta`/`Punto` y sus reglas
+`validate:`), `--native` sigue compilando limpio las funciones sueltas del fichero (`doble`,
+`factorial`, `infinita`) sin que el código de clase generado internamente cause ningún problema.
+
+Validado, por tanto, de forma distinta al resto de esta fase: no contra el binario real sirviendo
+HTTP, sino en `tests/native_class_shadow.cpp`, que genera el C++ de una clase y sus métodos
+directamente (`generar_clase_runtime()`/`generar_metodo_nativo()`, sin pasar por
+`compilar_nativo()`) y lo ejecuta con un `main()` propio — el mismo patrón que
+`native_gen_shadow.cpp` usó para `fib`/`cuenta_primos` antes de que existiera `compilar_nativo()`.
+Cubre: campos y un método (`this.x`, aritmética), un `ConstructorCall` **dentro** de un método que
+devuelve una instancia nueva (`Punto(this.x + dx, this.y + dy)`), mutación de campo
+(`this.x = this.x + dx`, `Assign` a `Member`), y el caso que de verdad importa según §8 — dos
+variables sobre la misma instancia, mutar una a través de la otra, y comprobar que las dos ven el
+cambio. Coincide con la VM en todos los casos. 79/79 del corpus real y el canario
+`LUMEN_SHADOW_CHECK` siguen en verde.
+
 ### Fase 4 — Rutas HTTP síncronas
 - Handler generado como `Task<void>` (o función síncrona si no hay `await`, §9), registrado en
   el router igual que hoy.

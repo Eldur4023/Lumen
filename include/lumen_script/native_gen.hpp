@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "ast.hpp"
+#include "emitter.hpp" // ClassSigs
 #include "ir.hpp"
 #include "type.hpp"
 
@@ -75,15 +76,97 @@ struct FirmaNativa {
 // el mapa (alfabetico) todavia no proceso.
 using TablaFirmas = std::unordered_map<std::string, FirmaNativa>;
 
+// Un campo de clase ya reducido a su Type -- solo entra a ClaseNativa::campos
+// si es representable (ver tipo_elemento_contenedor_soportado en
+// native_gen.cpp): int/float/bool/string, nunca opcional -- exactamente el
+// mismo subconjunto que un elemento de List o un valor de Dict, porque el
+// lenguaje ya restringe los campos de clase a escalares (project.cpp). El
+// ORDEN de esta lista fija el layout del struct C++ generado.
+struct CampoNativo {
+    std::string nombre;
+    Type        tipo;
+};
+
+// Lo que native_gen.cpp necesita saber de una clase para representarla de
+// forma nativa: el layout (campos, en orden de declaracion) y la firma de
+// cada metodo (para comprobar una llamada, igual que TablaFirmas para
+// funciones sueltas -- pero por metodo, no globalmente, porque dos clases
+// distintas pueden tener un metodo con el mismo nombre). Una clase con
+// algun campo no representable (List/Dict, opcional -- una clase como
+// campo de otra clase no existe en el lenguaje) sencillamente no tiene
+// entrada aqui: cualquier uso suyo (This/Member/ConstructorCall/
+// ClassMethodCall) se queda sin poder demostrar su tipo.
+struct ClaseNativa {
+    std::vector<CampoNativo>                     campos;
+    std::unordered_map<std::string, FirmaNativa> metodos;
+};
+// Por nombre de clase Lumen.
+using TablaClases = std::unordered_map<std::string, ClaseNativa>;
+
+// A que clase (y que papel) pertenece una funcion de la tabla global,
+// indexada igual que FunctionTable/nombre_por_indice: `metodo` vacio
+// significa que es un constructor. `tiene_cuerpo` solo importa para un
+// constructor -- esta fase solo compila el que NO tiene cuerpo (el
+// automapeo "un parametro por campo, en orden", ver COMPILACION-NATIVA.md):
+// comprobar que un constructor CON cuerpo deja todos los campos con su
+// tipo declarado (que ninguno se quede en `null`, el valor con el que
+// arranca `MakeDict` en emit_ctor) exige un analisis de asignacion
+// definida sobre las ramas del cuerpo que esta fase todavia no hace.
+struct RolFuncion {
+    std::string clase;
+    std::string metodo;
+    bool        tiene_cuerpo = false;
+};
+using TablaRoles = std::unordered_map<int, RolFuncion>;
+
+// Construye TablaClases/TablaRoles a partir del programa entero y las
+// firmas de clase ya resueltas (ClassSigs, de project.cpp) -- incluido el
+// constructor implicito que build_class_signatures() sintetiza cuando una
+// clase no declara ninguno: ese constructor NO vive en el AST
+// (Program::classes[i].ctors), asi que esta funcion repite, a proposito,
+// la misma regla de sintesis ("un parametro por campo, en orden") que ya
+// aplica project.cpp.
+void construir_clases(const Program& prog, const ClassSigs& clases_sig,
+                      TablaClases& clases, TablaRoles& roles);
+
 // `nombre_por_indice[i]` es el nombre Lumen de la funcion de indice `i` en
 // la tabla del modulo (FnSig::index) -- hace falta para traducir una
 // llamada (IrExpr::Call, call_shape == UserFunctionCall) de vuelta a un
 // nombre, porque el IR solo lleva el indice ya resuelto. `firmas` es la
 // tabla de arriba, para comprobar el tipo de cada argumento contra el
-// parametro correspondiente del destino.
+// parametro correspondiente del destino. `clases`/`roles` son las tablas de
+// arriba, para cuando el cuerpo de esta funcion usa una clase (crea una
+// instancia, llama a un metodo, lee/escribe un campo).
 std::optional<FuncionNativa> generar_funcion_nativa(const FnDecl& fn, const IrBlock& body,
                                                      const std::vector<std::string>& nombre_por_indice,
-                                                     const TablaFirmas& firmas);
+                                                     const TablaFirmas& firmas,
+                                                     const TablaClases& clases,
+                                                     const TablaRoles& roles);
+
+// Igual que generar_funcion_nativa(), para el cuerpo de un metodo: `this`
+// ocupa la ranura 0 (antes que los parametros, ver Emitter::check_method),
+// al reves que en un constructor. Nunca tiene wrapper de ABI -- un
+// receptor de tipo clase nunca cruza la ABI fija (tipo_abi_soportado), asi
+// que ni falta que hace intentarlo -- y el simbolo C++ se nombra
+// `l_<clase>_<metodo>`, no solo `l_<metodo>`, porque dos clases distintas
+// pueden compartir el nombre de un metodo (Lumen no tiene sobrecarga, pero
+// cada clase es su propio espacio de nombres).
+std::optional<FuncionNativa> generar_metodo_nativo(const std::string& clase, const FnDecl& fn,
+                                                    const IrBlock& body,
+                                                    const std::vector<std::string>& nombre_por_indice,
+                                                    const TablaFirmas& firmas,
+                                                    const TablaClases& clases,
+                                                    const TablaRoles& roles);
+
+// El texto C++ del struct/caja de una clase nativa -- LPunto, con la misma
+// semantica de referencia real (§8) que LList/LDict (caja con refcount no
+// atomico), pero SIN plantilla: cada clase Lumen tiene su propio conjunto
+// FIJO de campos tipados, no un elemento homogeneo. El unico constructor
+// (aparte de copia/movimiento) toma un valor por campo, en el ORDEN de
+// `clase.campos` -- es, a la vez, el automapeo del unico constructor que
+// esta fase compila (ver RolFuncion::tiene_cuerpo) y la unica forma de
+// construir una instancia en C++ generado.
+std::string generar_clase_runtime(const std::string& nombre_clase, const ClaseNativa& clase);
 
 // El texto C++ de la definicion de NativeValue, identico al de
 // native_abi.hpp: hace falta duplicarlo dentro del .cpp que se compila a

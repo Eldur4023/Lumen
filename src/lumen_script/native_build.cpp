@@ -68,6 +68,7 @@ TablaFirmas construir_firmas(const Program& prog) {
 } // namespace
 
 std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const FunctionSigs& sigs,
+                                              const ClassSigs& clases_sig,
                                               const std::filesystem::path& cache_dir,
                                               std::string& aviso) {
     aviso.clear();
@@ -78,6 +79,18 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
 
     const TablaFirmas firmas = construir_firmas(prog);
 
+    TablaClases clases;
+    TablaRoles  roles;
+    construir_clases(prog, clases_sig, clases, roles);
+
+    // El texto de cada clase representable va ANTES que ningun prototipo/
+    // cuerpo: un LPunto usado como parametro/retorno necesita el tipo
+    // completo, no basta una declaracion adelantada. Sin dependencias entre
+    // clases que ordenar -- el lenguaje no admite una clase como campo de
+    // otra (project.cpp), asi que el orden entre ellas es indiferente.
+    std::string clases_texto;
+    for (const auto& [nombre, cn] : clases) clases_texto += generar_clase_runtime(nombre, cn) + "\n";
+
     struct Generada {
         size_t      indice;
         std::string simbolo_abi;
@@ -87,7 +100,9 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
     // alfabetico de nombre, no en el orden en que unas funciones llaman a
     // otras -- sin un prototipo adelantado, una funcion que llama a otra que
     // el mapa visita despues (p.ej. "usa" llamando a "valida") no compilaria
-    // porque C++ exige ver la declaracion antes del uso.
+    // porque C++ exige ver la declaracion antes del uso. Los metodos
+    // comparten el mismo bloque -- una funcion suelta puede llamar a un
+    // metodo (recibiendo la instancia ya construida) y viceversa.
     std::string prototipos;
     std::string cuerpos;
 
@@ -98,23 +113,60 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
         DiagnosticBag diags_ir; // descartable: si esta funcion ya compilo a
                                 // bytecode, su cuerpo tipa limpio tambien aqui.
         Chunk         descartable;
-        Emitter       emitter(diags_ir, &sigs, nullptr, &prog.imports);
-        IrBlock       body;
+        // classes_ = nullptr, igual que build_functions() en project.cpp:
+        // una funcion SUELTA no puede construir instancias ni llamar a un
+        // metodo (el checker real solo resuelve eso dentro de una ruta/
+        // metodo, que si reciben ClassSigs) -- pasarlo aqui haria a este
+        // check_function() mas permisivo que el compilador real, la misma
+        // clase de divergencia que motivo la correccion critica de mas
+        // arriba. Una funcion suelta SI puede recibir/devolver una
+        // instancia ya construida (un parametro/retorno de tipo clase, sin
+        // tocar sus campos ni metodos) -- eso no necesita classes_ en
+        // absoluto, solo el tipo declarado del parametro.
+        Emitter emitter(diags_ir, &sigs, nullptr, &prog.imports);
+        IrBlock body;
         if (!emitter.check_function(*fn, descartable, diags_ir, &body)) continue;
 
-        auto generada = generar_funcion_nativa(*fn, body, nombre_por_indice, firmas);
+        auto generada = generar_funcion_nativa(*fn, body, nombre_por_indice, firmas, clases, roles);
         if (!generada) continue;
 
         prototipos += generada->firma_cpp + ";\n";
         cuerpos += generada->firma_cpp + " " + generada->cuerpo_cpp + "\n\n";
-        // Sin simbolo_abi: la funcion usa `string` en su frontera y todavia
-        // no cruza la ABI fija (ver tipo_abi_soportado en native_gen.cpp).
-        // Su cuerpo ya quedo arriba, asi que otra funcion nativa que la
-        // llame directamente se sigue beneficiando -- solo se queda fuera
-        // del despacho desde la VM (por_indice no tendra entrada para ella).
+        // Sin simbolo_abi: la funcion usa string/List/Dict/clase en su
+        // frontera y todavia no cruza la ABI fija (ver tipo_abi_soportado
+        // en native_gen.cpp). Su cuerpo ya quedo arriba, asi que otra
+        // funcion nativa que la llame directamente se sigue beneficiando --
+        // solo se queda fuera del despacho desde la VM (por_indice no
+        // tendra entrada para ella).
         if (!generada->simbolo_abi.empty()) {
             cuerpos += generada->wrapper_cpp + "\n\n";
             generadas.push_back({sig.index, generada->simbolo_abi});
+        }
+    }
+
+    // Metodos de las clases representables (los constructores no necesitan
+    // generacion aparte: el UNICO constructor de la clase C++ generada, en
+    // generar_clase_runtime(), YA es el automapeo -- ver el comentario de
+    // ConstructorCall en Generador::expr). Nunca cruzan la ABI (el receptor
+    // es de tipo clase), asi que no aportan nada a `generadas`/por_indice --
+    // solo invocables desde otra funcion nativa, directamente en C++.
+    for (const auto& c : prog.classes) {
+        if (!clases.count(c.name)) continue; // la clase no es representable
+        for (const auto& m : c.methods) {
+            DiagnosticBag diags_ir;
+            Chunk         descartable;
+            // classes_ = &clases_sig aqui SI, igual que emit_class_bodies()
+            // en project.cpp: un metodo si puede construir instancias y
+            // llamar a otros metodos.
+            Emitter emitter(diags_ir, &sigs, &clases_sig, &prog.imports);
+            IrBlock body;
+            if (!emitter.check_method(c.name, m, descartable, diags_ir, &body)) continue;
+
+            auto generada = generar_metodo_nativo(c.name, m, body, nombre_por_indice, firmas,
+                                                  clases, roles);
+            if (!generada) continue;
+            prototipos += generada->firma_cpp + ";\n";
+            cuerpos += generada->firma_cpp + " " + generada->cuerpo_cpp + "\n\n";
         }
     }
 
@@ -124,7 +176,8 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
         "#include <cctype>\n#include <cstdint>\n#include <initializer_list>\n#include <string>\n"
         "#include <utility>\n#include <vector>\n\n" +
         abi_prelude() + "\n" + error_runtime_prelude() + "\n" + list_runtime_prelude() + "\n" +
-        dict_runtime_prelude() + "\n" + string_runtime_prelude() + "\n" + prototipos + "\n" + cuerpos;
+        dict_runtime_prelude() + "\n" + string_runtime_prelude() + "\n" + clases_texto + "\n" +
+        prototipos + "\n" + cuerpos;
 
     std::error_code ec;
     std::filesystem::create_directories(cache_dir, ec);
