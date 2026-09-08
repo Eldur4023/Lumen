@@ -56,7 +56,7 @@ static void caso(const char* nombre, const std::string& src,
     Emitter       em(diags_real, fns, classes, imports);
     Chunk         chunk;
     em.emit_condition(*e, names, chunk);
-    IrExprPtr ir = em.check_condition(*e, names, diags_shadow);
+    IrExprPtr ir = em.check_condition(*e, names, chunk, diags_shadow);
 
     auto texts = [](const DiagnosticBag& d) {
         std::vector<std::string> v;

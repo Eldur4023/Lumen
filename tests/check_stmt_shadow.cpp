@@ -56,7 +56,7 @@ static void caso_fn(const char* nombre, const std::string& src,
     Chunk         chunk;
     em.emit_function(prog.functions[0], chunk);
     IrBlock body;
-    em.check_function(prog.functions[0], diags_shadow, &body);
+    em.check_function(prog.functions[0], chunk, diags_shadow, &body);
 
     std::vector<std::string> real = texts(diags_real), shadow = texts(diags_shadow);
 
@@ -134,12 +134,12 @@ static void caso_clase(const char* nombre, const std::string& src,
     if (!cls.methods.empty()) {
         Chunk chunk;
         em.emit_method(cls.name, cls.methods[0], chunk);
-        em.check_method(cls.name, cls.methods[0], diags_shadow, &body);
+        em.check_method(cls.name, cls.methods[0], chunk, diags_shadow, &body);
     }
     if (!cls.ctors.empty()) {
         Chunk chunk;
         em.emit_ctor(cls.name, fields, cls.ctors[0], chunk);
-        em.check_ctor(cls.name, fields, cls.ctors[0], diags_shadow, &body);
+        em.check_ctor(cls.name, fields, cls.ctors[0], chunk, diags_shadow, &body);
     }
 
     std::vector<std::string> real = texts(diags_real), shadow = texts(diags_shadow);

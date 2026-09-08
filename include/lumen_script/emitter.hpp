@@ -130,14 +130,20 @@ public:
 
     // Contrapartida de check_expr para emit_condition: mismo reinicio de
     // locals_/route_method_/scope_depth_, mismas declaraciones de `names`,
-    // pero llamando a check_expr en vez de a emit_expr. Es la manera mas
-    // directa de comparar check_expr contra la compilacion real sobre una
-    // expresion suelta: emit_condition y check_condition se pueden llamar en
-    // secuencia sobre el mismo Emitter porque las dos reinician su estado por
-    // completo al entrar, igual que ya hace emit_condition hoy si se llama
-    // mas de una vez.
+    // pero llamando a check_expr en vez de a emit_expr.
+    //
+    // Lleva su propio `Chunk& out` -- igual que emit_condition -- aunque no
+    // emita ni un opcode: declare_local() escribe chunk_->num_locals segun
+    // avanza (la misma contabilidad que necesita el VM para dimensionar la
+    // pila, la real, no una copia), asi que necesita un chunk_ valido desde
+    // el primer momento y no puede depender de que alguien haya llamado antes
+    // a emit_condition sobre el mismo Emitter para dejarlo puesto. Pasar el
+    // MISMO chunk que ya se le paso a emit_condition (que es lo que hace hoy
+    // el canario de project.cpp) es valido: declare_local() vuelve a anotar
+    // los mismos nombres, pero num_locals ya no puede subir mas de lo que ya
+    // subio, asi que no cambia nada observable.
     IrExprPtr check_condition(const Expr& e, const std::vector<NombreTipado>& names,
-                              DiagnosticBag& shadow);
+                              Chunk& out, DiagnosticBag& shadow);
 
     // check_stmt/check_block: la misma idea que check_expr, pero para
     // sentencias -- reproducen emit_stmt/emit_block rama a rama y construyen
@@ -157,18 +163,20 @@ public:
     // igual que hoy con `failed_`, un bloque a medio construir no se usa.
     IrBlock   check_block(const Block& body, DiagnosticBag& shadow);
 
-    // `out_body`, si no es nulo, recibe el IrBlock construido (el mismo que
-    // ya se descarta hoy en project.cpp: check_route/etc. lo usan solo para
-    // saber si `shadow` crecio). Parametro opcional para no tocar ninguno de
-    // los 9 sitios de project.cpp que ya llaman a esto -- lo usan las
-    // pruebas que quieren inspeccionar la forma del IR construido.
-    bool check_route(const RouteDecl& route, DiagnosticBag& shadow, IrBlock* out_body = nullptr);
-    bool check_function(const FnDecl& fn, DiagnosticBag& shadow, IrBlock* out_body = nullptr);
-    bool check_method(const std::string& cls, const FnDecl& m, DiagnosticBag& shadow,
-                      IrBlock* out_body = nullptr);
+    // `out`: mismo motivo que en check_condition (declare_local necesita un
+    // chunk_ valido). `out_body`, si no es nulo, recibe el IrBlock construido
+    // (el mismo que ya se descarta hoy en project.cpp: check_route/etc. lo
+    // usan solo para saber si `shadow` crecio).
+    bool check_route(const RouteDecl& route, Chunk& out, DiagnosticBag& shadow,
+                     IrBlock* out_body = nullptr);
+    bool check_function(const FnDecl& fn, Chunk& out, DiagnosticBag& shadow,
+                        IrBlock* out_body = nullptr);
+    bool check_method(const std::string& cls, const FnDecl& m, Chunk& out,
+                      DiagnosticBag& shadow, IrBlock* out_body = nullptr);
     bool check_ctor(const std::string& cls, const std::vector<std::string>& fields,
-                    const CtorDecl& ct, DiagnosticBag& shadow, IrBlock* out_body = nullptr);
-    bool check_error_handler(const ErrorDecl& decl, DiagnosticBag& shadow,
+                    const CtorDecl& ct, Chunk& out, DiagnosticBag& shadow,
+                    IrBlock* out_body = nullptr);
+    bool check_error_handler(const ErrorDecl& decl, Chunk& out, DiagnosticBag& shadow,
                              IrBlock* out_body = nullptr);
 
 private:
@@ -230,6 +238,35 @@ private:
     // Metodo cuyo receptor no tiene tipo conocido al compilar: se apila y el
     // despacho por tipo lo hace el VM.
     void emit_method_call_dynamic(const Expr& e);
+
+    // ── Fase 1: emisor que consume el IR (todavia sin conectar) ─────────────
+    //
+    // Contrapartida de emit_block/emit_stmt/emit_expr/emit_call que en vez de
+    // Expr/Stmt del AST recibe IrExpr/IrStmt ya resueltos por check_expr/
+    // check_stmt. No comprueba nada -- ni una llamada a error(), ni una
+    // busqueda por nombre (resolve_local/native_id/is_reserved_object...):
+    // confia en que el IR que recibe ya paso por el checker. El nombre se
+    // reusa (sobrecarga por tipo del parametro) porque son la MISMA operacion
+    // -- "emitir esta expresion/sentencia" -- vista desde dos entradas
+    // distintas mientras dura la migracion; cuando el corte final sustituya
+    // las llamadas Expr/Stmt por estas, los nombres ya son los que hay que
+    // dejar.
+    void emit_block(const IrBlock& body);
+    void emit_stmt(const IrStmt& s);
+    void emit_expr(const IrExpr& e);
+    void emit_call(const IrExpr& e);
+    // Cierto solo si se PUEDE demostrar que el IrExpr es de tipo int -- misma
+    // regla que es_int(), pero leyendo IrExpr::type (ya resuelto por
+    // check_expr) en vez de local_type(): ningun IrExpr necesita volver a
+    // resolver un nombre.
+    bool es_int_ir(const IrExpr& e) const;
+    // Los builtins que llegan aqui con un native_id ya resuelto
+    // (ReservedMemberCall y BuiltinGlobalCall salvo render(), que se
+    // compila aparte): misma cola compartida que tiene hoy emit_call.
+    void emit_native_call(const IrExpr& e);
+    // Metodo cuyo receptor no tiene tipo conocido al compilar (BuiltinMethodCall).
+    void emit_method_call_dynamic(const IrExpr& e);
+    void emitir_render_compilado(const IrExpr& e);
 
     // Shadow de comprobar_campo/comprobar_metodo_builtin: misma logica, error
     // a `shadow` en vez de a diags_. Usados por check_expr/check_call.

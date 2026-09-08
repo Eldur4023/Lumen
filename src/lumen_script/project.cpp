@@ -610,7 +610,7 @@ void build_classes(const Program& program, const FunctionSigs& fns,
             if (!emitter.emit_condition(*r.condition, field_names, *chunk)) continue;
             if (shadow_check_activo()) {
                 DiagnosticBag shadow;
-                emitter.check_condition(*r.condition, field_names, shadow);
+                emitter.check_condition(*r.condition, field_names, *chunk, shadow);
                 shadow_comparar("validate", diags, antes, shadow);
             }
             info->rules.push_back({chunk, r.message});
@@ -1217,7 +1217,7 @@ void emit_class_bodies(Module& mod, const ClassSigs& classes, const FunctionSigs
             emitter.emit_method(c.name, m, *mod.functions[ms->second.index]);
             if (shadow_check_activo()) {
                 DiagnosticBag shadow;
-                emitter.check_method(c.name, m, shadow);
+                emitter.check_method(c.name, m, *mod.functions[ms->second.index], shadow);
                 shadow_comparar(("metodo " + c.name + "." + m.name).c_str(), diags, antes, shadow);
             }
         }
@@ -1229,7 +1229,7 @@ void emit_class_bodies(Module& mod, const ClassSigs& classes, const FunctionSigs
             emitter.emit_ctor(c.name, sig.fields, ct, *mod.functions[cs->second]);
             if (shadow_check_activo()) {
                 DiagnosticBag shadow;
-                emitter.check_ctor(c.name, sig.fields, ct, shadow);
+                emitter.check_ctor(c.name, sig.fields, ct, *mod.functions[cs->second], shadow);
                 shadow_comparar(("constructor " + c.name).c_str(), diags, antes, shadow);
             }
         }
@@ -1254,7 +1254,8 @@ void emit_class_bodies(Module& mod, const ClassSigs& classes, const FunctionSigs
                                   *mod.functions[cs->second]);
                 if (shadow_check_activo()) {
                     DiagnosticBag shadow;
-                    emitter.check_ctor(c.name, sig.fields, implicito, shadow);
+                    emitter.check_ctor(c.name, sig.fields, implicito, *mod.functions[cs->second],
+                                       shadow);
                     shadow_comparar(("constructor implicito " + c.name).c_str(), diags, antes,
                                     shadow);
                 }
@@ -1285,7 +1286,7 @@ FunctionSigs build_functions(Module& mod, DiagnosticBag& diags) {
         emitter.emit_function(f, *mod.functions[it->second.index]);
         if (shadow_check_activo()) {
             DiagnosticBag shadow;
-            emitter.check_function(f, shadow);
+            emitter.check_function(f, *mod.functions[it->second.index], shadow);
             shadow_comparar(("funcion " + f.name).c_str(), diags, antes, shadow);
         }
     }
@@ -1303,7 +1304,7 @@ void build_error_handlers(Module& mod, const FunctionSigs& fns,
         if (!emitter.emit_error_handler(e, *chunk)) continue;
         if (shadow_check_activo()) {
             DiagnosticBag shadow;
-            emitter.check_error_handler(e, shadow);
+            emitter.check_error_handler(e, *chunk, shadow);
             shadow_comparar(("on error " + std::to_string(e.code)).c_str(), diags, antes, shadow);
         }
         mod.error_handlers[e.code] = std::move(chunk);
@@ -1356,7 +1357,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
             if (!ws_emitter.emit_route(r, *ws_chunk)) continue;
             if (shadow_check_activo()) {
                 DiagnosticBag shadow;
-                ws_emitter.check_route(r, shadow);
+                ws_emitter.check_route(r, *ws_chunk, shadow);
                 shadow_comparar(("ws " + r.pattern).c_str(), diags, antes, shadow);
             }
 
@@ -1443,7 +1444,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
             if (!sse_emitter.emit_route(r, *sse_chunk)) continue;
             if (shadow_check_activo()) {
                 DiagnosticBag shadow;
-                sse_emitter.check_route(r, shadow);
+                sse_emitter.check_route(r, *sse_chunk, shadow);
                 shadow_comparar(("sse " + r.pattern).c_str(), diags, antes, shadow);
             }
 
@@ -1531,7 +1532,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
         if (!emitter.emit_route(r, *chunk)) continue;
         if (shadow_check_activo()) {
             DiagnosticBag shadow;
-            emitter.check_route(r, shadow);
+            emitter.check_route(r, *chunk, shadow);
             shadow_comparar((r.method + " " + r.pattern).c_str(), diags, antes, shadow);
         }
 

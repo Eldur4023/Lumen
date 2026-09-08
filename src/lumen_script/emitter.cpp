@@ -193,7 +193,8 @@ bool Emitter::emit_condition(const Expr& e, const std::vector<NombreTipado>& nam
 }
 
 IrExprPtr Emitter::check_condition(const Expr& e, const std::vector<NombreTipado>& names,
-                                   DiagnosticBag& shadow) {
+                                   Chunk& out, DiagnosticBag& shadow) {
+    chunk_        = &out;
     route_method_ = {};
     locals_.clear();
     loops_.clear();
@@ -210,8 +211,10 @@ IrExprPtr Emitter::check_condition(const Expr& e, const std::vector<NombreTipado
 // mismas declaraciones de parametros/`this`. Devuelven si esta llamada en
 // concreto no anadio ningun error a `shadow` (no si `shadow` esta vacio del
 // todo: quien llama puede reusar el mismo DiagnosticBag para varios casos).
-bool Emitter::check_route(const RouteDecl& route, DiagnosticBag& shadow, IrBlock* out_body) {
+bool Emitter::check_route(const RouteDecl& route, Chunk& out, DiagnosticBag& shadow,
+                          IrBlock* out_body) {
     size_t antes    = shadow.size();
+    chunk_          = &out;
     route_method_   = route.method;
     locals_.clear();
     loops_.clear();
@@ -230,8 +233,10 @@ bool Emitter::check_route(const RouteDecl& route, DiagnosticBag& shadow, IrBlock
     return shadow.size() == antes;
 }
 
-bool Emitter::check_function(const FnDecl& fn, DiagnosticBag& shadow, IrBlock* out_body) {
+bool Emitter::check_function(const FnDecl& fn, Chunk& out, DiagnosticBag& shadow,
+                             IrBlock* out_body) {
     size_t antes  = shadow.size();
+    chunk_        = &out;
     route_method_ = "FN";
     locals_.clear();
     loops_.clear();
@@ -243,9 +248,10 @@ bool Emitter::check_function(const FnDecl& fn, DiagnosticBag& shadow, IrBlock* o
     return shadow.size() == antes;
 }
 
-bool Emitter::check_method(const std::string& cls, const FnDecl& m, DiagnosticBag& shadow,
-                           IrBlock* out_body) {
+bool Emitter::check_method(const std::string& cls, const FnDecl& m, Chunk& out,
+                           DiagnosticBag& shadow, IrBlock* out_body) {
     size_t antes  = shadow.size();
+    chunk_        = &out;
     route_method_ = "FN";
     locals_.clear();
     loops_.clear();
@@ -259,8 +265,10 @@ bool Emitter::check_method(const std::string& cls, const FnDecl& m, DiagnosticBa
 }
 
 bool Emitter::check_ctor(const std::string& cls, const std::vector<std::string>& fields,
-                         const CtorDecl& ct, DiagnosticBag& shadow, IrBlock* out_body) {
+                         const CtorDecl& ct, Chunk& out, DiagnosticBag& shadow,
+                         IrBlock* out_body) {
     size_t antes  = shadow.size();
+    chunk_        = &out;
     route_method_ = "FN";
     locals_.clear();
     loops_.clear();
@@ -281,8 +289,10 @@ bool Emitter::check_ctor(const std::string& cls, const std::vector<std::string>&
     return shadow.size() == antes;
 }
 
-bool Emitter::check_error_handler(const ErrorDecl& decl, DiagnosticBag& shadow, IrBlock* out_body) {
+bool Emitter::check_error_handler(const ErrorDecl& decl, Chunk& out, DiagnosticBag& shadow,
+                                  IrBlock* out_body) {
     size_t antes  = shadow.size();
+    chunk_        = &out;
     route_method_ = "ERROR";
     locals_.clear();
     loops_.clear();
@@ -2223,6 +2233,588 @@ void Emitter::emitir_render_compilado(const Expr& e) {
 
     const int id = native_id("__render_tpl");
     chunk_->emit(Op::CallNative, e.loc, (static_cast<uint32_t>(id) << 8) | 2u);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Fase 1 (COMPILACION-NATIVA.md): emisor que consume el IR, todavia sin
+// conectar a ningun punto de entrada real. Ver el comentario de
+// emitter.hpp junto a estas declaraciones para el porque de la sobrecarga
+// de nombre. Cada funcion de aqui es la contrapartida MECANICA de su
+// version sobre Expr/Stmt: mismos opcodes, mismo orden -- la unica
+// diferencia es que lee campos ya resueltos (slot, call_shape, call_index,
+// call_name, type) en vez de resolverlos, y no llama a error() en ningun
+// sitio porque check_expr/check_stmt ya lo hicieron antes de construir
+// este nodo.
+// ═══════════════════════════════════════════════════════════════════════════
+
+bool Emitter::es_int_ir(const IrExpr& e) const {
+    switch (e.kind) {
+        case IrExprKind::IntLit: return true;
+        case IrExprKind::Ident:  return e.type.base_name() == "int";
+        case IrExprKind::Binary:
+            if (e.text == "+" || e.text == "-" || e.text == "*")
+                return e.lhs && e.rhs && es_int_ir(*e.lhs) && es_int_ir(*e.rhs);
+            return false;
+        default: return false;
+    }
+}
+
+void Emitter::emit_expr(const IrExpr& e) {
+    switch (e.kind) {
+        case IrExprKind::StringLit:
+            chunk_->emit(Op::Const, e.loc, chunk_->add_constant(Value::str(e.text)));
+            break;
+        case IrExprKind::IntLit:
+            chunk_->emit(Op::Const, e.loc, chunk_->add_constant(Value::integer(e.int_value)));
+            break;
+        case IrExprKind::FloatLit:
+            chunk_->emit(Op::Const, e.loc, chunk_->add_constant(Value::real(e.float_value)));
+            break;
+        case IrExprKind::BoolLit:
+            chunk_->emit(Op::Const, e.loc, chunk_->add_constant(Value::boolean(e.bool_value)));
+            break;
+        case IrExprKind::NullLit:
+            chunk_->emit(Op::Const, e.loc, chunk_->add_constant(Value::null()));
+            break;
+
+        case IrExprKind::Ident:
+        case IrExprKind::This:
+            chunk_->emit(Op::LoadLocal, e.loc, static_cast<uint32_t>(e.slot));
+            break;
+
+        case IrExprKind::Unary:
+            emit_expr(*e.lhs);
+            chunk_->emit(e.text == "not" ? Op::Not : Op::Neg, e.loc);
+            break;
+
+        case IrExprKind::Binary: {
+            if (e.text == "and" || e.text == "or") {
+                emit_expr(*e.lhs);
+                size_t j = chunk_->emit(e.text == "and" ? Op::JumpIfFalsePeek
+                                                        : Op::JumpIfTruePeek, e.loc);
+                emit_expr(*e.rhs);
+                chunk_->patch(j, chunk_->here());
+                break;
+            }
+
+            emit_expr(*e.lhs);
+            emit_expr(*e.rhs);
+            Op op = Op::Add;
+            if      (e.text == "+")  op = Op::Add;
+            else if (e.text == "-")  op = Op::Sub;
+            else if (e.text == "*")  op = Op::Mul;
+            else if (e.text == "/")  op = Op::Div;
+            else if (e.text == "%")  op = Op::Mod;
+            else if (e.text == "==") op = Op::Eq;
+            else if (e.text == "!=") op = Op::Ne;
+            else if (e.text == "<")  op = Op::Lt;
+            else if (e.text == "<=") op = Op::Le;
+            else if (e.text == ">")  op = Op::Gt;
+            else if (e.text == ">=") op = Op::Ge;
+            // check_expr ya rechazo cualquier operador que no sea uno de
+            // estos once -- un IrExpr::Binary con otro texto no deberia
+            // poder existir.
+
+            if (es_int_ir(*e.lhs) && es_int_ir(*e.rhs)) {
+                switch (op) {
+                    case Op::Add: op = Op::AddInt; break;
+                    case Op::Sub: op = Op::SubInt; break;
+                    case Op::Mul: op = Op::MulInt; break;
+                    case Op::Lt:  op = Op::LtInt;  break;
+                    case Op::Le:  op = Op::LeInt;  break;
+                    case Op::Gt:  op = Op::GtInt;  break;
+                    case Op::Ge:  op = Op::GeInt;  break;
+                    default: break;
+                }
+            }
+            chunk_->emit(op, e.loc);
+            break;
+        }
+
+        case IrExprKind::Ternary: {
+            emit_expr(*e.object);
+            size_t to_else = chunk_->emit(Op::JumpIfFalse, e.loc);
+            emit_expr(*e.lhs);
+            size_t to_end = chunk_->emit(Op::Jump, e.loc);
+            chunk_->patch(to_else, chunk_->here());
+            emit_expr(*e.rhs);
+            chunk_->patch(to_end, chunk_->here());
+            break;
+        }
+
+        case IrExprKind::ListLit:
+            for (const auto& item : e.items) emit_expr(*item);
+            chunk_->emit(Op::MakeList, e.loc, static_cast<uint32_t>(e.items.size()));
+            break;
+
+        case IrExprKind::DictLit:
+            for (const auto& entry : e.entries) {
+                emit_expr(*entry.key);
+                emit_expr(*entry.value);
+            }
+            chunk_->emit(Op::MakeDict, e.loc, static_cast<uint32_t>(e.entries.size()));
+            break;
+
+        case IrExprKind::Index:
+            emit_expr(*e.object);
+            emit_expr(*e.lhs);
+            chunk_->emit(Op::GetIndex, e.loc);
+            break;
+
+        case IrExprKind::Member: {
+            // Sin receptor: o bien session.x (__session_get) o bien un
+            // miembro de 0 argumentos de un objeto reservado (sse.open),
+            // distinguibles por si call_name viene relleno -- ver el
+            // comentario de ir.hpp sobre este reuso.
+            if (!e.object) {
+                if (e.call_name.empty()) {
+                    chunk_->emit(Op::Const, e.loc, chunk_->add_constant(Value::str(e.text)));
+                    chunk_->emit(Op::CallNative, e.loc,
+                                 (static_cast<uint32_t>(native_id("__session_get")) << 8) | 1u);
+                } else {
+                    chunk_->emit(Op::CallNative, e.loc, static_cast<uint32_t>(e.call_index) << 8);
+                }
+                break;
+            }
+            emit_expr(*e.object);
+            chunk_->emit(Op::GetMember, e.loc, chunk_->add_constant(Value::str(e.text)));
+            break;
+        }
+
+        case IrExprKind::Call:
+            emit_call(e);
+            break;
+
+        case IrExprKind::PreStep:
+        case IrExprKind::PostStep: {
+            bool post = (e.kind == IrExprKind::PostStep);
+            Op   op   = (e.text == "+") ? Op::Add : Op::Sub;
+            const IrExpr& tgt = *e.lhs;
+
+            auto one = [&] {
+                chunk_->emit(Op::Const, e.loc, chunk_->add_constant(Value::integer(1)));
+            };
+
+            if (tgt.kind == IrExprKind::Ident) {
+                uint32_t u = static_cast<uint32_t>(tgt.slot);
+
+                if (post) chunk_->emit(Op::LoadLocal, e.loc, u);
+                chunk_->emit(Op::LoadLocal, e.loc, u);
+                one();
+                chunk_->emit(op, e.loc);
+                chunk_->emit(Op::StoreLocal, e.loc, u);
+                if (!post) chunk_->emit(Op::LoadLocal, e.loc, u);
+                break;
+            }
+
+            if (tgt.kind == IrExprKind::Member) {
+                begin_scope();
+                uint32_t name_k = chunk_->add_constant(Value::str(tgt.text));
+
+                emit_expr(*tgt.object);
+                int obj = declare_local(" recep", e.loc);
+                chunk_->emit(Op::StoreLocal, e.loc, static_cast<uint32_t>(obj));
+
+                chunk_->emit(Op::LoadLocal, e.loc, static_cast<uint32_t>(obj));
+                chunk_->emit(Op::GetMember, e.loc, name_k);
+                int prev = declare_local(" previo", e.loc);
+                chunk_->emit(Op::StoreLocal, e.loc, static_cast<uint32_t>(prev));
+
+                chunk_->emit(Op::LoadLocal, e.loc, static_cast<uint32_t>(obj));
+                chunk_->emit(Op::LoadLocal, e.loc, static_cast<uint32_t>(prev));
+                one();
+                chunk_->emit(op, e.loc);
+                chunk_->emit(Op::SetMember, e.loc, name_k);
+
+                if (post) {
+                    chunk_->emit(Op::Pop, e.loc);
+                    chunk_->emit(Op::LoadLocal, e.loc, static_cast<uint32_t>(prev));
+                }
+                end_scope();
+                break;
+            }
+
+            if (tgt.kind == IrExprKind::Index) {
+                begin_scope();
+                emit_expr(*tgt.object);
+                int cont = declare_local(" contened", e.loc);
+                chunk_->emit(Op::StoreLocal, e.loc, static_cast<uint32_t>(cont));
+
+                emit_expr(*tgt.lhs);
+                int idx = declare_local(" indice", e.loc);
+                chunk_->emit(Op::StoreLocal, e.loc, static_cast<uint32_t>(idx));
+
+                chunk_->emit(Op::LoadLocal, e.loc, static_cast<uint32_t>(cont));
+                chunk_->emit(Op::LoadLocal, e.loc, static_cast<uint32_t>(idx));
+                chunk_->emit(Op::GetIndex, e.loc);
+                int prev = declare_local(" previo", e.loc);
+                chunk_->emit(Op::StoreLocal, e.loc, static_cast<uint32_t>(prev));
+
+                chunk_->emit(Op::LoadLocal, e.loc, static_cast<uint32_t>(cont));
+                chunk_->emit(Op::LoadLocal, e.loc, static_cast<uint32_t>(idx));
+                chunk_->emit(Op::LoadLocal, e.loc, static_cast<uint32_t>(prev));
+                one();
+                chunk_->emit(op, e.loc);
+                chunk_->emit(Op::SetIndex, e.loc);
+
+                if (post) {
+                    chunk_->emit(Op::Pop, e.loc);
+                    chunk_->emit(Op::LoadLocal, e.loc, static_cast<uint32_t>(prev));
+                }
+                end_scope();
+                break;
+            }
+            // check_expr ya rechazo cualquier otro objetivo de ++/--.
+            break;
+        }
+
+        case IrExprKind::Await:
+            emit_call(*e.lhs); // e.lhs es siempre Call, con awaited ya en true
+            break;
+    }
+}
+
+// Contrapartida de emit_method_call_dynamic sobre el IR: mismo orden
+// (receptor, posicionales, nombrados agrupados en un Dict), mismo opcode.
+void Emitter::emit_method_call_dynamic(const IrExpr& e) {
+    emit_expr(*e.object);
+    uint32_t argc = 0, named = 0;
+    for (const auto& a : e.args) {
+        if (!a.name.empty()) { ++named; continue; }
+        emit_expr(*a.value);
+        ++argc;
+    }
+    if (named > 0) {
+        for (const auto& a : e.args) {
+            if (a.name.empty()) continue;
+            chunk_->emit(Op::Const, a.loc, chunk_->add_constant(Value::str(a.name)));
+            emit_expr(*a.value);
+        }
+        chunk_->emit(Op::MakeDict, e.loc, named);
+        ++argc;
+    }
+    // check_metodo_builtin ya rechazo mas de 255 argumentos.
+    chunk_->emit(Op::CallMethod, e.loc,
+                 (chunk_->add_constant(Value::str(e.call_name)) << 8) | argc);
+}
+
+// Cola compartida por ReservedMemberCall y BuiltinGlobalCall (salvo
+// render()): las dos resuelven a un native_id valido con las mismas reglas
+// de nombrados que hoy tiene emit_call.
+void Emitter::emit_native_call(const IrExpr& e) {
+    uint32_t argc = 0, named = 0;
+    for (const auto& a : e.args) {
+        if (a.name.empty()) { emit_expr(*a.value); ++argc; }
+        else ++named;
+    }
+    if (named > 0) {
+        for (const auto& a : e.args) {
+            if (a.name.empty()) continue;
+            chunk_->emit(Op::Const, a.loc, chunk_->add_constant(Value::str(a.name)));
+            emit_expr(*a.value);
+        }
+        chunk_->emit(Op::MakeDict, e.loc, named);
+        ++argc;
+    }
+    const NativeDef& def = native_at(e.call_index);
+    if (def.is_async) chunk_->has_await = true;
+    chunk_->emit(def.is_async ? Op::CallAsync : Op::CallNative, e.loc,
+                 (static_cast<uint32_t>(e.call_index) << 8) | argc);
+}
+
+void Emitter::emit_call(const IrExpr& e) {
+    switch (e.call_shape) {
+        case IrCallShape::DbModuleCall: {
+            chunk_->emit(Op::Const, e.loc, chunk_->add_constant(Value::str(e.call_name)));
+            for (const auto& a : e.args) emit_expr(*a.value);
+            chunk_->has_await = true;
+            chunk_->emit(Op::CallAsync, e.loc,
+                         (static_cast<uint32_t>(e.call_index) << 8) |
+                         static_cast<uint32_t>(e.args.size() + 1));
+            break;
+        }
+
+        case IrCallShape::UserFunctionCall:
+        case IrCallShape::ConstructorCall: {
+            for (const auto& a : e.args) emit_expr(*a.value);
+            chunk_->emit(Op::CallFunction, e.loc,
+                         (static_cast<uint32_t>(e.call_index) << 8) |
+                         static_cast<uint32_t>(e.args.size()));
+            break;
+        }
+
+        case IrCallShape::ClassMethodCall: {
+            emit_expr(*e.object); // `this`
+            for (const auto& a : e.args) emit_expr(*a.value);
+            chunk_->emit(Op::CallFunction, e.loc,
+                         (static_cast<uint32_t>(e.call_index) << 8) |
+                         static_cast<uint32_t>(e.args.size() + 1));
+            break;
+        }
+
+        case IrCallShape::ReservedMemberCall:
+            emit_native_call(e);
+            break;
+
+        case IrCallShape::BuiltinGlobalCall:
+            if (e.call_name == "render") emitir_render_compilado(e);
+            else                         emit_native_call(e);
+            break;
+
+        case IrCallShape::BuiltinMethodCall:
+            emit_method_call_dynamic(e);
+            break;
+
+        case IrCallShape::Invalid:
+            break; // inalcanzable: check_call ya lo rechazo
+    }
+}
+
+// Contrapartida de emitir_render_compilado sobre el IR. Sigue siendo la
+// unica excepcion real a "check_* es la unica fuente de diagnosticos": la
+// plantilla en si (su fichero, sus propios {{ }}) no se puede validar sin
+// leerla y compilarla, y eso es superficie de plantillas (fase 3), no algo
+// que check_call pueda anticipar sobre una expresion. error()/diags_ siguen
+// siendo correctos aqui a proposito.
+void Emitter::emitir_render_compilado(const IrExpr& e) {
+    const std::string& nombre = e.args[0].value->text;
+
+    if (nombre.find("..") != std::string::npos ||
+        std::filesystem::path(nombre).is_absolute()) {
+        error(e.args[0].loc, "nombre de plantilla no valido: '" + nombre + "'");
+        return;
+    }
+
+    std::vector<NombreTipado> claves;
+    for (const auto& a : e.args) {
+        if (a.name.empty()) continue;
+        claves.push_back({a.name, a.value->type.base_name()});
+    }
+
+    const std::filesystem::path ruta =
+        std::filesystem::path(plantillas_->dir) / nombre;
+    std::ifstream f(ruta, std::ios::binary);
+    if (!f) {
+        error(e.args[0].loc, "no se encuentra la plantilla '" + nombre + "' en " +
+                             plantillas_->dir);
+        return;
+    }
+    const std::string fuente((std::istreambuf_iterator<char>(f)),
+                             std::istreambuf_iterator<char>());
+
+    Plantilla tpl;
+    if (!compilar_plantilla(fuente, nombre, plantillas_->dir, claves, diags_, tpl)) {
+        failed_ = true;
+        return;
+    }
+    const uint32_t idx = static_cast<uint32_t>(plantillas_->tabla->size());
+    plantillas_->tabla->push_back(std::move(tpl));
+
+    chunk_->emit(Op::Const, e.loc, chunk_->add_constant(Value::integer(idx)));
+    for (const auto& a : e.args) {
+        if (a.name.empty()) continue;
+        chunk_->emit(Op::Const, a.loc, chunk_->add_constant(Value::str(a.name)));
+        emit_expr(*a.value);
+    }
+    chunk_->emit(Op::MakeDict, e.loc, static_cast<uint32_t>(claves.size()));
+
+    const int id = native_id("__render_tpl");
+    chunk_->emit(Op::CallNative, e.loc, (static_cast<uint32_t>(id) << 8) | 2u);
+}
+
+void Emitter::emit_block(const IrBlock& body) {
+    begin_scope();
+    for (const auto& s : body) emit_stmt(*s);
+    end_scope();
+}
+
+void Emitter::emit_stmt(const IrStmt& s) {
+    switch (s.kind) {
+        case IrStmtKind::Return:
+            if (s.value) { emit_expr(*s.value); chunk_->emit(Op::Return, s.loc); }
+            else         { chunk_->emit(Op::ReturnNull, s.loc); }
+            break;
+
+        case IrStmtKind::ExprStmt:
+            emit_expr(*s.value);
+            chunk_->emit(Op::Pop, s.loc);
+            break;
+
+        case IrStmtKind::VarDecl:
+            if (s.value) emit_expr(*s.value);
+            else         chunk_->emit(Op::Const, s.loc, chunk_->add_constant(Value::null()));
+            chunk_->emit(Op::StoreLocal, s.loc, static_cast<uint32_t>(s.slot));
+            break;
+
+        case IrStmtKind::Assign: {
+            switch (s.assign_target) {
+                case IrAssignTarget::Session:
+                    chunk_->emit(Op::Const, s.loc,
+                                 chunk_->add_constant(Value::str(s.assign_field)));
+                    emit_expr(*s.value);
+                    chunk_->emit(Op::CallNative, s.loc,
+                                 (static_cast<uint32_t>(native_id("__session_set")) << 8) | 2u);
+                    chunk_->emit(Op::Pop, s.loc);
+                    break;
+
+                case IrAssignTarget::Index:
+                    emit_expr(*s.assign_object);
+                    emit_expr(*s.assign_index);
+                    emit_expr(*s.value);
+                    chunk_->emit(Op::SetIndex, s.loc);
+                    chunk_->emit(Op::Pop, s.loc);
+                    break;
+
+                case IrAssignTarget::Member:
+                    emit_expr(*s.assign_object);
+                    emit_expr(*s.value);
+                    chunk_->emit(Op::SetMember, s.loc,
+                                 chunk_->add_constant(Value::str(s.assign_field)));
+                    chunk_->emit(Op::Pop, s.loc);
+                    break;
+
+                case IrAssignTarget::Local:
+                    emit_expr(*s.value);
+                    chunk_->emit(Op::StoreLocal, s.loc, static_cast<uint32_t>(s.assign_slot));
+                    break;
+            }
+            break;
+        }
+
+        case IrStmtKind::If: {
+            emit_expr(*s.value);
+            size_t to_else = chunk_->emit(Op::JumpIfFalse, s.loc);
+            emit_block(s.body);
+
+            if (!s.orelse.empty()) {
+                size_t to_end = chunk_->emit(Op::Jump, s.loc);
+                chunk_->patch(to_else, chunk_->here());
+                emit_block(s.orelse);
+                chunk_->patch(to_end, chunk_->here());
+            } else {
+                chunk_->patch(to_else, chunk_->here());
+            }
+            break;
+        }
+
+        case IrStmtKind::While: {
+            size_t start = chunk_->here();
+            emit_expr(*s.value);
+            size_t to_end = chunk_->emit(Op::JumpIfFalse, s.loc);
+
+            loops_.push_back({});
+            emit_block(s.body);
+            for (size_t j : loops_.back().continues) chunk_->patch(j, start);
+            chunk_->emit(Op::Jump, s.loc, static_cast<uint32_t>(start));
+            chunk_->patch(to_end, chunk_->here());
+
+            for (size_t j : loops_.back().breaks) chunk_->patch(j, chunk_->here());
+            loops_.pop_back();
+            break;
+        }
+
+        case IrStmtKind::Require: {
+            emit_expr(*s.value);
+            size_t to_ok = chunk_->emit(Op::JumpIfFalse, s.loc);
+            size_t skip  = chunk_->emit(Op::Jump, s.loc);
+            chunk_->patch(to_ok, chunk_->here());
+            emit_expr(*s.target);
+            chunk_->emit(Op::Return, s.loc);
+            chunk_->patch(skip, chunk_->here());
+            break;
+        }
+
+        case IrStmtKind::Break:
+            loops_.back().breaks.push_back(chunk_->emit(Op::Jump, s.loc));
+            break;
+
+        case IrStmtKind::Continue:
+            loops_.back().continues.push_back(chunk_->emit(Op::Jump, s.loc));
+            break;
+
+        case IrStmtKind::For: {
+            begin_scope();
+
+            emit_expr(*s.target);
+            chunk_->emit(Op::IterList, s.loc);
+            int items = declare_local(" items", s.loc);
+            chunk_->emit(Op::StoreLocal, s.loc, static_cast<uint32_t>(items));
+
+            chunk_->emit(Op::LoadLocal, s.loc, static_cast<uint32_t>(items));
+            chunk_->emit(Op::CallNative, s.loc,
+                         (static_cast<uint32_t>(native_id("len")) << 8) | 1u);
+            int count = declare_local(" count", s.loc);
+            chunk_->emit(Op::StoreLocal, s.loc, static_cast<uint32_t>(count));
+
+            chunk_->emit(Op::Const, s.loc, chunk_->add_constant(Value::integer(0)));
+            int index = declare_local(" index", s.loc);
+            chunk_->emit(Op::StoreLocal, s.loc, static_cast<uint32_t>(index));
+
+            // `s.slot` ya es la ranura de la variable del bucle -- pero
+            // declare_local hay que llamarlo igual, en el mismo orden, para
+            // que items/count/index caigan en las ranuras que check_stmt ya
+            // calculo (ver el comentario de IrStmt::slot). Se descarta el
+            // valor de vuelta porque ya se conoce.
+            declare_local(s.name, s.loc, s.decl_type);
+            uint32_t var = static_cast<uint32_t>(s.slot);
+
+            size_t start = chunk_->here();
+            chunk_->emit(Op::LoadLocal, s.loc, static_cast<uint32_t>(index));
+            chunk_->emit(Op::LoadLocal, s.loc, static_cast<uint32_t>(count));
+            chunk_->emit(Op::Lt, s.loc);
+            size_t to_end = chunk_->emit(Op::JumpIfFalse, s.loc);
+
+            chunk_->emit(Op::LoadLocal, s.loc, static_cast<uint32_t>(items));
+            chunk_->emit(Op::LoadLocal, s.loc, static_cast<uint32_t>(index));
+            chunk_->emit(Op::GetIndex, s.loc);
+            chunk_->emit(Op::StoreLocal, s.loc, var);
+
+            loops_.push_back({});
+            emit_block(s.body);
+
+            size_t step = chunk_->here();
+            for (size_t j : loops_.back().continues) chunk_->patch(j, step);
+            chunk_->emit(Op::LoadLocal, s.loc, static_cast<uint32_t>(index));
+            chunk_->emit(Op::Const, s.loc, chunk_->add_constant(Value::integer(1)));
+            chunk_->emit(Op::Add, s.loc);
+            chunk_->emit(Op::StoreLocal, s.loc, static_cast<uint32_t>(index));
+            chunk_->emit(Op::Jump, s.loc, static_cast<uint32_t>(start));
+
+            chunk_->patch(to_end, chunk_->here());
+            for (size_t j : loops_.back().breaks) chunk_->patch(j, chunk_->here());
+            loops_.pop_back();
+
+            end_scope();
+            break;
+        }
+
+        case IrStmtKind::Try: {
+            TryRange range;
+            range.begin = chunk_->here();
+            emit_block(s.body);
+            range.end = chunk_->here();
+
+            size_t to_end = chunk_->emit(Op::Jump, s.loc);
+            range.catch_pc = chunk_->here();
+            chunk_->try_ranges.push_back(range);
+
+            begin_scope();
+            if (!s.name.empty()) {
+                // Mismo motivo que en For: declare_local hay que llamarlo
+                // para que la ranura real coincida con la que ya calculo
+                // check_stmt (s.slot); no se resuelve por nombre aqui.
+                declare_local(s.name, s.loc);
+                chunk_->emit(Op::StoreLocal, s.loc, static_cast<uint32_t>(s.slot));
+            } else {
+                chunk_->emit(Op::Pop, s.loc);
+            }
+            for (const auto& st : s.orelse) emit_stmt(*st);
+            end_scope();
+
+            chunk_->patch(to_end, chunk_->here());
+            break;
+        }
+    }
 }
 
 } // namespace lumen_script
