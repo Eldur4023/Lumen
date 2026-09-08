@@ -1072,6 +1072,32 @@ binario real sirviendo HTTP: `require n >= 1 and n <= 10 else -1` da la misma re
 vías, dentro y fuera de rango. 79/79 del corpus real y el canario `LUMEN_SHADOW_CHECK` siguen en
 verde.
 
+**Segundo hallazgo, otra corrección crítica — un cuerpo que "cae al final" es UB en C++, no `null`.**
+Escribir la prueba de `require` hizo probar, a propósito, el pariente más simple: una función sin
+`else`, `fn int f(int n): if n > 5: return n`, sin nada después del `if`. El compilador real la
+acepta sin ningún aviso — si el cuerpo se acaba sin `return`, el VM devuelve `null` con toda
+naturalidad, es exactamente el mismo caso que ya cubre el `Require` de arriba. Pero antes de esta
+corrección, `--native` generaba una función C++ no-`void` que podía llegar al final de su cuerpo sin
+ningún `return` — **comportamiento indefinido** en C++, no "el mismo `null`" — y, confirmado contra
+el binario real, el resultado no era ni siquiera un valor plausible: `bytecode` daba `{"r":null}`
+para `f(3)`, `--native` daba `{"r":3}` — basura de la pila de C++ que por pura coincidencia parecía
+un valor razonable. Es la misma familia de fallo que la corrección crítica original (§ más arriba):
+un tipo declarado que el compilador real no garantiza en ningún sitio, y esta fase, en su primera
+versión, sí asumía.
+
+La corrección: `bloque_siempre_retorna()` recorre el cuerpo demostrando si SIEMPRE termina en un
+`return` — un `if`/`else` cuenta solo si las DOS ramas lo garantizan (igual que exige el propio
+compilador de C++ para el mismo patrón); un `require` nunca cuenta por sí solo (solo cubre el camino
+"condición falsa"); un `while`/`for` tampoco (el cuerpo puede ejecutarse cero veces). Para cualquier
+función con retorno no-`void`, no poder demostrarlo la descarta entera — no se sintetiza ningún
+`return` con un valor por defecto (sería inventar un `0`/`""` que el VM no tiene: la respuesta real
+es `null`, un tipo que esta fase no puede representar de todas formas). Validado en
+`tests/native_build_shadow.cpp` (`prueba_sin_return_en_todos_los_caminos()`) y de nuevo contra el
+binario real: la función ahora se queda en bytecode (`0 funcion(es) compilada(s)`) y las dos vías
+coinciden. `fib`/`cuenta_primos`, los métodos de clase, y el resto del corpus real (`bench/lumen/
+app.lum`, `tests/casos/clases.lum`) se re-verificaron sin cambios — todos ya retornaban en todos sus
+caminos, la corrección es más estricta, no distinta, para el código que ya era seguro.
+
 **Pendiente, y no trivial: el valor de retorno de una ruta necesita una representación distinta a
 la de una función.** `Dict<K,V>` (Fase 3) exige un valor `V` homogéneo — pero el cuerpo JSON de una
 respuesta real casi nunca lo es (`{"id": i, "name": "item-"+str(i), "value": valor, "active":

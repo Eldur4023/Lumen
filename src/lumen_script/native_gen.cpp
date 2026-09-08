@@ -974,6 +974,57 @@ private:
     }
 };
 
+// ── ¿Termina el cuerpo SIEMPRE con un return? ───────────────────────────────
+//
+// Bug real, encontrado probando esto a proposito (no una precaucion
+// especulativa): "fn int f(int n): if n > 5: return n" -- sin `else`, sin
+// nada despues del `if` -- compila hoy sin ningun aviso (el checker real lo
+// acepta: el VM, si el cuerpo se acaba sin `return`, simplemente devuelve
+// `null`). Confirmado contra el binario real: bytecode da `{"r":null}` para
+// n=3; --native, ANTES de esta comprobacion, daba `{"r":3}` -- basura de la
+// pila de C++, porque "llegar al final de una funcion no-void sin return"
+// es comportamiento indefinido, no "null" ni ningun otro valor concreto.
+//
+// La causa de fondo es la misma familia que la correccion critica de más
+// arriba: cualquier camino que "cae al final" devuelve `null` en Lumen, un
+// tipo distinto del declarado salvo que la funcion sea `void` -- asi que,
+// para cualquier retorno no-void, "el cuerpo no demuestra que SIEMPRE
+// retorna" es exactamente tan inseguro como "el tipo no coincide". La
+// funcion entera se rechaza (bloque_siempre_retorna() se comprueba, para
+// retorno no-void, justo despues de block_compilable() en
+// generar_funcion_nativa()/generar_metodo_nativo()) en vez de intentar
+// generar un `return` sintetico: inventar un valor por defecto seria
+// funcionalidad nueva que el VM no tiene (el VM da null, no un "0"/"" que
+// esta fase no puede representar de todas formas).
+bool bloque_siempre_retorna(const IrBlock& b);
+
+bool stmt_siempre_retorna(const IrStmt& s) {
+    switch (s.kind) {
+        case IrStmtKind::Return:
+            return true;
+        // Solo si TIENE `else` y las dos ramas garantizan un return --
+        // igual que exige el propio compilador de C++ para el mismo
+        // patron. Un `if` sin `else` nunca garantiza nada (el camino
+        // "condicion falsa" sigue cayendo al resto del bloque).
+        case IrStmtKind::If:
+            return !s.orelse.empty() && bloque_siempre_retorna(s.body) &&
+                   bloque_siempre_retorna(s.orelse);
+        // Require: solo cubre el camino "condicion falsa" (ahi si vuelve,
+        // con `otherwise`) -- el camino "condicion verdadera" sigue
+        // cayendo al resto del bloque, asi que Require por si sola nunca
+        // garantiza nada. While/For: el cuerpo puede ejecutarse cero
+        // veces, tampoco garantizan nada por si solos.
+        default:
+            return false;
+    }
+}
+
+bool bloque_siempre_retorna(const IrBlock& b) {
+    for (const auto& s : b)
+        if (s && stmt_siempre_retorna(*s)) return true; // el resto del bloque queda inalcanzable
+    return false;
+}
+
 } // namespace
 
 std::optional<FuncionNativa> generar_funcion_nativa(const FnDecl& fn, const IrBlock& body,
@@ -993,6 +1044,12 @@ std::optional<FuncionNativa> generar_funcion_nativa(const FnDecl& fn, const IrBl
     for (size_t i = 0; i < fn.params.size(); ++i)
         comprobador.registrar(static_cast<int>(i), Type::from_declared(fn.params[i].type));
     if (!comprobador.block_compilable(body, retorno_decl)) return std::nullopt;
+    // Ver el comentario de bloque_siempre_retorna(): sin esto, un cuerpo
+    // que "cae al final" en algun camino (el VM da null con naturalidad)
+    // generaria una funcion C++ no-void que puede llegar al final sin
+    // return -- comportamiento indefinido, no "null".
+    if (retorno_decl.kind() != Type::Kind::Void && !bloque_siempre_retorna(body))
+        return std::nullopt;
 
     FuncionNativa out;
     out.nombre_lumen = fn.name;
@@ -1092,6 +1149,12 @@ std::optional<FuncionNativa> generar_metodo_nativo(const std::string& clase, con
     for (size_t i = 0; i < fn.params.size(); ++i)
         comprobador.registrar(static_cast<int>(i + 1), Type::from_declared(fn.params[i].type));
     if (!comprobador.block_compilable(body, retorno_decl)) return std::nullopt;
+    // Ver el comentario de bloque_siempre_retorna(): sin esto, un cuerpo
+    // que "cae al final" en algun camino (el VM da null con naturalidad)
+    // generaria una funcion C++ no-void que puede llegar al final sin
+    // return -- comportamiento indefinido, no "null".
+    if (retorno_decl.kind() != Type::Kind::Void && !bloque_siempre_retorna(body))
+        return std::nullopt;
 
     FuncionNativa out;
     out.nombre_lumen = fn.name;

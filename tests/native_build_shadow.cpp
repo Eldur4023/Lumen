@@ -455,6 +455,53 @@ static bool prueba_require() {
     return ok;
 }
 
+// Bug real, encontrado a proposito (no una precaucion especulativa): una
+// funcion cuyo cuerpo no demuestra que SIEMPRE retorna en todos los
+// caminos (aqui, un `if` sin `else`) compila y corre bien en bytecode (el
+// VM, al caer al final, devuelve null con naturalidad) pero antes de esta
+// comprobacion generaba una funcion C++ no-void que podia llegar al final
+// sin return -- comportamiento indefinido, confirmado dando basura de la
+// pila en vez de null contra el binario real.
+static bool prueba_sin_return_en_todos_los_caminos() {
+    const std::string src =
+        "fn int quiza(int n):\n"
+        "    if n > 5:\n"
+        "        return n\n";
+
+    SourceFile    file;
+    DiagnosticBag diag_parse;
+    Program       prog;
+    if (!parse_program(src, file, diag_parse, prog)) {
+        std::printf("FALLA (sin return): no parsea (%s)\n",
+                    diag_parse.items().empty() ? "?" : diag_parse.items().front().message.c_str());
+        return false;
+    }
+
+    FunctionSigs                  sigs = firmar(prog);
+    FunctionTable                 tabla_vm;
+    std::unique_ptr<NativeModule> nativo;
+    const auto cache_dir =
+        std::filesystem::temp_directory_path() / "lumen_native_build_check_sinreturn";
+    if (!compilar_las_dos_vias(prog, sigs, tabla_vm, nativo, cache_dir)) return false;
+
+    if (nativo) {
+        std::printf("  FALLA sin_return: se compilo a nativo (deberia caer a bytecode: no "
+                    "demuestra que siempre retorna)\n");
+        return false;
+    }
+    // Bytecode, para dejar constancia de que el comportamiento real (n=3 ->
+    // null) sigue intacto y no es lo que se esta comprobando aqui.
+    const Chunk& chunk = *tabla_vm[sigs.at("quiza").index];
+    VM::Result   r     = ejecutar_result(chunk, {Value::integer(3)}, &tabla_vm, nullptr);
+    if (r.status != VM::Status::Done || !r.value.is_null()) {
+        std::printf("  FALLA sin_return: quiza(3) por bytecode deberia dar null\n");
+        return false;
+    }
+    std::printf("  ok    sin_return: 'quiza' se queda en bytecode, como debe (no demuestra "
+                "que siempre retorna)\n");
+    return true;
+}
+
 static bool prueba_tipos_dinamicos() {
     bool ok = true;
 
@@ -697,6 +744,7 @@ int main() {
     if (!prueba_listas()) ++fallos;
     if (!prueba_diccionarios()) ++fallos;
     if (!prueba_require()) ++fallos;
+    if (!prueba_sin_return_en_todos_los_caminos()) ++fallos;
     if (!prueba_tipos_dinamicos()) ++fallos;
 
     if (fallos == 0) {
