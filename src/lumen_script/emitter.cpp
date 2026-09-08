@@ -68,32 +68,28 @@ void Emitter::end_scope() {
         locals_.pop_back();
 }
 
+// Los 6 puntos de entrada reales (emit_route/emit_function/emit_method/
+// emit_ctor/emit_condition/emit_error_handler) delegan en su check_*
+// correspondiente para construir el IR -- con diags_ real, no un shadow
+// aparte, asi que check_* pasa a ser la UNICA fuente de diagnosticos -- y
+// solo si eso tuvo exito llaman a emit_block/emit_expr (el emisor que
+// consume el IR) para producir el bytecode. emit_expr/emit_stmt/emit_call/
+// emit_block sobre Expr/Stmt y comprobar_campo/comprobar_metodo_builtin ya
+// no los llama nadie desde aqui: siguen en el arbol porque tipo_de() (que SI
+// se sigue usando, desde check_expr/check_call/check_campo) esta definida en
+// terminos de Expr, no de IrExpr, y no vale la pena duplicarla -- pero un
+// commit aparte los retira una vez confirmado que de verdad ya no hace falta
+// ninguno.
+// El `return !failed_` final (no `return true`) importa: emitir_render_
+// compilado (el unico sitio que sigue pudiendo fallar durante la emision,
+// no solo durante el chequeo -- ver su comentario) pone failed_ a true si
+// la plantilla en si no compila, y eso solo se sabe DESPUES de emit_block.
 bool Emitter::emit_route(const RouteDecl& route, Chunk& out) {
-    chunk_        = &out;
-    route_method_ = route.method;
-    failed_       = false;
-    locals_.clear();
-    loops_.clear();
-    scope_depth_ = 0;
+    IrBlock body;
+    if (!check_route(route, out, diags_, &body)) { failed_ = true; return false; }
+    failed_ = false;
 
-    for (const auto& p : route.params) declare_local(p.name, p.loc, Type::from_declared(p.type));
-
-    // Las guardas del grupo se emiten antes del cuerpo, de fuera hacia dentro:
-    // para llegar al handler hay que pasar primero la del grupo padre.  Cada
-    // una es el mismo `if not X: return Y` que `require`, asi que no hay
-    // concepto de middleware ni en el emisor ni en el VM.
-    for (const auto& g : route.guards) {
-        if (!g.condition || !g.otherwise) continue;
-        emit_expr(*g.condition);
-        size_t to_ok = chunk_->emit(Op::JumpIfFalse, g.loc);
-        size_t skip  = chunk_->emit(Op::Jump, g.loc);
-        chunk_->patch(to_ok, chunk_->here());
-        emit_expr(*g.otherwise);
-        chunk_->emit(Op::Return, g.loc);
-        chunk_->patch(skip, chunk_->here());
-    }
-
-    emit_block(route.body);
+    emit_block(body);
 
     // Un handler que se cae por el final no devuelve nada: el motor respondera
     // con lo que haya escrito un builtin, o 204 si no escribio nada.
@@ -102,48 +98,35 @@ bool Emitter::emit_route(const RouteDecl& route, Chunk& out) {
 }
 
 bool Emitter::emit_function(const FnDecl& fn, Chunk& out) {
-    chunk_        = &out;
-    route_method_ = "FN";
-    failed_       = false;
-    locals_.clear();
-    loops_.clear();
-    scope_depth_ = 0;
+    IrBlock body;
+    if (!check_function(fn, out, diags_, &body)) { failed_ = true; return false; }
+    failed_ = false;
 
-    for (const auto& p : fn.params) declare_local(p.name, p.loc, Type::from_declared(p.type));
-
-    emit_block(fn.body);
+    emit_block(body);
     out.emit(Op::ReturnNull, fn.loc);
     return !failed_;
 }
 
 bool Emitter::emit_method(const std::string& cls, const FnDecl& m, Chunk& out) {
-    chunk_        = &out;
-    route_method_ = "FN";
-    failed_       = false;
-    locals_.clear();
-    loops_.clear();
-    scope_depth_ = 0;
+    IrBlock body;
+    if (!check_method(cls, m, out, diags_, &body)) { failed_ = true; return false; }
+    failed_ = false;
 
-    // `this` es simplemente el parametro 0.
-    declare_local("this", m.loc, Type::class_ref(cls));
-    for (const auto& p : m.params) declare_local(p.name, p.loc, Type::from_declared(p.type));
-
-    emit_block(m.body);
+    emit_block(body);
     out.emit(Op::ReturnNull, m.loc);
     return !failed_;
 }
 
 bool Emitter::emit_ctor(const std::string& cls, const std::vector<std::string>& fields,
                         const CtorDecl& ct, Chunk& out) {
-    chunk_        = &out;
-    route_method_ = "FN";
-    failed_       = false;
-    locals_.clear();
-    loops_.clear();
-    scope_depth_ = 0;
+    IrBlock body;
+    if (!check_ctor(cls, fields, ct, out, diags_, &body)) { failed_ = true; return false; }
+    failed_ = false;
 
-    for (const auto& p : ct.params) declare_local(p.name, p.loc, Type::from_declared(p.type));
-    int self = declare_local("this", ct.loc, Type::class_ref(cls));
+    // check_ctor ya declaro los parametros y `this` (en ese orden, antes de
+    // cualquier begin_scope/end_scope que los pudiera hacer desaparecer de
+    // locals_), asi que siguen ahi para resolverlos por nombre.
+    int self = resolve_local("this");
 
     // La instancia arranca con todos los campos declarados a null, para que
     // acceder a uno que el constructor no toque de null y no falle.
@@ -155,14 +138,12 @@ bool Emitter::emit_ctor(const std::string& cls, const std::vector<std::string>& 
     chunk_->emit(Op::StoreLocal, ct.loc, static_cast<uint32_t>(self));
 
     if (ct.has_body) {
-        emit_block(ct.body);
+        emit_block(body);
     } else {
         // Sin cuerpo: cada parametro va al campo de su mismo nombre.
+        // check_ctor ya rechazo cualquier parametro que no sea un campo, asi
+        // que si se llega aqui, todos lo son.
         for (const auto& p : ct.params) {
-            if (std::find(fields.begin(), fields.end(), p.name) == fields.end()) {
-                error(p.loc, "'" + p.name + "' no es un campo de '" + cls + "'");
-                continue;
-            }
             chunk_->emit(Op::LoadLocal, ct.loc, static_cast<uint32_t>(self));
             int slot = resolve_local(p.name);
             chunk_->emit(Op::LoadLocal, ct.loc, static_cast<uint32_t>(slot));
@@ -178,16 +159,11 @@ bool Emitter::emit_ctor(const std::string& cls, const std::vector<std::string>& 
 
 bool Emitter::emit_condition(const Expr& e, const std::vector<NombreTipado>& names,
                              Chunk& out) {
-    chunk_        = &out;
-    route_method_ = {};
-    failed_       = false;
-    locals_.clear();
-    loops_.clear();
-    scope_depth_ = 0;
+    IrExprPtr ir = check_condition(e, names, out, diags_);
+    if (!ir) { failed_ = true; return false; }
+    failed_ = false;
 
-    for (const auto& n : names) declare_local(n.nombre, e.loc, Type::from_legacy_name(n.tipo));
-
-    emit_expr(e);
+    emit_expr(*ir);
     out.emit(Op::Return, e.loc);
     return !failed_;
 }
@@ -313,14 +289,11 @@ bool Emitter::check_error_handler(const ErrorDecl& decl, Chunk& out, DiagnosticB
 }
 
 bool Emitter::emit_error_handler(const ErrorDecl& decl, Chunk& out) {
-    chunk_        = &out;
-    route_method_ = "ERROR";
-    failed_       = false;
-    locals_.clear();
-    loops_.clear();
-    scope_depth_ = 0;
+    IrBlock body;
+    if (!check_error_handler(decl, out, diags_, &body)) { failed_ = true; return false; }
+    failed_ = false;
 
-    emit_block(decl.body);
+    emit_block(body);
     out.emit(Op::ReturnNull, decl.loc);
     return !failed_;
 }

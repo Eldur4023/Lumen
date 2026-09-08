@@ -504,6 +504,46 @@ real (casos de mano y corpus orgánico), quedaba un solo paso para cerrar la fas
 puros de ese IR, quitándoles sus propias llamadas a `error()` — el paso de mayor riesgo de toda
 la fase 1, porque ahí sí se toca el camino real de compilación que usa todo el mundo.
 
+**Hecho.** `check_expr`/`check_call`/`check_stmt` construyen y devuelven `IrExpr`/`IrStmt`
+(verificado con inspección de forma además de diagnósticos — ver más abajo), se escribió el
+emisor que consume ese IR (`emit_expr`/`emit_call`/`emit_stmt`/`emit_block` sobre `IrExpr`/
+`IrStmt`, sin ninguna llamada a `error()`), y se verificó por **equivalencia de ejecución real en
+el VM** — no solo que compila limpio, sino que el bytecode resultante produce el mismo valor
+devuelto, el mismo error o la misma suspensión que el bytecode del emisor viejo, sobre 11
+funciones puras completas (aritmética, recursión, mutua-recursión, `for`/`while`/`break`/
+`continue`, índices, `try`/`catch`, `require`, listas, dicts, ternario, métodos de builtin). Esa
+prueba encontró un bug real antes de tocar el camino real: `IrStmt::VarDecl` no llamaba a
+`declare_local()` al emitirse (usaba directamente la ranura ya resuelta), lo que dejaba
+`locals_` desincronizado para cualquier declaración posterior en la misma función — corregido.
+
+Con eso verificado, los 6 puntos de entrada reales (`emit_route`/`emit_function`/`emit_method`/
+`emit_ctor`/`emit_condition`/`emit_error_handler`) se reescribieron para llamar a su `check_*`
+correspondiente **con `diags_` real, no un `shadow` aparte** — así que `check_expr`/`check_stmt`
+son ahora la única fuente de diagnósticos del compilador — y solo si eso tuvo éxito emiten desde
+el IR ya construido. Las guardas de un `group()` se plegaron en `check_route` como nodos
+`IrStmtKind::Require` (comparten exactamente el mismo desazucarado que `require`, verificado
+línea a línea contra el `emit_route` original) para que también pasen por el IR.
+
+**Validación final, con el compilador real**: `tests/run_tests.sh` en 79/79 — incluyendo
+`guarda deniega`/`guarda permite` (las guardas ahora vía IR), `recursion`/`tope de recursion`,
+`constructor`, `regla incumplida`/`todos los mensajes` (`validate:`, vía `emit_condition`), y
+`mensajes en on error`. El canario de `LUMEN_SHADOW_CHECK` sobre los 20 `.lum` reales sigue en 0
+discrepancias, con los mismos códigos de salida que antes de tocar nada. Se verificó además a
+mano, sirviendo de verdad por HTTP, el único camino que sigue teniendo comprobación y emisión
+fusionadas a propósito (`render()`, porque compilar la plantilla exige leer el fichero): una
+plantilla válida con una expresión `{{ nombre.upper() }}` y un argumento nombrado respondió
+correctamente end-to-end. Esa misma prueba manual, con una plantilla que llama a un método
+inexistente, encontró un `std::bad_alloc`/`std::length_error` al compilar — confirmado como un
+bug **preexistente** en el compilador de plantillas (reproducido idéntico en el commit anterior a
+este, antes de tocar nada del emisor), no una regresión de este cambio; queda anotado para
+revisarlo aparte, fuera del alcance de la fase 1.
+
+Con esto, la fase 1 está terminada: el checker es la única fuente de diagnósticos, y el emisor
+que llega a producción es un consumidor puro del IR. `emit_expr`/`emit_stmt`/`emit_call`/
+`emit_block` sobre `Expr`/`Stmt` y `comprobar_campo`/`comprobar_metodo_builtin` ya no los llama
+nadie desde los puntos de entrada reales — siguen en el árbol por ahora (retirarlos es limpieza,
+no riesgo, y se hace aparte una vez confirmado con calma que de verdad no hace falta ninguno).
+
 **La primera mitad de ese paso ya está hecha**: `check_expr`/`check_call`/`check_stmt`/
 `check_block`/`check_condition` ahora construyen y devuelven el `IrExpr`/`IrStmt`/`IrBlock`
 correspondiente (`nullptr`/vacío exactamente cuando ya se llamó a `shadow.error()` en el sitio
