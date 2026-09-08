@@ -7,6 +7,7 @@
 #include "ast.hpp"
 #include "bytecode.hpp"
 #include "diagnostic.hpp"
+#include "ir.hpp"
 #include "type.hpp"
 
 namespace lumen_script {
@@ -112,14 +113,20 @@ public:
     // ranuras: es un lector de locals_, nunca un escritor.
     //
     // Los errores van a `shadow`, NUNCA a diags_: todavia no es la fuente de
-    // diagnosticos (eso es el paso 3 de la fase 1), asi que un error de aqui
-    // no debe duplicar el que ya produce emit_expr/emit_call por su cuenta.
+    // diagnosticos (eso llega cuando el corte real conecte esto a Emitter),
+    // asi que un error de aqui no debe duplicar el que ya produce
+    // emit_expr/emit_call por su cuenta.
     //
-    // Publico porque la verificacion (comparar shadow contra diags_ real
-    // sobre el corpus de tests/casos) vive en un binario de pruebas aparte;
-    // nada en el compilador real llama a esto todavia.
-    Type check_expr(const Expr& e, DiagnosticBag& shadow) const;
-    void check_call(const Expr& e, bool awaited, DiagnosticBag& shadow) const;
+    // Ademas de comprobar, CONSTRUYE y devuelve el IrExpr correspondiente
+    // (nulo si algo no compilo -- ya se llamo a shadow.error en el sitio
+    // exacto). El tipo de cada nodo es tipo_de(e), sin excepcion: nunca un
+    // tipo mas preciso inventado aqui, porque eso seria funcionalidad nueva
+    // y no una reproduccion de lo que ya hace el compilador. Publico porque
+    // la verificacion (comparar shadow contra diags_ real, y el shape del
+    // IrExpr devuelto, sobre el corpus de tests/casos) vive en un binario de
+    // pruebas aparte; nada en el compilador real llama a esto todavia.
+    IrExprPtr check_expr(const Expr& e, DiagnosticBag& shadow) const;
+    IrExprPtr check_call(const Expr& e, bool awaited, DiagnosticBag& shadow) const;
 
     // Contrapartida de check_expr para emit_condition: mismo reinicio de
     // locals_/route_method_/scope_depth_, mismas declaraciones de `names`,
@@ -129,29 +136,40 @@ public:
     // secuencia sobre el mismo Emitter porque las dos reinician su estado por
     // completo al entrar, igual que ya hace emit_condition hoy si se llama
     // mas de una vez.
-    void check_condition(const Expr& e, const std::vector<NombreTipado>& names,
-                         DiagnosticBag& shadow);
+    IrExprPtr check_condition(const Expr& e, const std::vector<NombreTipado>& names,
+                              DiagnosticBag& shadow);
 
     // check_stmt/check_block: la misma idea que check_expr, pero para
-    // sentencias -- reproducen emit_stmt/emit_block rama a rama. A
-    // diferencia de check_expr, SI declaran ranuras (VarDecl, el `for`
-    // desazucarado, el nombre de un `catch`): esas SI son contabilidad de
-    // nombres real, no un temporal de codegen, y hace falta que el checker
-    // la lleve para que el Ident de una sentencia posterior resuelva bien.
-    // Por construccion no puede correr sobre el `this` de una emision real en
-    // curso (pisaria sus ranuras) -- de ahi check_route/check_function/etc.
-    // como puntos de entrada propios, cada uno reiniciando el estado exactamente
-    // como su contrapartida emit_*, para poder llamarse en secuencia sobre el
-    // mismo Emitter (primero la via real, luego la sombra) sin interferir.
-    void check_stmt(const Stmt& s, DiagnosticBag& shadow);
-    void check_block(const Block& body, DiagnosticBag& shadow);
+    // sentencias -- reproducen emit_stmt/emit_block rama a rama y construyen
+    // el IrStmt/IrBlock correspondiente (nulo/vacio en caso de error, mismo
+    // criterio que check_expr). A diferencia de check_expr, SI declaran
+    // ranuras (VarDecl, el `for` desazucarado, el nombre de un `catch`):
+    // esas SI son contabilidad de nombres real, no un temporal de codegen, y
+    // hace falta que el checker la lleve para que el Ident de una sentencia
+    // posterior resuelva bien. Por construccion no puede correr sobre el
+    // `this` de una emision real en curso (pisaria sus ranuras) -- de ahi
+    // check_route/check_function/etc. como puntos de entrada propios, cada
+    // uno reiniciando el estado exactamente como su contrapartida emit_*,
+    // para poder llamarse en secuencia sobre el mismo Emitter (primero la
+    // via real, luego la sombra) sin interferir.
+    IrStmtPtr check_stmt(const Stmt& s, DiagnosticBag& shadow);
+    // Vacio si algun sentencia del bloque fallo (ya se reporto en su sitio);
+    // igual que hoy con `failed_`, un bloque a medio construir no se usa.
+    IrBlock   check_block(const Block& body, DiagnosticBag& shadow);
 
-    bool check_route(const RouteDecl& route, DiagnosticBag& shadow);
-    bool check_function(const FnDecl& fn, DiagnosticBag& shadow);
-    bool check_method(const std::string& cls, const FnDecl& m, DiagnosticBag& shadow);
+    // `out_body`, si no es nulo, recibe el IrBlock construido (el mismo que
+    // ya se descarta hoy en project.cpp: check_route/etc. lo usan solo para
+    // saber si `shadow` crecio). Parametro opcional para no tocar ninguno de
+    // los 9 sitios de project.cpp que ya llaman a esto -- lo usan las
+    // pruebas que quieren inspeccionar la forma del IR construido.
+    bool check_route(const RouteDecl& route, DiagnosticBag& shadow, IrBlock* out_body = nullptr);
+    bool check_function(const FnDecl& fn, DiagnosticBag& shadow, IrBlock* out_body = nullptr);
+    bool check_method(const std::string& cls, const FnDecl& m, DiagnosticBag& shadow,
+                      IrBlock* out_body = nullptr);
     bool check_ctor(const std::string& cls, const std::vector<std::string>& fields,
-                    const CtorDecl& ct, DiagnosticBag& shadow);
-    bool check_error_handler(const ErrorDecl& decl, DiagnosticBag& shadow);
+                    const CtorDecl& ct, DiagnosticBag& shadow, IrBlock* out_body = nullptr);
+    bool check_error_handler(const ErrorDecl& decl, DiagnosticBag& shadow,
+                             IrBlock* out_body = nullptr);
 
 private:
     DiagnosticBag&                       diags_;

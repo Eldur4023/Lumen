@@ -192,8 +192,8 @@ bool Emitter::emit_condition(const Expr& e, const std::vector<NombreTipado>& nam
     return !failed_;
 }
 
-void Emitter::check_condition(const Expr& e, const std::vector<NombreTipado>& names,
-                              DiagnosticBag& shadow) {
+IrExprPtr Emitter::check_condition(const Expr& e, const std::vector<NombreTipado>& names,
+                                   DiagnosticBag& shadow) {
     route_method_ = {};
     locals_.clear();
     loops_.clear();
@@ -201,7 +201,7 @@ void Emitter::check_condition(const Expr& e, const std::vector<NombreTipado>& na
 
     for (const auto& n : names) declare_local(n.nombre, e.loc, Type::from_legacy_name(n.tipo));
 
-    check_expr(e, shadow);
+    return check_expr(e, shadow);
 }
 
 // check_route/check_function/check_method/check_ctor/check_error_handler:
@@ -210,7 +210,7 @@ void Emitter::check_condition(const Expr& e, const std::vector<NombreTipado>& na
 // mismas declaraciones de parametros/`this`. Devuelven si esta llamada en
 // concreto no anadio ningun error a `shadow` (no si `shadow` esta vacio del
 // todo: quien llama puede reusar el mismo DiagnosticBag para varios casos).
-bool Emitter::check_route(const RouteDecl& route, DiagnosticBag& shadow) {
+bool Emitter::check_route(const RouteDecl& route, DiagnosticBag& shadow, IrBlock* out_body) {
     size_t antes    = shadow.size();
     route_method_   = route.method;
     locals_.clear();
@@ -225,11 +225,12 @@ bool Emitter::check_route(const RouteDecl& route, DiagnosticBag& shadow) {
         check_expr(*g.otherwise, shadow);
     }
 
-    check_block(route.body, shadow);
+    IrBlock body = check_block(route.body, shadow);
+    if (out_body) *out_body = std::move(body);
     return shadow.size() == antes;
 }
 
-bool Emitter::check_function(const FnDecl& fn, DiagnosticBag& shadow) {
+bool Emitter::check_function(const FnDecl& fn, DiagnosticBag& shadow, IrBlock* out_body) {
     size_t antes  = shadow.size();
     route_method_ = "FN";
     locals_.clear();
@@ -237,11 +238,13 @@ bool Emitter::check_function(const FnDecl& fn, DiagnosticBag& shadow) {
     scope_depth_ = 0;
 
     for (const auto& p : fn.params) declare_local(p.name, p.loc, Type::from_declared(p.type));
-    check_block(fn.body, shadow);
+    IrBlock body = check_block(fn.body, shadow);
+    if (out_body) *out_body = std::move(body);
     return shadow.size() == antes;
 }
 
-bool Emitter::check_method(const std::string& cls, const FnDecl& m, DiagnosticBag& shadow) {
+bool Emitter::check_method(const std::string& cls, const FnDecl& m, DiagnosticBag& shadow,
+                           IrBlock* out_body) {
     size_t antes  = shadow.size();
     route_method_ = "FN";
     locals_.clear();
@@ -250,12 +253,13 @@ bool Emitter::check_method(const std::string& cls, const FnDecl& m, DiagnosticBa
 
     declare_local("this", m.loc, Type::class_ref(cls));
     for (const auto& p : m.params) declare_local(p.name, p.loc, Type::from_declared(p.type));
-    check_block(m.body, shadow);
+    IrBlock body = check_block(m.body, shadow);
+    if (out_body) *out_body = std::move(body);
     return shadow.size() == antes;
 }
 
 bool Emitter::check_ctor(const std::string& cls, const std::vector<std::string>& fields,
-                         const CtorDecl& ct, DiagnosticBag& shadow) {
+                         const CtorDecl& ct, DiagnosticBag& shadow, IrBlock* out_body) {
     size_t antes  = shadow.size();
     route_method_ = "FN";
     locals_.clear();
@@ -266,7 +270,8 @@ bool Emitter::check_ctor(const std::string& cls, const std::vector<std::string>&
     declare_local("this", ct.loc, Type::class_ref(cls));
 
     if (ct.has_body) {
-        check_block(ct.body, shadow);
+        IrBlock body = check_block(ct.body, shadow);
+        if (out_body) *out_body = std::move(body);
     } else {
         for (const auto& p : ct.params) {
             if (std::find(fields.begin(), fields.end(), p.name) == fields.end())
@@ -276,14 +281,15 @@ bool Emitter::check_ctor(const std::string& cls, const std::vector<std::string>&
     return shadow.size() == antes;
 }
 
-bool Emitter::check_error_handler(const ErrorDecl& decl, DiagnosticBag& shadow) {
+bool Emitter::check_error_handler(const ErrorDecl& decl, DiagnosticBag& shadow, IrBlock* out_body) {
     size_t antes  = shadow.size();
     route_method_ = "ERROR";
     locals_.clear();
     loops_.clear();
     scope_depth_ = 0;
 
-    check_block(decl.body, shadow);
+    IrBlock body = check_block(decl.body, shadow);
+    if (out_body) *out_body = std::move(body);
     return shadow.size() == antes;
 }
 
@@ -518,124 +524,243 @@ void Emitter::emit_stmt(const Stmt& s) {
     }
 }
 
+// Traduce un StmtKind al IrStmtKind correspondiente -- ver el comentario de
+// ir_kind_de: un switch explicito, no un static_cast, para que un StmtKind
+// nuevo sin actualizar esto avise en compilacion.
+static IrStmtKind ir_stmt_kind_de(StmtKind k) {
+    switch (k) {
+        case StmtKind::Return:   return IrStmtKind::Return;
+        case StmtKind::ExprStmt: return IrStmtKind::ExprStmt;
+        case StmtKind::VarDecl:  return IrStmtKind::VarDecl;
+        case StmtKind::Assign:   return IrStmtKind::Assign;
+        case StmtKind::If:       return IrStmtKind::If;
+        case StmtKind::While:    return IrStmtKind::While;
+        case StmtKind::For:      return IrStmtKind::For;
+        case StmtKind::Require:  return IrStmtKind::Require;
+        case StmtKind::Try:      return IrStmtKind::Try;
+        case StmtKind::Break:    return IrStmtKind::Break;
+        case StmtKind::Continue: return IrStmtKind::Continue;
+    }
+    return IrStmtKind::Return; // inalcanzable si el switch de arriba es exhaustivo
+}
+
 // Shadow de emit_block/emit_stmt (fase 1, checker en paralelo -- ver
 // emitter.hpp). Mismo orden de comprobaciones, mismo texto, sin tocar chunk_.
 // A diferencia de check_expr, SI llama a declare_local/begin_scope/end_scope:
 // VarDecl, el `for` desazucarado y el nombre de un `catch` son contabilidad
 // de nombres real (no un temporal de codegen), y hace falta reproducirla para
 // que el Ident de una sentencia posterior resuelva a la ranura correcta.
-void Emitter::check_block(const Block& body, DiagnosticBag& shadow) {
+//
+// check_block SIEMPRE visita las sentencias que tiene, aunque alguna falle:
+// eso es lo que permite reportar todos los errores de un bloque en una sola
+// pasada, igual que hace hoy emit_stmt. Una sentencia que fallo (nullptr) se
+// omite del IrBlock resultante -- silenciosamente, no es un error nuevo, ya
+// se reporto en su sitio -- asi que un IrBlock nunca lleva un hueco nulo. Un
+// If/While/For cuya condicion o iterable fallo tampoco se propaga (devuelve
+// nullptr el mismo), aunque su cuerpo se haya revisado entero para no perder
+// los errores que haya dentro; un Try nunca falla por cuenta propia, porque
+// no tiene una expresion propia que comprobar, solo delega en sus bloques.
+IrBlock Emitter::check_block(const Block& body, DiagnosticBag& shadow) {
     begin_scope();
-    for (const auto& s : body) check_stmt(*s, shadow);
+    IrBlock out;
+    for (const auto& s : body) {
+        IrStmtPtr st = check_stmt(*s, shadow);
+        if (st) out.push_back(std::move(st));
+    }
     end_scope();
+    return out;
 }
 
-void Emitter::check_stmt(const Stmt& s, DiagnosticBag& shadow) {
-    switch (s.kind) {
-        case StmtKind::Return:
-            if (s.value) check_expr(*s.value, shadow);
-            break;
+IrStmtPtr Emitter::check_stmt(const Stmt& s, DiagnosticBag& shadow) {
+    auto nodo = [&]() {
+        auto r = std::make_unique<IrStmt>();
+        r->kind = ir_stmt_kind_de(s.kind);
+        r->loc  = s.loc;
+        return r;
+    };
 
-        case StmtKind::ExprStmt:
-            check_expr(*s.value, shadow);
-            break;
+    switch (s.kind) {
+        case StmtKind::Return: {
+            auto r = nodo();
+            if (s.value) {
+                IrExprPtr v = check_expr(*s.value, shadow);
+                if (!v) return nullptr;
+                r->value = std::move(v);
+            }
+            return r;
+        }
+
+        case StmtKind::ExprStmt: {
+            IrExprPtr v = check_expr(*s.value, shadow);
+            if (!v) return nullptr;
+            auto r = nodo();
+            r->value = std::move(v);
+            return r;
+        }
 
         case StmtKind::VarDecl: {
-            if (s.value) check_expr(*s.value, shadow);
-            declare_local(s.name, s.loc, Type::from_declared(s.type));
-            break;
+            IrExprPtr v;
+            if (s.value) {
+                v = check_expr(*s.value, shadow);
+                if (!v) return nullptr;
+            }
+            int slot = declare_local(s.name, s.loc, Type::from_declared(s.type));
+            auto r = nodo();
+            r->value     = std::move(v);
+            r->name      = s.name;
+            r->decl_type = Type::from_declared(s.type);
+            r->slot      = slot;
+            return r;
         }
 
         case StmtKind::Assign: {
+            // `session.x = v` → __session_set("x", v).
             if (s.target->kind == ExprKind::Member &&
                 s.target->object->kind == ExprKind::Ident &&
                 s.target->object->text == "session" &&
                 resolve_local("session") < 0) {
-                check_expr(*s.value, shadow);
-                return;
+                IrExprPtr v = check_expr(*s.value, shadow);
+                if (!v) return nullptr;
+                auto r = nodo();
+                r->assign_target = IrAssignTarget::Session;
+                r->assign_field  = s.target->text;
+                r->value = std::move(v);
+                return r;
             }
 
+            // `xs[0] = v` y `d["k"] = v`.
             if (s.target->kind == ExprKind::Index) {
-                check_expr(*s.target->object, shadow);
-                check_expr(*s.target->lhs, shadow);
-                check_expr(*s.value, shadow);
-                return;
+                IrExprPtr obj = check_expr(*s.target->object, shadow);
+                IrExprPtr idx = check_expr(*s.target->lhs, shadow);
+                IrExprPtr val = check_expr(*s.value, shadow);
+                if (!obj || !idx || !val) return nullptr;
+                auto r = nodo();
+                r->assign_target = IrAssignTarget::Index;
+                r->assign_object = std::move(obj);
+                r->assign_index  = std::move(idx);
+                r->value = std::move(val);
+                return r;
             }
 
+            // `this.campo = v` y `objeto.campo = v`.
             if (s.target->kind == ExprKind::Member) {
-                if (!check_campo(*s.target->object, s.target->text, s.loc, shadow)) return;
-                check_expr(*s.target->object, shadow);
-                check_expr(*s.value, shadow);
-                return;
+                if (!check_campo(*s.target->object, s.target->text, s.loc, shadow)) return nullptr;
+                IrExprPtr obj = check_expr(*s.target->object, shadow);
+                IrExprPtr val = check_expr(*s.value, shadow);
+                if (!obj || !val) return nullptr;
+                auto r = nodo();
+                r->assign_target = IrAssignTarget::Member;
+                r->assign_object = std::move(obj);
+                r->assign_field  = s.target->text;
+                r->value = std::move(val);
+                return r;
             }
 
             if (s.target->kind != ExprKind::Ident) {
                 shadow.error(s.loc, "solo se puede asignar a una variable o a un campo");
-                return;
+                return nullptr;
             }
             int slot = resolve_local(s.target->text);
             if (slot < 0) {
                 shadow.error(s.target->loc, "'" + s.target->text + "' no esta declarada");
-                return;
+                return nullptr;
             }
-            check_expr(*s.value, shadow);
-            break;
+            IrExprPtr val = check_expr(*s.value, shadow);
+            if (!val) return nullptr;
+            auto r = nodo();
+            r->assign_target = IrAssignTarget::Local;
+            r->assign_slot   = slot;
+            r->value = std::move(val);
+            return r;
         }
 
         case StmtKind::If: {
-            check_expr(*s.value, shadow);
-            check_block(s.body, shadow);
-            if (!s.orelse.empty()) check_block(s.orelse, shadow);
-            break;
+            IrExprPtr cond = check_expr(*s.value, shadow);
+            IrBlock   then = check_block(s.body, shadow);
+            IrBlock   orelse;
+            if (!s.orelse.empty()) orelse = check_block(s.orelse, shadow);
+            if (!cond) return nullptr;
+            auto r = nodo();
+            r->value  = std::move(cond);
+            r->body   = std::move(then);
+            r->orelse = std::move(orelse);
+            return r;
         }
 
         case StmtKind::While: {
-            check_expr(*s.value, shadow);
+            IrExprPtr cond = check_expr(*s.value, shadow);
             loops_.push_back({});
-            check_block(s.body, shadow);
+            IrBlock body = check_block(s.body, shadow);
             loops_.pop_back();
-            break;
+            if (!cond) return nullptr;
+            auto r = nodo();
+            r->value = std::move(cond);
+            r->body  = std::move(body);
+            return r;
         }
 
         case StmtKind::Require: {
-            check_expr(*s.value, shadow);
-            check_expr(*s.target, shadow);
-            break;
+            IrExprPtr cond = check_expr(*s.value, shadow);
+            IrExprPtr els  = check_expr(*s.target, shadow);
+            if (!cond || !els) return nullptr;
+            auto r = nodo();
+            r->value  = std::move(cond);
+            r->target = std::move(els);
+            return r;
         }
 
         case StmtKind::Break:
-            if (loops_.empty()) shadow.error(s.loc, "'break' fuera de un bucle");
-            break;
+            if (loops_.empty()) { shadow.error(s.loc, "'break' fuera de un bucle"); return nullptr; }
+            return nodo();
 
         case StmtKind::Continue:
-            if (loops_.empty()) shadow.error(s.loc, "'continue' fuera de un bucle");
-            break;
+            if (loops_.empty()) { shadow.error(s.loc, "'continue' fuera de un bucle"); return nullptr; }
+            return nodo();
 
         case StmtKind::For: {
             begin_scope();
-            check_expr(*s.target, shadow);
+            IrExprPtr iterable = check_expr(*s.target, shadow);
             declare_local(" items", s.loc);
             declare_local(" count", s.loc);
             declare_local(" index", s.loc);
-            declare_local(s.name, s.loc, Type::from_declared(s.type));
+            int var = declare_local(s.name, s.loc, Type::from_declared(s.type));
 
             loops_.push_back({});
-            check_block(s.body, shadow);
+            IrBlock body = check_block(s.body, shadow);
             loops_.pop_back();
-
             end_scope();
-            break;
+
+            if (!iterable) return nullptr;
+            auto r = nodo();
+            r->target    = std::move(iterable);
+            r->name      = s.name;
+            r->decl_type = Type::from_declared(s.type);
+            r->slot      = var;
+            r->body      = std::move(body);
+            return r;
         }
 
         case StmtKind::Try: {
-            check_block(s.body, shadow);
+            IrBlock body = check_block(s.body, shadow);
             begin_scope();
-            if (!s.name.empty()) declare_local(s.name, s.loc);
-            for (const auto& st : s.orelse) check_stmt(*st, shadow);
+            int slot = -1;
+            if (!s.name.empty()) slot = declare_local(s.name, s.loc);
+            IrBlock orelse;
+            for (const auto& st : s.orelse) {
+                IrStmtPtr ir = check_stmt(*st, shadow);
+                if (ir) orelse.push_back(std::move(ir));
+            }
             end_scope();
-            break;
+
+            auto r = nodo();
+            r->body   = std::move(body);
+            r->name   = s.name;
+            r->slot   = slot;
+            r->orelse = std::move(orelse);
+            return r;
         }
     }
+    return nullptr; // inalcanzable si el switch de arriba es exhaustivo
 }
 
 void Emitter::emit_expr(const Expr& e) {
@@ -1413,20 +1538,61 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
                  (static_cast<uint32_t>(id) << 8) | static_cast<uint32_t>(argc));
 }
 
+// Traduce un ExprKind al IrExprKind correspondiente. Es una funcion, no un
+// static_cast: las dos enumeraciones tienen hoy el mismo orden a proposito,
+// pero un cast confiaria en eso silenciosamente. Con un switch explicito, si
+// alguien anade un ExprKind sin actualizar esta funcion, el compilador avisa
+// (switch no exhaustivo) en vez de dejar pasar un IrExprKind inventado.
+static IrExprKind ir_kind_de(ExprKind k) {
+    switch (k) {
+        case ExprKind::StringLit: return IrExprKind::StringLit;
+        case ExprKind::IntLit:    return IrExprKind::IntLit;
+        case ExprKind::FloatLit:  return IrExprKind::FloatLit;
+        case ExprKind::BoolLit:   return IrExprKind::BoolLit;
+        case ExprKind::NullLit:   return IrExprKind::NullLit;
+        case ExprKind::Ident:     return IrExprKind::Ident;
+        case ExprKind::This:      return IrExprKind::This;
+        case ExprKind::Member:    return IrExprKind::Member;
+        case ExprKind::Index:     return IrExprKind::Index;
+        case ExprKind::Call:      return IrExprKind::Call;
+        case ExprKind::Unary:     return IrExprKind::Unary;
+        case ExprKind::Binary:    return IrExprKind::Binary;
+        case ExprKind::Ternary:   return IrExprKind::Ternary;
+        case ExprKind::Await:     return IrExprKind::Await;
+        case ExprKind::PreStep:   return IrExprKind::PreStep;
+        case ExprKind::PostStep:  return IrExprKind::PostStep;
+        case ExprKind::ListLit:   return IrExprKind::ListLit;
+        case ExprKind::DictLit:   return IrExprKind::DictLit;
+    }
+    return IrExprKind::NullLit; // inalcanzable si el switch de arriba es exhaustivo
+}
+
 // Shadow de emit_expr (fase 1, checker en paralelo -- ver emitter.hpp): misma
 // forma, mismo orden de comprobaciones y mismo texto de error, pero sin tocar
 // chunk_ y sin declarar ninguna ranura (las declare_local() de emit_expr son
-// temporales de codegen que un paso de solo comprobacion no necesita). El
-// tipo que devuelve es el mismo que ya calcula tipo_de(): completarlo con mas
-// casos seria funcionalidad nueva, no una reproduccion de lo que hay hoy.
-Type Emitter::check_expr(const Expr& e, DiagnosticBag& shadow) const {
+// temporales de codegen que un paso de solo comprobacion no necesita).
+//
+// Ademas de comprobar, construye el IrExpr de esta expresion. El tipo de
+// cada nodo es SIEMPRE tipo_de(e), nunca algo mas preciso inventado aqui
+// (seria funcionalidad nueva, no una reproduccion de lo que hay hoy) -- por
+// eso `nodo()` lo fija una sola vez y cada case solo rellena su estructura.
+// nullptr significa "ya se llamo a shadow.error en el sitio exacto": ningun
+// nodo a medio construir se propaga hacia arriba.
+IrExprPtr Emitter::check_expr(const Expr& e, DiagnosticBag& shadow) const {
+    auto nodo = [&]() {
+        auto r = std::make_unique<IrExpr>();
+        r->kind = ir_kind_de(e.kind);
+        r->loc  = e.loc;
+        r->type = tipo_de(e);
+        return r;
+    };
+
     switch (e.kind) {
-        case ExprKind::StringLit:
-        case ExprKind::IntLit:
-        case ExprKind::FloatLit:
-        case ExprKind::BoolLit:
-        case ExprKind::NullLit:
-            break;
+        case ExprKind::StringLit: { auto r = nodo(); r->text = e.text; return r; }
+        case ExprKind::IntLit:    { auto r = nodo(); r->int_value = e.int_value; return r; }
+        case ExprKind::FloatLit:  { auto r = nodo(); r->float_value = e.float_value; return r; }
+        case ExprKind::BoolLit:   { auto r = nodo(); r->bool_value = e.bool_value; return r; }
+        case ExprKind::NullLit:   return nodo();
 
         case ExprKind::Ident: {
             int slot = resolve_local(e.text);
@@ -1436,57 +1602,103 @@ Type Emitter::check_expr(const Expr& e, DiagnosticBag& shadow) const {
                                  "no usarlo como valor");
                 else
                     shadow.error(e.loc, "'" + e.text + "' no esta declarada");
+                return nullptr;
             }
-            break;
+            auto r = nodo();
+            r->text = e.text;
+            r->slot = slot;
+            return r;
         }
 
-        case ExprKind::Unary:
-            check_expr(*e.lhs, shadow);
-            break;
+        case ExprKind::Unary: {
+            IrExprPtr operando = check_expr(*e.lhs, shadow);
+            if (!operando) return nullptr;
+            auto r = nodo();
+            r->text = e.text;
+            r->lhs  = std::move(operando);
+            return r;
+        }
 
         case ExprKind::Binary: {
             if (e.text == "and" || e.text == "or") {
-                check_expr(*e.lhs, shadow);
-                check_expr(*e.rhs, shadow);
-                break;
+                IrExprPtr l = check_expr(*e.lhs, shadow);
+                IrExprPtr r2 = check_expr(*e.rhs, shadow);
+                if (!l || !r2) return nullptr;
+                auto r = nodo();
+                r->text = e.text;
+                r->lhs = std::move(l);
+                r->rhs = std::move(r2);
+                return r;
             }
-            check_expr(*e.lhs, shadow);
-            check_expr(*e.rhs, shadow);
+            IrExprPtr l = check_expr(*e.lhs, shadow);
+            IrExprPtr r2 = check_expr(*e.rhs, shadow);
             static const std::set<std::string> ops = {
                 "+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">="};
-            if (!ops.count(e.text))
+            if (!ops.count(e.text)) {
                 shadow.error(e.loc, "operador no soportado: " + e.text);
-            break;
+                return nullptr;
+            }
+            if (!l || !r2) return nullptr;
+            auto r = nodo();
+            r->text = e.text;
+            r->lhs = std::move(l);
+            r->rhs = std::move(r2);
+            return r;
         }
 
-        case ExprKind::Ternary:
-            check_expr(*e.object, shadow);
-            check_expr(*e.lhs, shadow);
-            check_expr(*e.rhs, shadow);
-            break;
+        case ExprKind::Ternary: {
+            IrExprPtr cond = check_expr(*e.object, shadow);
+            IrExprPtr si   = check_expr(*e.lhs, shadow);
+            IrExprPtr no   = check_expr(*e.rhs, shadow);
+            if (!cond || !si || !no) return nullptr;
+            auto r = nodo();
+            r->object = std::move(cond);
+            r->lhs    = std::move(si);
+            r->rhs    = std::move(no);
+            return r;
+        }
 
-        case ExprKind::ListLit:
-            for (const auto& item : e.items) check_expr(*item, shadow);
-            break;
-
-        case ExprKind::DictLit:
-            for (const auto& entry : e.entries) {
-                check_expr(*entry.key, shadow);
-                check_expr(*entry.value, shadow);
+        case ExprKind::ListLit: {
+            auto r = nodo();
+            for (const auto& item : e.items) {
+                IrExprPtr it = check_expr(*item, shadow);
+                if (!it) return nullptr;
+                r->items.push_back(std::move(it));
             }
-            break;
+            return r;
+        }
 
-        case ExprKind::Index:
-            check_expr(*e.object, shadow);
-            check_expr(*e.lhs, shadow);
-            break;
+        case ExprKind::DictLit: {
+            auto r = nodo();
+            for (const auto& entry : e.entries) {
+                IrExprPtr k = check_expr(*entry.key, shadow);
+                IrExprPtr v = check_expr(*entry.value, shadow);
+                if (!k || !v) return nullptr;
+                r->entries.push_back({std::move(k), std::move(v)});
+            }
+            return r;
+        }
+
+        case ExprKind::Index: {
+            IrExprPtr obj = check_expr(*e.object, shadow);
+            IrExprPtr idx = check_expr(*e.lhs, shadow);
+            if (!obj || !idx) return nullptr;
+            auto r = nodo();
+            r->object = std::move(obj);
+            r->lhs    = std::move(idx);
+            return r;
+        }
 
         case ExprKind::Member: {
+            // `session.x` admite cualquier nombre: se traduce a
+            // __session_get("x"). `text` ya lleva "x"; no hace falta mas.
             if (e.object->kind == ExprKind::Ident &&
                 e.object->text == "session" &&
                 resolve_local("session") < 0 &&
                 member_native_id("session", e.text) < 0) {
-                break;
+                auto r = nodo();
+                r->text = e.text;
+                return r;
             }
 
             if (e.object->kind == ExprKind::Ident &&
@@ -1497,85 +1709,145 @@ Type Emitter::check_expr(const Expr& e, DiagnosticBag& shadow) const {
                 if (id < 0) {
                     shadow.error(e.loc, "'" + e.object->text + "' no tiene un miembro '" +
                                  e.text + "'");
-                    break;
+                    return nullptr;
                 }
                 if (native_at(id).min_args > 0) {
                     shadow.error(e.loc, "'" + e.object->text + "." + e.text +
                                  "' es una operacion: hay que llamarla con ()");
-                    break;
+                    return nullptr;
                 }
                 if ((e.object->text == "sse" && route_method_ != "SSE") ||
                     (e.object->text == "ws"  && route_method_ != "WS")) {
                     shadow.error(e.loc, "'" + e.object->text + "' solo existe dentro de "
                                  "una ruta " + e.object->text);
-                    break;
+                    return nullptr;
                 }
                 if (e.object->text == "error" && route_method_ != "ERROR") {
                     shadow.error(e.loc, "'error' solo existe dentro de un 'on error'");
-                    break;
+                    return nullptr;
                 }
-                break;
+                // Miembro de 0 argumentos de un objeto reservado (`sse.open`):
+                // reusa call_name/call_index, ver el comentario de ir.hpp.
+                auto r = nodo();
+                r->text = e.text;
+                r->call_name  = e.object->text;
+                r->call_index = id;
+                return r;
             }
-            if (!check_campo(*e.object, e.text, e.loc, shadow)) break;
-            check_expr(*e.object, shadow);
-            break;
+            if (!check_campo(*e.object, e.text, e.loc, shadow)) return nullptr;
+            IrExprPtr obj = check_expr(*e.object, shadow);
+            if (!obj) return nullptr;
+            auto r = nodo();
+            r->object = std::move(obj);
+            r->text   = e.text;
+            return r;
         }
 
         case ExprKind::Call:
-            check_call(e, /*awaited=*/false, shadow);
-            break;
+            return check_call(e, /*awaited=*/false, shadow);
 
         case ExprKind::PreStep:
         case ExprKind::PostStep: {
             const Expr& tgt = *e.lhs;
 
             if (tgt.kind == ExprKind::Ident) {
-                if (resolve_local(tgt.text) < 0)
+                int slot = resolve_local(tgt.text);
+                if (slot < 0) {
                     shadow.error(tgt.loc, "'" + tgt.text + "' no esta declarada");
-                break;
+                    return nullptr;
+                }
+                auto objetivo = std::make_unique<IrExpr>();
+                objetivo->kind = IrExprKind::Ident;
+                objetivo->loc  = tgt.loc;
+                objetivo->text = tgt.text;
+                objetivo->slot = slot;
+                objetivo->type = local_type(tgt.text);
+                auto r = nodo();
+                r->text = e.text;
+                r->lhs  = std::move(objetivo);
+                return r;
             }
             if (tgt.kind == ExprKind::Member) {
                 // Igual que emit_expr: NO se comprueba que el campo exista
                 // (comprobar_campo no se llama aqui hoy tampoco). Reproducir
                 // ese hueco, no arreglarlo, es lo que toca en esta fase.
-                check_expr(*tgt.object, shadow);
-                break;
+                IrExprPtr obj = check_expr(*tgt.object, shadow);
+                if (!obj) return nullptr;
+                auto objetivo = std::make_unique<IrExpr>();
+                objetivo->kind   = IrExprKind::Member;
+                objetivo->loc    = tgt.loc;
+                objetivo->text   = tgt.text;
+                objetivo->object = std::move(obj);
+                auto r = nodo();
+                r->text = e.text;
+                r->lhs  = std::move(objetivo);
+                return r;
             }
             if (tgt.kind == ExprKind::Index) {
-                check_expr(*tgt.object, shadow);
-                check_expr(*tgt.lhs, shadow);
-                break;
+                IrExprPtr obj = check_expr(*tgt.object, shadow);
+                IrExprPtr idx = check_expr(*tgt.lhs, shadow);
+                if (!obj || !idx) return nullptr;
+                auto objetivo = std::make_unique<IrExpr>();
+                objetivo->kind   = IrExprKind::Index;
+                objetivo->loc    = tgt.loc;
+                objetivo->object = std::move(obj);
+                objetivo->lhs    = std::move(idx);
+                auto r = nodo();
+                r->text = e.text;
+                r->lhs  = std::move(objetivo);
+                return r;
             }
             shadow.error(e.loc, "'++' y '--' solo se aplican a una variable, un campo "
                          "o un elemento indexado");
-            break;
+            return nullptr;
         }
 
         case ExprKind::Await: {
             if (!e.lhs || e.lhs->kind != ExprKind::Call) {
                 shadow.error(e.loc, "'await' solo se aplica a una llamada asincrona "
                              "(de momento: sleep)");
-                break;
+                return nullptr;
             }
-            check_call(*e.lhs, /*awaited=*/true, shadow);
-            break;
+            IrExprPtr llamada = check_call(*e.lhs, /*awaited=*/true, shadow);
+            if (!llamada) return nullptr;
+            auto r = nodo();
+            r->lhs = std::move(llamada);
+            return r;
         }
 
-        case ExprKind::This:
-            if (resolve_local("this") < 0)
+        case ExprKind::This: {
+            int slot = resolve_local("this");
+            if (slot < 0) {
                 shadow.error(e.loc, "'this' solo existe dentro de un metodo o un constructor");
-            break;
+                return nullptr;
+            }
+            auto r = nodo();
+            r->slot = slot;
+            return r;
+        }
     }
-    return tipo_de(e);
+    return nullptr; // inalcanzable si el switch de arriba es exhaustivo
 }
 
 // Shadow de emit_call: misma forma, mismo orden, mismo texto -- ver el
-// comentario de check_expr.
-void Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow) const {
-    if (!e.object) { shadow.error(e.loc, "llamada sin destino"); return; }
+// comentario de check_expr. Construye un IrExpr(kind=Call) con call_shape ya
+// resuelto a una de las 8 formas de COMPILACION-NATIVA.md §1.2.
+IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow) const {
+    if (!e.object) { shadow.error(e.loc, "llamada sin destino"); return nullptr; }
 
-    std::string name;
-    int         id = -1;
+    auto llamada = [&](IrCallShape shape) {
+        auto r = std::make_unique<IrExpr>();
+        r->kind = IrExprKind::Call;
+        r->loc  = e.loc;
+        r->type = tipo_de(e);
+        r->call_shape = shape;
+        r->awaited    = awaited;
+        return r;
+    };
+
+    std::string  name;
+    int          id = -1;
+    IrCallShape  shape = IrCallShape::Invalid;
 
     // sse.send(...) — miembro de un objeto reservado.
     if (e.object->kind == ExprKind::Member &&
@@ -1588,7 +1860,7 @@ void Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow) con
         if (id < 0) {
             shadow.error(e.object->loc, "'" + e.object->object->text +
                                  "' no tiene un miembro '" + e.object->text + "'");
-            return;
+            return nullptr;
         }
         const std::string& obj = e.object->object->text;
 
@@ -1596,7 +1868,7 @@ void Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow) con
         if (is_module && (!imports_ || !imports_->count(obj))) {
             shadow.error(e.object->loc, "falta 'import " + obj + "' para poder usar '" +
                                  obj + "." + e.object->text + "'");
-            return;
+            return nullptr;
         }
         if (is_module) {
             const NativeDef& mdef = native_at(id);
@@ -1604,40 +1876,47 @@ void Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow) con
                 shadow.error(e.loc, "'" + obj + "." + e.object->text + "()' es asincrono: "
                              "hay que escribir 'await " + obj + "." + e.object->text +
                              "(...)'");
-                return;
+                return nullptr;
             }
+            IrExprPtr r = llamada(IrCallShape::DbModuleCall);
+            r->call_name  = obj;
+            r->call_index = id;
+
             size_t argc = 1;
             for (const auto& a : e.args) {
                 if (!a.name.empty()) {
                     shadow.error(a.loc, "las consultas no admiten argumentos con nombre");
-                    return;
+                    return nullptr;
                 }
-                check_expr(*a.value, shadow);
+                IrExprPtr v = check_expr(*a.value, shadow);
+                if (!v) return nullptr;
+                r->args.push_back({{}, std::move(v), a.loc});
                 ++argc;
             }
             if (argc < static_cast<size_t>(mdef.min_args)) {
                 shadow.error(e.loc, "'" + obj + "." + e.object->text +
                              "()' espera al menos la consulta SQL");
-                return;
+                return nullptr;
             }
             if (mdef.max_args >= 0 && argc > static_cast<size_t>(mdef.max_args)) {
                 shadow.error(e.loc, "'" + obj + "." + e.object->text +
                              "()' no lleva argumentos");
-                return;
+                return nullptr;
             }
-            if (argc > 255) { shadow.error(e.loc, "demasiados argumentos"); return; }
-            return;
+            if (argc > 255) { shadow.error(e.loc, "demasiados argumentos"); return nullptr; }
+            return r;
         }
 
         if ((obj == "sse" && route_method_ != "SSE") ||
             (obj == "ws"  && route_method_ != "WS")) {
             shadow.error(e.object->loc, "'" + obj + "' solo existe dentro de una ruta " + obj);
-            return;
+            return nullptr;
         }
         if (obj == "error" && route_method_ != "ERROR") {
             shadow.error(e.object->loc, "'error' solo existe dentro de un 'on error'");
-            return;
+            return nullptr;
         }
+        shape = IrCallShape::ReservedMemberCall;
     }
     else if (e.object->kind == ExprKind::Ident) {
         name = e.object->text;
@@ -1647,14 +1926,19 @@ void Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow) con
             auto it = functions_ ? functions_->find(name) : FunctionSigs::const_iterator();
             if (functions_ && it != functions_->end()) {
                 const FnSig& sig = it->second;
+                IrExprPtr r = llamada(IrCallShape::UserFunctionCall);
+                r->call_index = static_cast<int>(sig.index);
+
                 size_t given = 0;
                 for (const auto& a : e.args) {
                     if (!a.name.empty()) {
                         shadow.error(a.loc, "una funcion de usuario no admite argumentos "
                                      "con nombre");
-                        return;
+                        return nullptr;
                     }
-                    check_expr(*a.value, shadow);
+                    IrExprPtr v = check_expr(*a.value, shadow);
+                    if (!v) return nullptr;
+                    r->args.push_back({{}, std::move(v), a.loc});
                     ++given;
                 }
 
@@ -1664,19 +1948,31 @@ void Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow) con
                         esperado += " a " + std::to_string(sig.defaults.size());
                     shadow.error(e.loc, "'" + name + "()' espera " + esperado +
                                  " argumento(s), pero recibe " + std::to_string(given));
-                    return;
+                    return nullptr;
                 }
-                return;
+                // Los que faltan se rellenan con su valor por defecto: la
+                // funcion recibe siempre la lista completa (igual que hoy
+                // emit_call, ver el comentario de IrArg).
+                for (size_t i = given; i < sig.defaults.size(); ++i) {
+                    IrExprPtr v = check_expr(*sig.defaults[i], shadow);
+                    if (!v) return nullptr;
+                    r->args.push_back({{}, std::move(v), e.loc});
+                }
+                return r;
             }
             auto ct = classes_ ? classes_->find(name) : ClassSigs::const_iterator();
             if (classes_ && ct != classes_->end()) {
+                IrExprPtr r = llamada(IrCallShape::ConstructorCall);
+
                 size_t argc = 0;
                 for (const auto& a : e.args) {
                     if (!a.name.empty()) {
                         shadow.error(a.loc, "un constructor no admite argumentos con nombre");
-                        return;
+                        return nullptr;
                     }
-                    check_expr(*a.value, shadow);
+                    IrExprPtr v = check_expr(*a.value, shadow);
+                    if (!v) return nullptr;
+                    r->args.push_back({{}, std::move(v), a.loc});
                     ++argc;
                 }
                 auto found = ct->second.ctors.find(argc);
@@ -1687,14 +1983,16 @@ void Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow) con
                     shadow.error(e.loc, "'" + name + "' no tiene constructor de " +
                                  std::to_string(argc) + " parametro(s)" +
                                  (opciones.empty() ? "" : "; los hay de " + opciones));
-                    return;
+                    return nullptr;
                 }
-                return;
+                r->call_index = static_cast<int>(found->second);
+                return r;
             }
 
             shadow.error(e.object->loc, "funcion desconocida: '" + name + "'");
-            return;
+            return nullptr;
         }
+        shape = IrCallShape::BuiltinGlobalCall;
     }
     else if (e.object->kind == ExprKind::Member && classes_) {
         Type recv_type = Type::unknown();
@@ -1713,55 +2011,88 @@ void Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow) con
                               e.object->text) == cls->second.fields.end()) {
                     shadow.error(e.object->loc, "'" + recv_name + "' no tiene un metodo '" +
                                          e.object->text + "'");
-                    return;
+                    return nullptr;
                 }
+                // Campo con un metodo generico encima: sigue mas abajo.
             } else {
                 const FnSig& sig = m->second;
-                check_expr(*e.object->object, shadow);
+                IrExprPtr receptor = check_expr(*e.object->object, shadow);
+                if (!receptor) return nullptr;
+
+                IrExprPtr r = llamada(IrCallShape::ClassMethodCall);
+                r->object     = std::move(receptor);
+                r->call_index = static_cast<int>(sig.index);
+
                 size_t given = 0;
                 for (const auto& a : e.args) {
                     if (!a.name.empty()) {
                         shadow.error(a.loc, "un metodo no admite argumentos con nombre");
-                        return;
+                        return nullptr;
                     }
-                    check_expr(*a.value, shadow);
+                    IrExprPtr v = check_expr(*a.value, shadow);
+                    if (!v) return nullptr;
+                    r->args.push_back({{}, std::move(v), a.loc});
                     ++given;
                 }
                 if (given < sig.required || given > sig.defaults.size()) {
                     shadow.error(e.loc, "'" + recv_name + "." + e.object->text +
                                  "()' espera " + std::to_string(sig.required) +
                                  " argumento(s), pero recibe " + std::to_string(given));
-                    return;
+                    return nullptr;
                 }
-                return;
+                for (size_t i = given; i < sig.defaults.size(); ++i) {
+                    IrExprPtr v = check_expr(*sig.defaults[i], shadow);
+                    if (!v) return nullptr;
+                    r->args.push_back({{}, std::move(v), e.loc});
+                }
+                return r;
             }
         }
-        if (!check_metodo_builtin(e, shadow)) return;
-        check_expr(*e.object->object, shadow);
-        for (const auto& a : e.args) check_expr(*a.value, shadow);
-        return;
+        if (!check_metodo_builtin(e, shadow)) return nullptr;
+        IrExprPtr receptor = check_expr(*e.object->object, shadow);
+        if (!receptor) return nullptr;
+        IrExprPtr r = llamada(IrCallShape::BuiltinMethodCall);
+        r->object    = std::move(receptor);
+        r->call_name = e.object->text;
+        for (const auto& a : e.args) {
+            IrExprPtr v = check_expr(*a.value, shadow);
+            if (!v) return nullptr;
+            r->args.push_back({{}, std::move(v), a.loc});
+        }
+        return r;
     }
     else if (e.object->kind == ExprKind::Member) {
-        if (!check_metodo_builtin(e, shadow)) return;
-        check_expr(*e.object->object, shadow);
-        for (const auto& a : e.args) check_expr(*a.value, shadow);
-        return;
+        if (!check_metodo_builtin(e, shadow)) return nullptr;
+        IrExprPtr receptor = check_expr(*e.object->object, shadow);
+        if (!receptor) return nullptr;
+        IrExprPtr r = llamada(IrCallShape::BuiltinMethodCall);
+        r->object    = std::move(receptor);
+        r->call_name = e.object->text;
+        for (const auto& a : e.args) {
+            IrExprPtr v = check_expr(*a.value, shadow);
+            if (!v) return nullptr;
+            r->args.push_back({{}, std::move(v), a.loc});
+        }
+        return r;
     }
     else {
         shadow.error(e.loc, "de momento solo se pueden llamar builtins o metodos");
-        return;
+        return nullptr;
     }
 
+    // Cola compartida por las formas 2 (ReservedMemberCall) y 6
+    // (BuiltinGlobalCall): las dos resuelven a un native_id valido y
+    // comparten exactamente las mismas reglas de await/nombrados/aridad.
     const NativeDef& def = native_at(id);
 
     if (def.is_async && !awaited) {
         shadow.error(e.loc, "'" + name + "()' es asincrono: hay que escribir "
                      "'await " + name + "(...)'");
-        return;
+        return nullptr;
     }
     if (!def.is_async && awaited) {
         shadow.error(e.loc, "'" + name + "()' no es asincrono: sobra el 'await'");
-        return;
+        return nullptr;
     }
 
     size_t positional = 0, named = 0;
@@ -1769,8 +2100,12 @@ void Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow) con
 
     if (named > 0 && name != "render") {
         shadow.error(e.loc, "'" + name + "()' no admite argumentos con nombre");
-        return;
+        return nullptr;
     }
+
+    IrExprPtr r = llamada(shape);
+    r->call_name  = name;
+    r->call_index = id;
 
     // render() compila la plantilla en si en emitir_render_compilado, que es
     // superficie de plantillas (fase 3), no de expresiones -- no se reproduce
@@ -1781,24 +2116,34 @@ void Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow) con
             shadow.error(e.loc, "render() necesita el nombre de la plantilla escrito, no una "
                          "variable. Para elegir entre varias, usa un if con nombres "
                          "literales: cada rama queda comprobada al compilar");
-            return;
+            return nullptr;
         }
         if (!plantillas_ || !plantillas_->tabla) {
             shadow.error(e.loc, "render() no se puede usar aqui");
-            return;
+            return nullptr;
         }
-        for (const auto& a : e.args) check_expr(*a.value, shadow);
-        return;
+        for (const auto& a : e.args) {
+            IrExprPtr v = check_expr(*a.value, shadow);
+            if (!v) return nullptr;
+            r->args.push_back({a.name, std::move(v), a.loc});
+        }
+        return r;
     }
 
-    for (const auto& a : e.args)
-        if (a.name.empty()) check_expr(*a.value, shadow);
+    for (const auto& a : e.args) {
+        if (!a.name.empty()) continue;
+        IrExprPtr v = check_expr(*a.value, shadow);
+        if (!v) return nullptr;
+        r->args.push_back({{}, std::move(v), a.loc});
+    }
 
     size_t argc = positional;
     if (named > 0) {
         for (const auto& a : e.args) {
             if (a.name.empty()) continue;
-            check_expr(*a.value, shadow);
+            IrExprPtr v = check_expr(*a.value, shadow);
+            if (!v) return nullptr;
+            r->args.push_back({a.name, std::move(v), a.loc});
         }
         ++argc;
     }
@@ -1811,9 +2156,11 @@ void Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow) con
                                          : "-" + std::to_string(def.max_args);
         shadow.error(e.loc, "'" + name + "()' espera " + expected +
                      " argumento(s), pero recibe " + std::to_string(argc));
-        return;
+        return nullptr;
     }
-    if (argc > 255) { shadow.error(e.loc, "demasiados argumentos"); return; }
+    if (argc > 255) { shadow.error(e.loc, "demasiados argumentos"); return nullptr; }
+
+    return r;
 }
 
 // Compila la plantilla contra las claves de esta llamada y emite una llamada a

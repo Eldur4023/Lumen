@@ -10,6 +10,7 @@
 #include <lumen_script/parser.hpp>
 
 #include <cstdio>
+#include <functional>
 #include <set>
 #include <string>
 #include <vector>
@@ -28,12 +29,19 @@ static ExprPtr parse(const std::string& src, SourceFile& file, DiagnosticBag& di
 
 // Compila `src` como expresion suelta con `names` declarados, una vez con la
 // via real (emit_condition) y otra con el checker en paralelo
-// (check_condition), y compara ambas listas de mensajes.
+// (check_condition), y compara ambas listas de mensajes. Ademas comprueba la
+// otra mitad de lo que hace check_expr/check_call desde que devuelven
+// IrExprPtr: que el nodo construido sea no-nulo exactamente cuando la
+// compilacion real tuvo exito, y nulo exactamente cuando fallo -- un IrExpr
+// a medio construir no deberia sobrevivir a un error en ningun caso.
+// `inspeccionar`, si se da, recibe el IrExpr construido (solo se llama si no
+// es nulo) para comprobar su forma (call_shape, slot, etc.).
 static void caso(const char* nombre, const std::string& src,
                  const std::vector<NombreTipado>& names,
                  const std::string& esperado_substr,
                  const FunctionSigs* fns = nullptr, const ClassSigs* classes = nullptr,
-                 const std::set<std::string>* imports = nullptr) {
+                 const std::set<std::string>* imports = nullptr,
+                 const std::function<bool(const IrExpr&, std::string&)>& inspeccionar = {}) {
     SourceFile   file;
     DiagnosticBag diag_parse;
     ExprPtr       e = parse(src, file, diag_parse);
@@ -48,7 +56,7 @@ static void caso(const char* nombre, const std::string& src,
     Emitter       em(diags_real, fns, classes, imports);
     Chunk         chunk;
     em.emit_condition(*e, names, chunk);
-    em.check_condition(*e, names, diags_shadow);
+    IrExprPtr ir = em.check_condition(*e, names, diags_shadow);
 
     auto texts = [](const DiagnosticBag& d) {
         std::vector<std::string> v;
@@ -67,6 +75,12 @@ static void caso(const char* nombre, const std::string& src,
             for (const auto& m : real) std::printf("           real: %s\n", m.c_str());
             return;
         }
+        if (!ir) {
+            ++fallos;
+            std::printf("  FALLA %s (compilo limpio pero check_expr/check_call devolvio "
+                        "nullptr)\n", nombre);
+            return;
+        }
     } else {
         bool real_tiene_esperado = false;
         for (const auto& m : real)
@@ -77,6 +91,12 @@ static void caso(const char* nombre, const std::string& src,
             std::printf("  FALLA %s (la compilacion real no dio \"%s\"; dio %zu error(es))\n",
                         nombre, esperado_substr.c_str(), real.size());
             for (const auto& m : real) std::printf("           real: %s\n", m.c_str());
+            return;
+        }
+        if (ir) {
+            ++fallos;
+            std::printf("  FALLA %s (fallo la compilacion pero check_expr/check_call "
+                        "devolvio un IrExpr no nulo)\n", nombre);
             return;
         }
     }
@@ -90,6 +110,15 @@ static void caso(const char* nombre, const std::string& src,
         for (const auto& m : shadow) std::printf("[%s] ", m.c_str());
         std::printf("\n");
         return;
+    }
+
+    if (ir && inspeccionar) {
+        std::string motivo;
+        if (!inspeccionar(*ir, motivo)) {
+            ++fallos;
+            std::printf("  FALLA %s (shape del IrExpr: %s)\n", nombre, motivo.c_str());
+            return;
+        }
     }
 
     std::printf("  ok    %s\n", nombre);
@@ -153,8 +182,25 @@ int main() {
 
     caso("ws fuera de una ruta ws", "ws.send(\"x\")", {}, "solo existe dentro de una ruta ws");
 
-    // ── Camino feliz: ninguna de las dos vias debe quejarse ──────────────
-    caso("metodo builtin valido sobre string", "quien.upper()", {{"quien", "string"}}, "");
+    // ── Camino feliz: ninguna de las dos vias debe quejarse, y ademas se
+    //    inspecciona la forma del IrExpr construido (call_shape, slot...)
+    //    contra las 8 formas de COMPILACION-NATIVA.md §1.2 que sean
+    //    alcanzables desde una expresion suelta (check_condition fija
+    //    route_method_ a "", asi que ReservedMemberCall solo se puede
+    //    ejercitar en su rama de error, ya cubierta mas arriba) ──────────
+    caso("metodo builtin valido sobre string", "quien.upper()", {{"quien", "string"}}, "",
+         nullptr, nullptr, nullptr,
+         [](const IrExpr& ir, std::string& why) {
+             if (ir.kind != IrExprKind::Call) { why = "no es Call"; return false; }
+             if (ir.call_shape != IrCallShape::BuiltinMethodCall) {
+                 why = "call_shape no es BuiltinMethodCall"; return false;
+             }
+             if (ir.call_name != "upper") { why = "call_name != 'upper'"; return false; }
+             if (!ir.object || ir.object->kind != IrExprKind::Ident) {
+                 why = "el receptor no es el Ident esperado"; return false;
+             }
+             return true;
+         });
 
     {
         ClassSigs classes;
@@ -166,14 +212,75 @@ int main() {
         FunctionSigs fns;
         fns["saluda"].required = 1;
         fns["saluda"].defaults.resize(1);
-        caso("llamada valida a funcion de usuario", "saluda(1)", {}, "", &fns);
+        caso("llamada valida a funcion de usuario", "saluda(1)", {}, "", &fns,
+             nullptr, nullptr,
+             [](const IrExpr& ir, std::string& why) {
+                 if (ir.call_shape != IrCallShape::UserFunctionCall) {
+                     why = "call_shape no es UserFunctionCall"; return false;
+                 }
+                 if (ir.call_index != 0) { why = "call_index no es el indice esperado"; return false; }
+                 if (ir.args.size() != 1) { why = "no lleva el unico argumento dado"; return false; }
+                 return true;
+             });
+    }
+
+    {
+        ClassSigs classes;
+        classes["Usuario"].ctors[2] = 3;
+        caso("llamada valida a constructor", "Usuario(1, 2)", {}, "", nullptr, &classes,
+             nullptr,
+             [](const IrExpr& ir, std::string& why) {
+                 if (ir.call_shape != IrCallShape::ConstructorCall) {
+                     why = "call_shape no es ConstructorCall"; return false;
+                 }
+                 if (ir.call_index != 3) { why = "call_index no es el indice del ctor"; return false; }
+                 if (ir.args.size() != 2) { why = "no lleva los 2 argumentos dados"; return false; }
+                 return true;
+             });
+    }
+
+    {
+        ClassSigs classes;
+        classes["Punto"].fields = {"x", "y"};
+        classes["Punto"].methods["cuadrado"] = {5, 0, {}};
+        caso("llamada valida a metodo de clase", "p.cuadrado()", {{"p", "Punto"}}, "",
+             nullptr, &classes, nullptr,
+             [](const IrExpr& ir, std::string& why) {
+                 if (ir.call_shape != IrCallShape::ClassMethodCall) {
+                     why = "call_shape no es ClassMethodCall"; return false;
+                 }
+                 if (ir.call_index != 5) { why = "call_index no es el indice del metodo"; return false; }
+                 if (!ir.object || ir.object->kind != IrExprKind::Ident || ir.object->slot != 0) {
+                     why = "el receptor no lleva la ranura resuelta de 'p'"; return false;
+                 }
+                 return true;
+             });
     }
 
     {
         std::set<std::string> imports = {"sqlite"};
         caso("llamada valida a builtin async con await",
-             "await sqlite.query(\"select 1\")", {}, "", nullptr, nullptr, &imports);
+             "await sqlite.query(\"select 1\")", {}, "", nullptr, nullptr, &imports,
+             [](const IrExpr& ir, std::string& why) {
+                 if (ir.kind != IrExprKind::Await) { why = "no es Await"; return false; }
+                 if (!ir.lhs || ir.lhs->call_shape != IrCallShape::DbModuleCall) {
+                     why = "la llamada envuelta no es DbModuleCall"; return false;
+                 }
+                 if (ir.lhs->call_name != "sqlite") { why = "call_name no es 'sqlite'"; return false; }
+                 if (!ir.lhs->awaited) { why = "awaited no quedo en true"; return false; }
+                 if (ir.lhs->args.size() != 1) { why = "no lleva el argumento de la consulta"; return false; }
+                 return true;
+             });
     }
+
+    caso("identificador con ranura resuelta", "equis", {{"equis", "int"}}, "",
+         nullptr, nullptr, nullptr,
+         [](const IrExpr& ir, std::string& why) {
+             if (ir.kind != IrExprKind::Ident) { why = "no es Ident"; return false; }
+             if (ir.slot != 0) { why = "slot no es 0"; return false; }
+             if (ir.type != Type::primitive(Type::Kind::Int)) { why = "type no es int"; return false; }
+             return true;
+         });
 
     if (fallos == 0) {
         std::printf("check_expr_shadow: todo reproducido, %d fallos\n", fallos);

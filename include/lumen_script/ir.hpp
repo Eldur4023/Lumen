@@ -57,13 +57,18 @@ enum class IrCallShape {
     Invalid,             // 8. ninguna de las anteriores: error de compilacion
 };
 
-// Argumento ya resuelto: el checker ya aplico los valores por defecto
-// (FnSig::defaults) y el orden posicional que le corresponde a cada nombrado
-// admitido (solo render() los admite hoy, ver forma 6) -- IrArg nunca lleva
-// un nombre pendiente de resolver.
+// Argumento ya resuelto: el checker ya comprobo que los nombrados son
+// validos donde aparecen (solo render(), forma 6, los admite hoy) y ya
+// relleno los que faltan con su valor por defecto (FnSig::defaults) en las
+// formas que los tienen. `name` viaja vacio para un argumento posicional o
+// para un valor por defecto rellenado por el checker; solo lleva contenido
+// en un nombrado de verdad (`render(x, k=v)`), que es la unica informacion
+// de un IrArg que no esta ya en su `value` -- hace falta para que quien
+// consuma el IR pueda reconstruir el Dict de variables (ver emit_call).
 struct IrArg {
-    IrExprPtr value;
-    SourceLoc loc;
+    std::string name;
+    IrExprPtr   value;
+    SourceLoc   loc;
 };
 
 struct IrDictEntry {
@@ -92,12 +97,20 @@ struct IrExpr {
     // resuelto", solo el indice real.
     int slot = -1;
 
-    // Estructura general, mismo reuso que Expr segun el kind:
-    //   Member/Index/Call  -> object es el receptor
-    //   Unary              -> object es el operando
-    //   Binary             -> lhs, rhs
-    //   Ternary            -> object es la condicion, lhs/rhs son las ramas
-    //   Await/PreStep/PostStep -> object es la subexpresion
+    // Estructura general. Calca el reuso real de Expr (ast.hpp), verificado
+    // contra emit_expr caso a caso -- no es simetrico a proposito, porque
+    // Expr tampoco lo es:
+    //   Member/Index/Call -> object es el receptor
+    //   Binary            -> lhs, rhs son los operandos
+    //   Ternary           -> object es la condicion, lhs/rhs son las ramas
+    //   Unary             -> lhs es el operando
+    //   Await             -> lhs es la llamada (siempre kind == Call)
+    //   PreStep/PostStep  -> lhs es el objetivo, reconstruido como un IrExpr
+    //                        Ident/Member/Index sintetico (ver check_expr):
+    //                        Member/Index ahi NO comprueban el campo/objeto
+    //                        con el mismo rigor que un Member/Index suelto,
+    //                        porque emit_expr tampoco lo hace hoy -- ver el
+    //                        comentario de check_expr sobre ese hueco.
     IrExprPtr object;
     IrExprPtr lhs, rhs;
 
@@ -107,15 +120,26 @@ struct IrExpr {
     // Segun call_shape: el indice ya resuelto en la tabla que corresponda
     // (FunctionSigs::index en UserFunctionCall/ClassMethodCall, el numero de
     // parametros ya usado para indexar ClassSig::ctors en ConstructorCall).
-    // -1 si esa forma no resuelve por indice (BuiltinGlobalCall,
-    // BuiltinMethodCall y ReservedMemberCall resuelven por nombre).
+    // -1 si esa forma no resuelve por indice (BuiltinMethodCall resuelve por
+    // nombre; ReservedMemberCall y BuiltinGlobalCall SI llevan call_index --
+    // las dos terminan resolviendo al mismo native_id de hoy, solo cambia
+    // call_shape segun de donde vino la llamada).
     int call_index = -1;
     // Nombre ya resuelto que necesita el opcode final: el modulo inyectado en
-    // DbModuleCall, el nombre reservado (sse/ws/error) en ReservedMemberCall,
-    // o el nombre del builtin/metodo en BuiltinGlobalCall/BuiltinMethodCall.
-    // Vacio si call_shape no lo necesita.
+    // DbModuleCall, el nombre del metodo builtin en BuiltinMethodCall, o el
+    // nombre completo ya formado ("obj.miembro" / el builtin) en
+    // ReservedMemberCall/BuiltinGlobalCall. Vacio si call_shape no lo
+    // necesita (UserFunctionCall/ClassMethodCall/ConstructorCall resuelven
+    // por call_index, no por nombre).
     std::string call_name;
     bool        awaited = false;
+
+    // Kind == Member representando un miembro de 0 argumentos de un objeto
+    // reservado (`sse.open`, sin parentesis: emit_expr lo resuelve con
+    // CallNative igual que una llamada, ver check_expr) reusa call_name (el
+    // objeto reservado, ej. "sse") y call_index (el native_id ya resuelto)
+    // en vez de anadir campos nuevos solo para este caso -- `text` sigue
+    // llevando el nombre del miembro, como en cualquier otro Member.
 
     // ListLit / DictLit
     std::vector<IrExprPtr>   items;

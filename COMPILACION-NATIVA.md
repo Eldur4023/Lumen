@@ -498,11 +498,43 @@ asignación). Aditivo, sin conectar, verificado con un smoke test standalone (`V
 formas de `Assign`, `For` y `Try`/`catch`).
 
 Con `IrExpr` e `IrStmt` definidos y `check_expr`/`check_stmt` verificados contra la compilación
-real (casos de mano y corpus orgánico), queda un solo paso para cerrar la fase 1: convertir
-`check_expr`/`check_stmt` para que **devuelvan** `IrExpr`/`IrStmt` en vez de escribir a un
+real (casos de mano y corpus orgánico), quedaba un solo paso para cerrar la fase 1: convertir
+`check_expr`/`check_stmt` para que **devuelvan** `IrExpr`/`IrStmt` en vez de (solo) escribir a un
 `DiagnosticBag` aparte, y luego convertir `emit_expr`/`emit_stmt`/`emit_call` en consumidores
 puros de ese IR, quitándoles sus propias llamadas a `error()` — el paso de mayor riesgo de toda
 la fase 1, porque ahí sí se toca el camino real de compilación que usa todo el mundo.
+
+**La primera mitad de ese paso ya está hecha**: `check_expr`/`check_call`/`check_stmt`/
+`check_block`/`check_condition` ahora construyen y devuelven el `IrExpr`/`IrStmt`/`IrBlock`
+correspondiente (`nullptr`/vacío exactamente cuando ya se llamó a `shadow.error()` en el sitio
+exacto), además de seguir escribiendo a `shadow` exactamente igual que antes. El tipo de cada
+`IrExpr` es siempre `tipo_de(e)` — nunca algo más preciso inventado en el propio `check_expr`,
+que habría sido funcionalidad nueva y no una reproducción de lo que ya hace el compilador.
+`check_route`/`check_function`/`check_method`/`check_ctor`/`check_error_handler` ganaron un
+parámetro opcional (`IrBlock* out_body = nullptr`) para exponer el árbol construido sin tocar
+ninguno de los 9 sitios de `project.cpp` que ya los llaman (todos siguen descartando el bool
+como hasta ahora).
+
+Verificado en dos capas:
+1. `tests/check_expr_shadow.cpp` (21 casos) y `tests/check_stmt_shadow.cpp` (12 casos) se
+   extendieron para inspeccionar la *forma* del IR devuelto en el camino feliz — no solo que no
+   hay divergencia de diagnósticos (que ya se verificaba), sino que `call_shape`/`call_index`/
+   `slot`/`assign_target`/`decl_type` son los que corresponden. Cubre 6 de las 8 formas de
+   `IrCall` con verificación estructural real (`DbModuleCall`, `UserFunctionCall`,
+   `ConstructorCall`, `ClassMethodCall`, `BuiltinMethodCall`, y la resolución de `slot` de un
+   `Ident`; `ReservedMemberCall` y la rama exitosa de `BuiltinGlobalCall` no son alcanzables
+   desde una expresión suelta vía `check_condition`, que fija `route_method_` a vacío) y las 3
+   formas de `IrAssignTarget` que se pueden ejercitar sin sesión (`Local`, `Index`, `Member`).
+2. El canario de `project.cpp` (`LUMEN_SHADOW_CHECK=1`) se corrió de nuevo sobre los 20 `.lum`
+   reales del repositorio tras la reescritura completa: cero discrepancias, igual que antes de
+   tocar nada — la reescritura no cambió ni un carácter de lo que ya se producía.
+
+`tests/run_tests.sh` sigue en 79/79. Con esto, la fase 1 tiene el IR real construido y
+verificado en los dos niveles (casos de mano con inspección de forma, corpus orgánico completo
+sin inspección pero con comparación exhaustiva de diagnósticos) — falta la segunda mitad, la que
+de verdad es irreversible sin revisión: convertir `emit_expr`/`emit_stmt`/`emit_call` en
+consumidores del `IrExpr`/`IrStmt` ya construido, y hacer que sean `check_expr`/`check_stmt` (no
+`shadow`, sino `diags_` de verdad) la única fuente de diagnósticos del compilador.
 
 #### 1.2 — Las formas de llamada que `IrCall` tiene que distinguir
 
