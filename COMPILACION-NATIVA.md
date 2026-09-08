@@ -1278,6 +1278,19 @@ gana una ruta (`/mod/:a/:b`, `int r = a % b`) y una comparación dedicada que ex
 el mismo `"error"` ignorando `"en"`, más una petición posterior que confirma que la ruta nativa sigue
 sirviendo después del error. 79/79 del corpus y las 8 suites de `ctest` en verde.
 
+**`int(x)`: el tercer `BuiltinGlobalCall` puro, y el primero de los tres (`str`/`len`/`int`) que puede
+fallar de verdad en tiempo de ejecución.** Identidad sobre `Int`, truncar hacia cero sobre `Float`/
+`Bool` (el mismo cast que ya hace `fn_int` sobre `Value::as_float()`/`as_bool()`) y, sobre `String`,
+un fallo real — `lumen_str_to_int()` (nueva, en `error_runtime_prelude()`) usa el MISMO
+`std::stoll` sin comprobar cuánto consumió (`"12abc"` → `12`, igual que `fn_int`) y el mismo mensaje
+EXACTO (`"int(): '<texto>' no es un número"`) por el mismo canal (`lumen_native_fail`) que división/
+módulo por cero — precisamente el canal que la corrección crítica anterior ya dejó seguro tanto en
+una función (su wrapper) como en una ruta (su try/catch), así que añadir el primer builtin puro que
+falla de verdad no reabre ningún hueco: ya había red de seguridad esperándolo.
+`tests/native_build_shadow.cpp::prueba_conversion_int()` prueba los cuatro escalares como argumento
+(incluida la cadena inválida, comparando el mismo `Status::Error` con el mismo mensaje en las dos
+vías) como regresión permanente. 79/79 del corpus y las 8 suites de `ctest` en verde.
+
 ### Fase 5 — Asincronía y base de datos
 - `await` → `co_await` sobre los awaitables existentes; transacciones, pool, `last_id`.
 - **Aceptación:** el banco de pruebas completo (`bench/run_all.sh`) corre en modo `--native`

@@ -472,6 +472,75 @@ static bool prueba_str_len() {
     return ok;
 }
 
+// int(x) (natives.cpp: fn_int): identidad sobre Int, truncar hacia cero
+// sobre Float/Bool, y sobre String un fallo REAL de verdad -- el mismo
+// canal de error que division/modulo por cero (lumen_native_fail), asi que
+// tiene que atravesar el wrapper de la funcion igual de limpio, con el
+// mismo mensaje EXACTO que fn_int ("int(): '<texto>' no es un numero").
+static bool prueba_conversion_int() {
+    const std::string src =
+        "fn int usa_int(int n):\n"
+        "    int a = int(n)\n"
+        "    int b = int(3.9)\n"
+        "    int c = int(true)\n"
+        "    int d = int(str(n))\n"
+        "    return a + b + c + d\n"
+        "\n"
+        "fn int int_invalido(int n):\n"
+        "    return int(\"no-es-numero\") + n\n";
+
+    SourceFile    file;
+    DiagnosticBag diag_parse;
+    Program       prog;
+    if (!parse_program(src, file, diag_parse, prog)) {
+        std::printf("FALLA (int()): no parsea (%s)\n",
+                    diag_parse.items().empty() ? "?" : diag_parse.items().front().message.c_str());
+        return false;
+    }
+
+    FunctionSigs                  sigs = firmar(prog);
+    FunctionTable                 tabla_vm;
+    std::unique_ptr<NativeModule> nativo;
+    const auto cache_dir = std::filesystem::temp_directory_path() / "lumen_native_build_check_int";
+    if (!compilar_las_dos_vias(prog, sigs, tabla_vm, nativo, cache_dir)) return false;
+
+    if (!nativo || nativo->compiladas() != 2) {
+        std::printf("FALLA (int()): se esperaban 2 funciones (usa_int, int_invalido), hay %zu\n",
+                    nativo ? nativo->compiladas() : 0);
+        return false;
+    }
+
+    bool ok = true;
+    {
+        const Chunk& chunk = *tabla_vm[sigs.at("usa_int").index];
+        long long sin_n = ejecutar(chunk, 7, &tabla_vm, nullptr);
+        long long con_n = ejecutar(chunk, 7, &tabla_vm, nativo.get());
+        if (sin_n != con_n) {
+            std::printf("  FALLA usa_int(7): bytecode=%lld nativo=%lld\n", sin_n, con_n);
+            ok = false;
+        } else {
+            std::printf("  ok    usa_int(7) = %lld (bytecode y VM+nativo coinciden: int/float/"
+                        "bool/string)\n", sin_n);
+        }
+    }
+    {
+        const Chunk& chunk = *tabla_vm[sigs.at("int_invalido").index];
+        VM::Result sin_n = ejecutar_result(chunk, {Value::integer(1)}, &tabla_vm, nullptr);
+        VM::Result con_n = ejecutar_result(chunk, {Value::integer(1)}, &tabla_vm, nativo.get());
+        if (sin_n.status != VM::Status::Error || con_n.status != VM::Status::Error ||
+            sin_n.error != con_n.error) {
+            std::printf("  FALLA int_invalido(1): bytecode(status=%d,'%s') nativo(status=%d,"
+                        "'%s')\n", (int)sin_n.status, sin_n.error.c_str(), (int)con_n.status,
+                        con_n.error.c_str());
+            ok = false;
+        } else {
+            std::printf("  ok    int_invalido(1): las dos vias dan Status::Error con el mismo "
+                        "mensaje ('%s')\n", con_n.error.c_str());
+        }
+    }
+    return ok;
+}
+
 // `require cond else otherwise`: el mismo IrStmtKind que las guardas de
 // grupo de una ruta (Emitter::check_require_like) -- probado aqui sobre una
 // funcion suelta, que ya lo puede usar sin necesitar ninguna pieza de rutas
@@ -807,6 +876,7 @@ int main() {
     if (!prueba_listas()) ++fallos;
     if (!prueba_diccionarios()) ++fallos;
     if (!prueba_str_len()) ++fallos;
+    if (!prueba_conversion_int()) ++fallos;
     if (!prueba_require()) ++fallos;
     if (!prueba_sin_return_en_todos_los_caminos()) ++fallos;
     if (!prueba_tipos_dinamicos()) ++fallos;

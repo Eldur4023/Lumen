@@ -604,17 +604,21 @@ public:
                     }
                     return mit->second.retorno;
                 }
-                // Dos builtins globales puros (natives.cpp: fn_str/fn_len),
-                // el resto (sleep/render/status/text/...) o tienen efecto
-                // (escriben la respuesta, leen la peticion) o son asincronos
-                // -- fuera de alcance de tipo_provable, que solo demuestra
-                // tipos de expresiones sin efectos. `str(x)` reusa el mismo
-                // puente a Value que el valor de retorno de una ruta (ver
-                // Generador::valor_json): solo escalares, para no
+                // Tres builtins globales puros (natives.cpp: fn_str/fn_len/
+                // fn_int), el resto (sleep/render/status/text/...) o tienen
+                // efecto (escriben la respuesta, leen la peticion) o son
+                // asincronos -- fuera de alcance de tipo_provable, que solo
+                // demuestra tipos de expresiones sin efectos. `str(x)` reusa
+                // el mismo puente a Value que el valor de retorno de una
+                // ruta (ver Generador::valor_json): solo escalares, para no
                 // reimplementar Value::to_string() aqui. `len(x)` solo
                 // String/List<T> -- Dict queda fuera porque LDict no expone
                 // ningun metodo de tamaño (dict_runtime_prelude solo trae
-                // has/set/keys).
+                // has/set/keys). `int(x)` acepta los cuatro escalares --
+                // sobre string puede fallar en tiempo de ejecucion
+                // (lumen_native_fail, mismo canal que division/modulo por
+                // cero: atrapado por el wrapper de una funcion o por el
+                // try/catch de una ruta, nunca sin red).
                 if (e.call_shape == IrCallShape::BuiltinGlobalCall) {
                     if (e.call_name == "str" && e.args.size() == 1 && e.args[0].value) {
                         auto t = tipo_provable(*e.args[0].value);
@@ -624,6 +628,10 @@ public:
                         auto t = tipo_provable(*e.args[0].value);
                         if (t && (t->kind() == Type::Kind::String || t->kind() == Type::Kind::List))
                             return Type::primitive(Type::Kind::Int);
+                    }
+                    if (e.call_name == "int" && e.args.size() == 1 && e.args[0].value) {
+                        auto t = tipo_provable(*e.args[0].value);
+                        if (t && es_escalar_json(t->kind())) return Type::primitive(Type::Kind::Int);
                     }
                 }
                 return std::nullopt;
@@ -978,8 +986,8 @@ public:
                     return expr(*e.object) + ".lumen_keys()"; // "keys": sin argumentos
                 }
 
-                // str(x)/len(x) (natives.cpp: fn_str/fn_len): los dos
-                // unicos BuiltinGlobalCall que tipo_provable() sabe
+                // str(x)/len(x)/int(x) (natives.cpp: fn_str/fn_len/fn_int):
+                // los unicos BuiltinGlobalCall que tipo_provable() sabe
                 // demostrar (ver ese caso, mas arriba). str() pasa por el
                 // mismo puente a Value que un valor de retorno de ruta
                 // (Generador::valor_json) y llama a Value::to_string(), la
@@ -994,6 +1002,19 @@ public:
                     return t->kind() == Type::Kind::String
                                ? "static_cast<int64_t>(" + expr(*e.args[0].value) + ".size())"
                                : expr(*e.args[0].value) + ".lumen_len()";
+                }
+                // int(x): identidad sobre Int, truncar hacia cero sobre
+                // Float/Bool (igual que el cast de C++ que ya usa fn_int
+                // sobre Value::as_float()/as_bool()), y sobre String, un
+                // fallo real de verdad (lumen_str_to_int, mismo mensaje EXACTO
+                // que fn_int -- error_runtime_prelude) -- el unico de los
+                // tres casos de int(x) que puede tomar el canal de error.
+                if (e.call_shape == IrCallShape::BuiltinGlobalCall && e.call_name == "int") {
+                    auto t = comprobador_.tipo_provable(*e.args[0].value);
+                    if (t->kind() == Type::Kind::Int) return expr(*e.args[0].value);
+                    if (t->kind() == Type::Kind::String)
+                        return "lumen_str_to_int(" + expr(*e.args[0].value) + ")";
+                    return "static_cast<int64_t>(" + expr(*e.args[0].value) + ")";
                 }
 
                 // BuiltinMethodCall (metodos de string, ver
@@ -1775,6 +1796,13 @@ std::string error_runtime_prelude() {
         "static auto lumen_mod_check(T a, U b) {\n"
         "    if (b == 0) lumen_native_fail(\"modulo por cero\");\n"
         "    return a % b;\n"
+        "}\n"
+        // int(x) sobre string (natives.cpp: fn_int) -- mismo std::stoll SIN
+        // comprobar cuanto consumio (fn_int tampoco lo hace: "12abc" da 12,
+        // no un error) y mismo mensaje EXACTO cuando ni eso analiza.
+        "static int64_t lumen_str_to_int(const std::string& s) {\n"
+        "    try { return std::stoll(s); }\n"
+        "    catch (...) { lumen_native_fail(\"int(): '\" + s + \"' no es un numero\"); }\n"
         "}\n";
 }
 
