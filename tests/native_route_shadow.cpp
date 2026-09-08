@@ -102,7 +102,11 @@ int main() {
         "\n"
         "get endpoint(\"/ir/:n\", int n):\n"
         "    require n >= 1 else redirect(\"/saluda/1\", 301)\n"
-        "    return redirect(\"/saluda/1\")\n";
+        "    return redirect(\"/saluda/1\")\n"
+        "\n"
+        "get endpoint(\"/mod/:a/:b\", int a, int b):\n"
+        "    int r = a % b\n"
+        "    return { \"r\": r }\n";
 
     const auto dir  = std::filesystem::temp_directory_path() / "lumen_native_route_check";
     std::error_code ec;
@@ -208,6 +212,49 @@ int main() {
     comparar("return status(204)", "/saluda/10");             // n <= 50
     comparar("guarda con redirect(url, codigo)", "/ir/0");    // n < 1
     comparar("return redirect(url)", "/ir/5");
+
+    // Bug real, encontrado probando esto a proposito (no una precaucion
+    // especulativa): una ruta nativa no tiene NINGUN wrapper de la ABI (a
+    // diferencia de una funcion) -- nadie la llama a traves de ella, la
+    // invoca build_routes() directamente -- asi que, antes de que
+    // generar_ruta_nativa() envolviera el cuerpo entero en un try/catch, un
+    // modulo por cero (lumen_mod_check, el mismo canal de error que ya usan
+    // las funciones) escapaba de la corrutina sin que nadie lo atrapara.
+    // Confirmado contra el binario real: NO tumbaba el proceso (Task<void>
+    // absorbe la excepcion en su unhandled_exception()), pero daba
+    // {"error":"Internal Server Error"} -- el generico de http_connection.cpp
+    // para una excepcion sin atrapar -- en vez de {"error":"modulo por
+    // cero","en":"..."} que da bytecode: 500 en las dos vias, pero un cuerpo
+    // distinto. El mensaje de "error" tiene que coincidir EXACTO (mismo
+    // lumen_native_error_message()); "en" no -- el codigo nativo no lleva
+    // ninguna nocion de linea/columna en tiempo de ejecucion, asi que usa
+    // "METODO patron" en vez del "archivo:linea:col" que da el VM.
+    {
+        Resultado bc  = pedir(*mod_bc, "GET", "/mod/10/0");
+        Resultado nat = pedir(*mod_nat, "GET", "/mod/10/0");
+        Value     bc_v, nat_v;
+        bool      parsea = Value::parse_json(bc.body, bc_v) && Value::parse_json(nat.body, nat_v);
+        if (!bc.encontrada || !nat.encontrada || bc.status != 500 || nat.status != 500 ||
+            !parsea || !bc_v.is_dict() || !nat_v.is_dict() ||
+            !bc_v.as_dict().count("error") || !nat_v.as_dict().count("error") ||
+            bc_v.as_dict().find("error")->second.as_str() !=
+                nat_v.as_dict().find("error")->second.as_str()) {
+            std::printf("  FALLA modulo por cero en ruta: bytecode(%d, '%s') vs nativo(%d, "
+                        "'%s')\n", bc.status, bc.body.c_str(), nat.status, nat.body.c_str());
+            ok = false;
+        } else {
+            std::printf("  ok    modulo por cero en ruta: las dos vias dan 500 con el mismo "
+                        "mensaje de error ('%s'), el proceso sigue vivo\n",
+                        nat_v.as_dict().find("error")->second.as_str().c_str());
+        }
+        // El proceso (bueno, el Module -- no hay proceso aparte en esta
+        // prueba) tiene que seguir sirviendo despues del error.
+        Resultado vivo = pedir(*mod_nat, "GET", "/mod/10/3");
+        if (!vivo.encontrada || vivo.status != 200) {
+            std::printf("  FALLA: la ruta nativa no responde tras el modulo por cero anterior\n");
+            ok = false;
+        }
+    }
 
     if (ok) {
         std::printf("native_route_shadow: las rutas nativas coinciden con bytecode en todos "

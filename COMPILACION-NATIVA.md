@@ -1249,6 +1249,35 @@ que se vaya a compilar algo — solo `<lumen/request.hpp>`/`<lumen/response.hpp>
 `prueba_str_len()` queda como regresión permanente en `tests/native_build_shadow.cpp`. 79/79 del
 corpus y las 8 suites de `ctest`, incluida `native_route_shadow`, en verde tras la corrección.
 
+**Tercera corrección crítica — una ruta nativa no tenía ningún wrapper que atrapara el canal de
+error.** El mismo canal que usan `lumen_div_check`/`lumen_mod_check`/el índice de `LList`
+(`lumen_native_fail()` → lanza `LumenNativeError`, ver `error_runtime_prelude()`) solo lo atrapa,
+para una función, el wrapper `extern "C"` que genera `generar_funcion_nativa()` — pero una ruta NO
+tiene ningún wrapper: nadie la invoca a través de la ABI, la llama `build_routes()` directamente en
+C++ normal. Antes de esta corrección, `generar_ruta_nativa()` no envolvía el cuerpo en ningún
+try/catch, así que un `a % b` con `b` dinámico (ya demostrado seguro por `Comprobador`, pero no
+exento de fallar en tiempo de ejecución) escapaba de la corrutina sin que nadie la atrapara. Probado
+a propósito contra el binario real (no una precaución especulativa): **no tumbaba el proceso**
+(`Task<void>::promise_type::unhandled_exception()` la absorbe con un `catch (...)`), pero daba
+`{"error":"Internal Server Error"}` — el genérico de `http_connection.cpp` para una excepción sin
+atrapar — en vez de `{"error":"modulo por cero","en":"..."}` que da bytecode: 500 en las dos vías,
+pero un cuerpo distinto — la misma clase de divergencia silenciosa que las dos correcciones críticas
+anteriores, encontrada por la misma disciplina de probar el caso incómodo a propósito en vez de
+asumir que "ya demostrado seguro para generar" implica "seguro en tiempo de ejecución sin red de
+seguridad".
+
+La corrección: `generar_ruta_nativa()` envuelve TODO el cuerpo (binding de parámetros incluido) en un
+`try { ... } catch (const LumenNativeError&) { ... }` que arma la MISMA respuesta que
+`build_routes()` construye para un error de bytecode — `{"error": <mensaje>, "en": <ubicación>}` con
+500 — usando `lumen_native_error_message()` (el mismo mensaje, byte a byte) y `"MÉTODO patrón"` para
+`"en"` en vez de un `archivo:línea:columna` preciso: el código nativo no lleva ninguna noción de
+línea/columna en tiempo de ejecución, así que no puede reproducir ESE detalle exacto — es la única
+divergencia deliberada y documentada de todo lo que cubre esta fase, confinada a un campo de
+diagnóstico, nunca al mensaje de error en sí ni al código de estado. `tests/native_route_shadow.cpp`
+gana una ruta (`/mod/:a/:b`, `int r = a % b`) y una comparación dedicada que exige el mismo status y
+el mismo `"error"` ignorando `"en"`, más una petición posterior que confirma que la ruta nativa sigue
+sirviendo después del error. 79/79 del corpus y las 8 suites de `ctest` en verde.
+
 ### Fase 5 — Asincronía y base de datos
 - `await` → `co_await` sobre los awaitables existentes; transacciones, pool, `last_id`.
 - **Aceptación:** el banco de pruebas completo (`bench/run_all.sh`) corre en modo `--native`

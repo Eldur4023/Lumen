@@ -1510,7 +1510,29 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
     // sobre los tipos nativos que declara esta ruta) -- se reproduce en vez
     // de reusarse, con las mismas funciones de conversion que
     // route_runtime_prelude() antepone una sola vez.
-    std::string cuerpo = "{\n";
+    // Todo el cuerpo va dentro de un try/catch: a diferencia de una funcion
+    // (donde el canal de error -- lumen_native_fail()/LumenNativeError, ver
+    // error_runtime_prelude -- lo atrapa el wrapper de la ABI, generado solo
+    // para funciones que la cruzan), una ruta no tiene ningun wrapper --
+    // nadie la llama a traves de la ABI, la invoca build_routes()
+    // directamente. Sin este catch, una division/modulo por cero o un
+    // indice de List fuera de rango DENTRO de una ruta (p.ej. `a % b` con
+    // `b` dinamico, ya demostrado seguro por Comprobador pero no exento de
+    // fallar en tiempo de ejecucion) lanzaria una excepcion sin nadie que la
+    // atrape -- confirmado contra el binario real: sin este catch, bytecode
+    // daba 500 con {"error":"modulo por cero","en":"archivo:linea:col"} y
+    // --native daba 500 con {"error":"Internal Server Error"} (el generico
+    // del motor para una excepcion sin atrapar, ver dispatch en
+    // http_connection.cpp) -- no un crash, pero si una respuesta distinta,
+    // exactamente la clase de divergencia silenciosa que este documento
+    // entero existe para no permitir. El mensaje coincide EXACTO con
+    // bytecode (mismo lumen_native_error_message()); "en" no puede ser
+    // igual de preciso -- el codigo nativo no lleva ninguna nocion de
+    // linea/columna en tiempo de ejecucion -- asi que usa "METODO patron",
+    // el mismo respaldo que ya usa build_routes cuando el VM tampoco tiene
+    // una ubicacion precisa.
+    const std::string donde = literal_string(route.method + " " + route.pattern);
+    std::string cuerpo = "{\n    try {\n";
     for (const auto& p : params) {
         const std::string mapa = p.en_path ? "req.params" : "req.query";
         const std::string nombre = nombre_cpp(p.nombre);
@@ -1563,6 +1585,13 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
     // ademas, EXACTAMENTE lo mismo que hace el VM cuando el cuerpo de una
     // ruta termina sin `return` explicito (null -> 204, ver build_routes).
     cuerpo += "    res.status(204).send(\"\");\n";
+    cuerpo += "    } catch (const LumenNativeError&) {\n";
+    cuerpo += "        Value::Dict __e;\n";
+    cuerpo += "        __e[\"error\"] = Value::str(lumen_native_error_message());\n";
+    cuerpo += "        __e[\"en\"] = Value::str(" + donde + ");\n";
+    cuerpo += "        res.status(500).header(\"Content-Type\", \"application/json; charset=utf-8\")"
+              ".send(Value::dict(std::move(__e)).to_json_text());\n";
+    cuerpo += "    }\n";
     cuerpo += "}";
 
     out.cuerpo_cpp = "extern \"C\" void " + out.simbolo +
