@@ -16,17 +16,19 @@ NativeModule::~NativeModule() {
 }
 
 NativeModule::NativeModule(NativeModule&& o) noexcept
-    : por_indice(std::move(o.por_indice)), error_message(o.error_message), handle_(o.handle_) {
+    : por_indice(std::move(o.por_indice)), error_message(o.error_message),
+      rutas_por_indice(std::move(o.rutas_por_indice)), handle_(o.handle_) {
     o.handle_ = nullptr;
 }
 
 NativeModule& NativeModule::operator=(NativeModule&& o) noexcept {
     if (this != &o) {
         if (handle_) dlclose(handle_);
-        por_indice    = std::move(o.por_indice);
-        error_message = o.error_message;
-        handle_       = o.handle_;
-        o.handle_     = nullptr;
+        por_indice       = std::move(o.por_indice);
+        error_message    = o.error_message;
+        rutas_por_indice = std::move(o.rutas_por_indice);
+        handle_          = o.handle_;
+        o.handle_        = nullptr;
     }
     return *this;
 }
@@ -34,6 +36,12 @@ NativeModule& NativeModule::operator=(NativeModule&& o) noexcept {
 size_t NativeModule::compiladas() const {
     size_t n = 0;
     for (auto* f : por_indice) if (f) ++n;
+    return n;
+}
+
+size_t NativeModule::rutas_compiladas() const {
+    size_t n = 0;
+    for (auto* f : rutas_por_indice) if (f) ++n;
     return n;
 }
 
@@ -170,14 +178,59 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
         }
     }
 
-    if (generadas.empty()) return nullptr; // nada que ofrecer nativo: no es un error
+    // Rutas (Fase 4): a diferencia de funciones/metodos, una ruta nunca
+    // aporta prototipo (nadie mas la llama en C++ generado) -- su texto
+    // completo (extern "C" incluido) se acumula aparte y va DESPUES de
+    // cuerpos, sin que le afecte el orden alfabetico de `sigs`.
+    struct RutaGenerada {
+        size_t      indice;
+        std::string simbolo;
+    };
+    std::vector<RutaGenerada> rutas_generadas;
+    std::string               rutas_cuerpos;
+    for (size_t i = 0; i < prog.routes.size(); ++i) {
+        const RouteDecl& r = prog.routes[i];
+        if (r.method == "WS" || r.method == "SSE") continue;
+
+        DiagnosticBag diags_ir;
+        Chunk         descartable;
+        // classes_ = &clases_sig, igual que build_routes() en project.cpp:
+        // una ruta si puede construir instancias y llamar a metodos (aunque
+        // esta primera fase de rutas no llegue a generar ninguno de esos
+        // casos -- ver el comentario de RutaNativa).
+        Emitter  emitter(diags_ir, &sigs, &clases_sig, &prog.imports);
+        IrBlock  body;
+        if (!emitter.check_route(r, descartable, diags_ir, &body)) continue;
+
+        auto generada = generar_ruta_nativa(r, body, static_cast<int>(i), nombre_por_indice,
+                                            firmas, clases, roles);
+        if (!generada) continue;
+
+        rutas_cuerpos += generada->cuerpo_cpp + "\n\n";
+        rutas_generadas.push_back({i, generada->simbolo});
+    }
+
+    if (generadas.empty() && rutas_generadas.empty())
+        return nullptr; // nada que ofrecer nativo: no es un error
+
+    const bool con_rutas = !rutas_generadas.empty();
 
     std::string codigo =
         "#include <cctype>\n#include <cstdint>\n#include <initializer_list>\n#include <string>\n"
         "#include <utility>\n#include <vector>\n\n" +
         abi_prelude() + "\n" + error_runtime_prelude() + "\n" + list_runtime_prelude() + "\n" +
-        dict_runtime_prelude() + "\n" + string_runtime_prelude() + "\n" + clases_texto + "\n" +
-        prototipos + "\n" + cuerpos;
+        dict_runtime_prelude() + "\n" + string_runtime_prelude() + "\n";
+    // Cabeceras/enlazado reales SOLO si hay al menos una ruta: una funcion
+    // pura nunca los necesita (ver el comentario de tipo_abi_soportado), y
+    // el .so autocontenido de siempre (Fase 2/3) no debe empezar a depender
+    // de liblumen_script.a sin motivo.
+    if (con_rutas)
+        codigo += "#include <lumen/request.hpp>\n#include <lumen/response.hpp>\n"
+                  "#include <lumen_script/value.hpp>\n"
+                  "using lumen_script::Value;\n\n" +
+                  route_runtime_prelude() + "\n";
+    codigo += clases_texto + "\n" + prototipos + "\n" + cuerpos;
+    if (con_rutas) codigo += rutas_cuerpos;
 
     std::error_code ec;
     std::filesystem::create_directories(cache_dir, ec);
@@ -195,15 +248,22 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
     }
 
     std::ostringstream cmd;
-    cmd << "g++ -O2 -shared -fPIC -std=c++20 "
-        << std::quoted(src_path.string()) << " -o " << std::quoted(so_path.string())
-        << " 2> " << std::quoted(err_path.string());
+    cmd << "g++ -O2 -shared -fPIC -std=c++20 ";
+    // LUMEN_NATIVE_INCLUDE_DIR/LUMEN_NATIVE_SCRIPT_LIB: horneadas por CMake
+    // (ver CMakeLists.txt) -- el binario `lumen` no tiene otra forma de
+    // saber, en tiempo de ejecucion, donde viven las cabeceras del proyecto
+    // ni donde quedo liblumen_script.a ya compilada.
+    if (con_rutas)
+        cmd << "-I" << std::quoted(std::string(LUMEN_NATIVE_INCLUDE_DIR)) << " ";
+    cmd << std::quoted(src_path.string()) << " -o " << std::quoted(so_path.string());
+    if (con_rutas) cmd << " " << std::quoted(std::string(LUMEN_NATIVE_SCRIPT_LIB));
+    cmd << " 2> " << std::quoted(err_path.string());
     if (std::system(cmd.str().c_str()) != 0) {
         std::ifstream errf(err_path);
         std::ostringstream errs;
         errs << errf.rdbuf();
-        aviso = "--native: " + std::to_string(generadas.size()) +
-                " funcion(es) no se pudieron compilar (g++ fallo): " + errs.str();
+        aviso = "--native: " + std::to_string(generadas.size() + rutas_generadas.size()) +
+                " funcion(es)/ruta(s) no se pudieron compilar (g++ fallo): " + errs.str();
         return nullptr;
     }
 
@@ -217,6 +277,7 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
     auto out = std::make_unique<NativeModule>();
     out->handle_ = handle;
     out->por_indice.assign(nombre_por_indice.size(), nullptr);
+    out->rutas_por_indice.assign(prog.routes.size(), nullptr);
 
     out->error_message =
         reinterpret_cast<ErrorMessageFn>(dlsym(handle, "lumen_native_error_message"));
@@ -226,6 +287,11 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
         void* sym = dlsym(handle, g.simbolo_abi.c_str());
         if (!sym) { simbolos_sin_resolver += " " + g.simbolo_abi; continue; }
         out->por_indice[g.indice] = reinterpret_cast<CompiledFn>(sym);
+    }
+    for (const auto& g : rutas_generadas) {
+        void* sym = dlsym(handle, g.simbolo.c_str());
+        if (!sym) { simbolos_sin_resolver += " " + g.simbolo; continue; }
+        out->rutas_por_indice[g.indice] = reinterpret_cast<NativeModule::RouteFn>(sym);
     }
     if (!out->error_message) simbolos_sin_resolver += " lumen_native_error_message";
     if (!simbolos_sin_resolver.empty())

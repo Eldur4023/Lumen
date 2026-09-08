@@ -5,6 +5,16 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 
+# --native (Fase 4, rutas): el .so que genera compilar_nativo() para una ruta
+# enlaza liblumen_script.a de verdad (necesita Value::write_json, no inline en
+# el header -- ver COMPILACION-NATIVA.md) desde una biblioteca COMPARTIDA. Un
+# .a compilado sin -fPIC no se puede meter dentro de un .so -- de ahi esto
+# global, no solo en el target de lumen_script: mas simple que marcar cada
+# dependencia transitiva (lumen, lumen_llhttp) una por una, y el coste (PIC en
+# el binario `lumen` mismo, que no lo necesitaba) es insignificante frente a
+# tener que recompilar bajo demanda.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
@@ -127,6 +137,18 @@ add_library(lumen_script STATIC
 target_include_directories(lumen_script PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(lumen_script PUBLIC lumen ${CMAKE_DL_LIBS})
 
+# --native (Fase 4, rutas): native_build.cpp invoca g++ como subproceso para
+# compilar el .cpp que genera una ruta -- necesita saber, en tiempo de
+# ejecucion del binario `lumen`, donde estan las cabeceras del propio
+# proyecto (para #include <lumen/response.hpp>, <lumen_script/value.hpp>...)
+# y donde quedo liblumen_script.a ya compilada (para enlazar Value::write_json,
+# que no es inline -- ver el comentario en generar_ruta_nativa). No hay forma
+# de que un binario ya enlazado adivine esas rutas por su cuenta: se hornean
+# aqui, en tiempo de compilacion de CMake, como estas dos macros.
+target_compile_definitions(lumen_script PRIVATE
+    LUMEN_NATIVE_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
+    LUMEN_NATIVE_SCRIPT_LIB="$<TARGET_FILE:lumen_script>")
+
 if(LUMEN_SQLITE)
     find_path(SQLITE3_INC sqlite3.h)
     find_library(SQLITE3_LIB sqlite3)
@@ -234,6 +256,17 @@ add_test(NAME native_build_shadow COMMAND prueba_native_build)
 add_executable(prueba_native_class tests/native_class_shadow.cpp)
 target_link_libraries(prueba_native_class PRIVATE lumen_script)
 add_test(NAME native_class_shadow COMMAND prueba_native_class)
+
+# Fase 4: una ruta HTTP compilada a nativo, de punta a punta, a traves de
+# compile() de verdad (parseo, build_routes, compilar_nativo) -- no un
+# Program armado a mano -- comparada contra la misma ruta servida por
+# bytecode. Necesita que g++ pueda encontrar <lumen/response.hpp> y enlazar
+# liblumen_script.a: mismas macros que ya usa native_build.cpp (ver el
+# comentario sobre LUMEN_NATIVE_INCLUDE_DIR en el target lumen_script), asi
+# que ni falta que hace repetirlas aqui.
+add_executable(prueba_native_route tests/native_route_shadow.cpp)
+target_link_libraries(prueba_native_route PRIVATE lumen_script)
+add_test(NAME native_route_shadow COMMAND prueba_native_route)
 
 # El traductor de marcadores de postgres es una funcion pura: se prueba sin
 # servidor incluyendo el .cpp del driver, para probar EL codigo y no una copia.

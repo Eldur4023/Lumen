@@ -165,7 +165,8 @@ int main(int argc, char** argv) {
               << mod->vm_routes << " con logica\n";
     if (native) {
         std::cout << "lumen: --native: " << (mod->native ? mod->native->compiladas() : 0)
-                  << " funcion(es) compilada(s) a codigo nativo\n";
+                  << " funcion(es), " << (mod->native ? mod->native->rutas_compiladas() : 0)
+                  << " ruta(s) compiladas a codigo nativo\n";
         // Una degradacion parcial (o total) a bytecode nunca es un error de
         // compilacion -- ver el comentario en Module::native_aviso -- pero
         // tampoco debe pasar en silencio.

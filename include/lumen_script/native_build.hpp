@@ -8,6 +8,11 @@
 #include "emitter.hpp"
 #include "native_abi.hpp"
 
+namespace lumen {
+class Request;
+class Response;
+} // namespace lumen
+
 namespace lumen_script {
 
 // Fase 2 de --native, la mitad que faltaba: "invocar el compilador de C++
@@ -42,7 +47,18 @@ public:
     // NativeModule ya construido, pero por si acaso).
     ErrorMessageFn error_message = nullptr;
 
+    // Fase 4: una ruta nunca cruza la ABI fija (NativeValue) -- nadie la
+    // llama desde bytecode, solo build_routes() en C++ normal, asi que el
+    // simbolo que exporta tiene la firma real que necesita (ver
+    // generar_ruta_nativa en native_gen.hpp), no la generica de CompiledFn.
+    // Indexado por posicion en Program::routes, igual que rutas_por_indice
+    // aqui debajo -- un hueco a nullptr significa "esta ruta se sigue
+    // sirviendo con bytecode".
+    using RouteFn = void (*)(lumen::Request&, lumen::Response&);
+    std::vector<RouteFn> rutas_por_indice;
+
     size_t compiladas() const;
+    size_t rutas_compiladas() const;
 
     // Vista liviana para VM::start() -- ver el comentario de NativeDispatch
     // en native_abi.hpp.

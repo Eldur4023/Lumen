@@ -215,4 +215,54 @@ std::string list_runtime_prelude();
 // `a / b` entre dos int) -- solo escritura y los metodos `has`/`keys`.
 std::string dict_runtime_prelude();
 
+// ── Fase 4: rutas HTTP sincronas ────────────────────────────────────────────
+//
+// Una ruta NO cruza la ABI fija de native_abi.hpp -- no la necesita, porque
+// nadie la llama desde bytecode: la unica que la invoca es el propio
+// build_routes() (project.cpp), en C++ normal, asi que el simbolo `extern
+// "C"` que exporta puede tener la firma real que haga falta
+// (lumen::Request&, lumen::Response&) en vez del NativeValue* generico de
+// una funcion. Eso, a su vez, es lo que permite que el valor de retorno sea
+// heterogeneo (un dict JSON con int/string/float mezclados, el caso comun):
+// se serializa con lumen_script::Value, no con Dict<V> (homogeneo, ver
+// dict_runtime_prelude), justo el "pendiente" que documenta
+// COMPILACION-NATIVA.md.
+//
+// Alcance de este primer corte (ver generar_ruta_nativa): solo parametros
+// escalares de patron (:id) o query string, SIN valor por defecto -- un
+// File, un parametro de tipo clase (cuerpo de peticion) o cualquier `?`
+// dejan la ruta entera fuera, igual que un cuerpo que use `session`/`jwt`/
+// `render`/`await` (Comprobador::block_compilable ya los rechaza: no forman
+// parte de ningun IrExprKind/IrStmtKind que reconozca). Cuando la ruta
+// entera es representable, el handler nativo sustituye enteramente a
+// bind_params/prepare_args/begin_auth/el VM -- no los llama, hace su propio
+// binding (identico a prepare_args, mismo formato de 400) porque son ellos
+// mismos codigo generado.
+struct RutaNativa {
+    std::string simbolo;    // "lumen_native_route_<indice>"
+    std::string cuerpo_cpp; // "extern \"C\" void <simbolo>(lumen::Request&, lumen::Response&) { ... }"
+};
+
+// Genera el C++ de una ruta, o nullopt si algo de ella (parametros o cuerpo)
+// cae fuera de lo que esta fase representa -- ver el comentario de
+// RutaNativa. `indice` es la posicion de `route` en Program::routes: hace
+// falta para nombrar el simbolo (dos rutas nunca comparten indice) y para
+// que compilar_nativo() sepa en que hueco de NativeModule::rutas_por_indice
+// dejar el puntero ya resuelto por dlsym().
+std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBlock& body,
+                                              int indice,
+                                              const std::vector<std::string>& nombre_por_indice,
+                                              const TablaFirmas& firmas,
+                                              const TablaClases& clases,
+                                              const TablaRoles& roles);
+
+// Funciones libres que necesita el binding de parametros que genera
+// generar_ruta_nativa() -- mismo criterio, mismo formato de error, que
+// coerce() en project.cpp, reproducido aqui porque el .cpp generado no
+// puede llamar a una funcion `static`/de anonimo de ese otro archivo.
+// Antepuesto una sola vez, igual que las demas *_runtime_prelude(), y SOLO
+// cuando el modulo tiene al menos una ruta nativa (a diferencia de las
+// otras: una funcion nativa nunca necesita lumen::Request/Response).
+std::string route_runtime_prelude();
+
 } // namespace lumen_script

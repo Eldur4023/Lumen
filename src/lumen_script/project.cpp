@@ -1330,7 +1330,8 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
     // encuentren en un render().
     PlantillaCtx pctx{mod.program.app.templates_dir, &mod.plantillas};
 
-    for (const auto& r : mod.program.routes) {
+    for (size_t ridx = 0; ridx < mod.program.routes.size(); ++ridx) {
+        const auto& r = mod.program.routes[ridx];
         if (!r.origins.empty() && r.method != "WS")
             diags.error(r.loc, "origins() solo es valido en rutas ws");
 
@@ -1526,10 +1527,43 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
             continue;
         }
 
-        // Nivel 2: ruta con logica → bytecode sobre el VM.
+        // bind_params valida los parametros (defecto en uno de ruta, File
+        // fuera de sitio, mas de un cuerpo...) SIEMPRE, sin importar que
+        // nivel acabe sirviendo la ruta -- Nivel 1.5 no usa `binds`
+        // directamente (el handler nativo hace su propio binding, identico
+        // en las reglas pero sobre tipos C++ en vez de Value), pero un
+        // programa con un patron/parametro invalido tiene que fallar la
+        // compilacion igual, y una ruta que generar_ruta_nativa() acepto es,
+        // por construccion, un subconjunto MAS estricto de lo que
+        // bind_params admite (sin defecto, sin File, sin cuerpo) -- nunca
+        // deberia reprobar aqui si ya paso alli.
         std::vector<ParamBind> binds;
         if (!bind_params(r, classes, binds, diags)) continue;
 
+        // Nivel 1.5: ruta compilada nativamente (Fase 4, --native). Mismo
+        // criterio de "todo o nada" que una funcion: generar_ruta_nativa()
+        // (native_gen.cpp), invocado durante compile() -> compilar_nativo(),
+        // ya decidio si esta ruta entera es representable (parametros
+        // escalares de patron/query sin valor por defecto, cuerpo sin
+        // sesion/JWT/render/await/contenedores) -- si lo es, mod.native trae
+        // el puntero ya resuelto por dlsym() y aqui solo hace falta
+        // invocarlo. La funcion generada hace su PROPIO binding de
+        // parametros (lee req.params/req.query ella misma) y escribe la
+        // respuesta directamente sobre `res`: no pasa por bind_params/
+        // prepare_args/begin_auth ni por el VM.
+        if (mod.native && ridx < mod.native->rutas_por_indice.size() &&
+            mod.native->rutas_por_indice[ridx]) {
+            auto fn = mod.native->rutas_por_indice[ridx];
+            ++mod.vm_routes; // cuenta como ruta con logica, aunque no pase por el VM
+            mod.router.add_internal(r.method, r.pattern,
+                [fn](lumen::Request& req, lumen::Response& res) -> lumen::Task<void> {
+                    fn(req, res);
+                    co_return;
+                });
+            continue;
+        }
+
+        // Nivel 2: ruta con logica → bytecode sobre el VM.
         auto    chunk = std::make_shared<Chunk>();
         Emitter emitter(diags, &fns, &sigs, &mod.program.imports, &pctx);
         size_t  antes = diags.size();

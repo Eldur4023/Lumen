@@ -1098,17 +1098,106 @@ coinciden. `fib`/`cuenta_primos`, los métodos de clase, y el resto del corpus r
 app.lum`, `tests/casos/clases.lum`) se re-verificaron sin cambios — todos ya retornaban en todos sus
 caminos, la corrección es más estricta, no distinta, para el código que ya era seguro.
 
-**Pendiente, y no trivial: el valor de retorno de una ruta necesita una representación distinta a
-la de una función.** `Dict<K,V>` (Fase 3) exige un valor `V` homogéneo — pero el cuerpo JSON de una
-respuesta real casi nunca lo es (`{"id": i, "name": "item-"+str(i), "value": valor, "active":
-activo}`, de `bench/lumen/app.lum`, mezcla `int`/`string`/`double`/`bool` en un solo dict). La
-representación tipada que ya paga por sí sola dentro del cuerpo de una ruta (variables locales,
-cómputo) no sirve para la expresión final que se serializa a JSON — esa necesita construirse como
-`Value` (el tipo dinámico que ya usa el VM, con `to_json_text()`), no como un contenedor nativo
-homogéneo. Es la pieza que falta antes de generar el resto del *driver* de una ruta (ligado de
-parámetros, guardas, serialización) — el orden de las claves del dict tiene que coincidir con el
-orden de inserción del `.lum` (`Value::Dict` es un vector, no un `map`, ver `value.hpp:35-42`), así
-que no es una conversión mecánica cualquiera.
+**El valor de retorno de una ruta necesita una representación distinta a la de una función — resuelto.**
+`Dict<K,V>` (Fase 3) exige un valor `V` homogéneo — pero el cuerpo JSON de una respuesta real casi
+nunca lo es (`{"n": n, "result": r}` ya mezcla dos expresiones que, en general, no comparten tipo; el
+caso de `bench/lumen/app.lum` con `int`/`string`/`double`/`bool` en un dict es aún más heterogéneo).
+La solución: `Comprobador::es_valor_json()`, un predicado hermano de `tipo_provable()` pero más
+permisivo — acepta escalares y `DictLit`/`ListLit` anidados de eso mismo, SIN exigir que compartan
+tipo (a diferencia de `tipo_provable`, que sí lo exige para un contenedor nativo) — y
+`Generador::valor_json()`, que construye el equivalente en `lumen_script::Value` (el tipo dinámico
+del VM, con `to_json_text()`) en vez de un contenedor nativo homogéneo: cada entrada se convierte por
+su cuenta, recursivamente, con `Value::integer/real/boolean/str` para los escalares y una lambda
+autoinvocada (`Value::Dict`/`Value::List` construidos a mano) para los literales. El orden de las
+claves coincide con el `.lum` porque `Value::Dict` es un vector en orden de inserción, no un `map`
+(`value.hpp:35-42`), y `valor_json()` recorre `entries` en ese mismo orden. Queda fuera, a propósito,
+convertir una `List<T>` YA construida (un `Ident`, por ejemplo) a `Value`: exigiría iterar `LList<T>`
+en el `.cpp` generado, y ningún caso de prueba lo necesita todavía — `Dict<V>` como valor de
+respuesta también queda fuera (`LDict` no expone iterar sus pares).
+
+**El enlazado real — la otra pieza que Fase 2/3 no necesitaban.** `Value::write_json()` (que
+`to_json_text()` llama) no es inline: vive en `value.cpp`, dentro de `liblumen_script.a`. Un `.cpp`
+de ruta que la usa tiene que **enlazar** contra esa biblioteca, no solo incluir su cabecera — la
+primera vez que esta fase depende de código real del proyecto, no de texto autocontenido. Dos
+cambios en `CMakeLists.txt` lo hacen posible: `CMAKE_POSITION_INDEPENDENT_CODE ON` global (un `.a`
+compilado sin `-fPIC` no se puede meter dentro de un `.so`, y es más simple que marcarlo target a
+target incluyendo las dependencias transitivas) y dos macros horneadas en tiempo de compilación de
+CMake (`LUMEN_NATIVE_INCLUDE_DIR`, `LUMEN_NATIVE_SCRIPT_LIB`) que le dicen a `native_build.cpp`, en
+tiempo de ejecución del binario `lumen`, dónde está `include/` y dónde quedó `liblumen_script.a` ya
+compilada — no hay otra forma de que un binario ya enlazado lo adivine. `lumen::Response` y
+`lumen::Request` resultaron ser enteramente *header-only* (todos sus métodos son inline en
+`response.hpp`/`request.hpp`), así que esta primera ruta NO necesita enlazar `liblumen.a` — solo
+`liblumen_script.a`, y solo cuando el módulo tiene al menos una ruta nativa (`compilar_nativo` arma
+un `.cpp` distinto, con cabeceras y enlazado real, únicamente en ese caso — el `.so` autocontenido de
+Fase 2/3 para un módulo sin rutas compilables no cambia ni un carácter).
+
+**`generar_ruta_nativa()` — más simple que una función porque nadie más la llama.** Una ruta nunca
+cruza la ABI POD de `native_abi.hpp`: nadie la invoca desde bytecode, solo `build_routes()` en C++
+normal, así que su símbolo `extern "C"` puede tener la firma real que hace falta
+(`lumen::Request&, lumen::Response&`) en vez de la genérica `NativeValue*`. Eso, a su vez, elimina la
+necesidad de `bloque_siempre_retorna()` para rutas: la función generada es `void`, así que "caer al
+final" es C++ perfectamente válido (nunca UB) — y es, además, EXACTAMENTE lo mismo que hace el VM
+cuando el cuerpo de una ruta termina sin `return` explícito (`null` → 204). `generar_ruta_nativa()`
+simplemente antepone `res.status(204).send("");` al final de cada ruta generada: inalcanzable si ya
+hay un `return`/`require` en todo camino, y el 204 correcto si no lo hay.
+
+Alcance deliberadamente estrecho de este primer corte: solo parámetros escalares de patrón (`:id`) o
+query string, **sin valor por defecto** — un `File`, un parámetro de tipo clase (cuerpo de petición),
+o cualquier `?` dejan la ruta entera sin compilar, igual que un cuerpo que use `session`/`jwt`/
+`render`/`await` (`Comprobador::block_compilable` ya los rechaza sin necesitar ningún caso nuevo: no
+forman parte de ningún `IrExprKind`/`IrStmtKind` que reconozca — el mismo invariante de "no hay
+generación parcial" que ya regía funciones). El *binding* de parámetros se reproduce a mano dentro de
+la ruta generada, EXACTAMENTE con las mismas reglas que `prepare_args()`/`coerce()` en `project.cpp`
+(ausente → cero silencioso del tipo; presente pero sin parsear → el mismo 400
+`{"error":"parametro invalido","param":...,"esperado":...,"recibido":...}`, incluido el detalle de
+que `std::stoll`/`std::stod` aceptan basura al final sin comprobarlo, `"12abc"` → `12`) — no hay
+manera de llamar a `prepare_args` desde el `.cpp` generado (vive en otro binario, sobre `Value`, no
+sobre los tipos C++ que declara la ruta), así que se duplica a propósito, con `route_runtime_prelude()`
+antepuesto una sola vez por módulo. Cuando la ruta entera es representable, el handler nativo
+sustituye ENTERAMENTE a `bind_params`/`prepare_args`/`begin_auth`/el VM en `build_routes` — no los
+llama, es código generado que hace su propio trabajo.
+
+**Validado en tres capas.** `tests/native_route_shadow.cpp` compila el mismo fuente con
+`compile(..., native=false)` y `compile(..., native=true)` y despacha peticiones directamente contra
+`mod->router` (sin sockets: el `Task<void>` de una ruta sin `await` nunca suspende de verdad, un
+`handle.resume()` basta) para el patrón bandera de `bench/lumen/app.lum`:
+
+```lum
+get endpoint("/compute/fib/:n", int n):
+    require n >= 1 and n <= 32 else status(400)
+    int r = fib(n)
+    return { "n": n, "result": r }
+```
+
+comparando status+cuerpo byte a byte en tres casos (`n=10` normal, `n=50` rechazado por la guarda,
+`n="abc"` que no parsea) — las tres coinciden. Contra el binario real, sirviendo HTTP de verdad, con
+`bench/lumen/app.lum` completo en dos instancias (una `--native`, otra sin): `/compute/fib/10`,
+`/compute/fib/32` (límite), `/compute/fib/33` y `/compute/fib/0` (rechazados por la guarda),
+`/compute/fib/abc` (parámetro inválido) y `/compute/primes/1000` dan la respuesta IDÉNTICA en las dos
+vías, incluido el `{"error":"peticion no valida"}` que sirve el `on error 400:` de la aplicación —
+confirmación en vivo de que "`on error` es responsabilidad del motor, no del handler" (hallazgo 3 de
+más arriba) es exactamente lo que hace que un handler nativo no necesite ningún mecanismo de error
+propio. `bench/lumen/app.lum` compiló 2 funciones (`fib`, `cuenta_primos`) y 3 rutas a nativo
+(`/health`, `/compute/fib/:n`, `/compute/primes/:n`); `/slow/:ms` (usa `await`) y `/payload/:n` (usa
+`List<Json>`) se quedan en bytecode, como deben. Curiosidad sin impacto observable: `/health` compila
+a nativo (su cuerpo — un único `return` de un dict de un literal — cae dentro del alcance de esta
+fase) pero nunca se usa por esa vía, porque `try_declarative` (Nivel 1, cero bytecode) la captura
+primero en `build_routes` — `compilar_nativo()` no sabe nada de esa prioridad, así que compila la
+ruta igual; el símbolo queda resuelto en `NativeModule::rutas_por_indice` sin que nadie lo llame.
+Trabajo desperdiciado pero inofensivo, no una divergencia. 79/79 del corpus real (sin `--native`,
+donde nada de esto se ejerce) y las 8 suites de `ctest`, `native_route_shadow` incluida, en verde.
+
+**Efecto colateral: las clases dejan de ser universalmente inalcanzables.** Fase 3 documentó que
+ninguna clase era alcanzable desde un programa Lumen en ejecución (una función suelta no puede
+tocarlas; un método nunca cruza la ABI). Eso seguía siendo cierto para el *binding* de parámetros de
+esta fase (un parámetro de tipo clase, cuerpo de petición, queda fuera a propósito) — pero
+`generar_ruta_nativa()` reutiliza el mismo `Comprobador`/`Generador` que ya sabían compilar
+`ConstructorCall`/`ClassMethodCall` cuando se les pasa `TablaClases`/`TablaRoles`, y `check_route`
+(igual que `check_method`) sí recibe `ClassSigs`. Una ruta que construye y usa una instancia
+ENTERAMENTE dentro de su cuerpo (sin que cruce nunca un parámetro o el valor de retorno) sería, en
+teoría, la primera vía real de ejecución para código de clase nativo — sin explorar ni probar
+todavía en este corte, y `es_valor_json()` tampoco sabe serializar una instancia como valor de
+retorno, así que el caso útil (una clase en la respuesta) sigue sin cubrir.
 
 ### Fase 5 — Asincronía y base de datos
 - `await` → `co_await` sobre los awaitables existentes; transacciones, pool, `last_id`.

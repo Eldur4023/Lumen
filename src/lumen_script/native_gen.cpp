@@ -1,5 +1,6 @@
 #include <lumen_script/native_gen.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <map>
 #include <sstream>
@@ -134,6 +135,15 @@ std::string literal_string(const std::string& s) {
 // mantener sincronizada con el estandar.
 std::string nombre_cpp(const std::string& lumen) { return "l_" + lumen; }
 
+// Los unicos Type::Kind que se pueden empaquetar en un Value escalar
+// directamente (Value::integer/real/boolean/str) -- ver Comprobador::
+// es_valor_json() y Generador::valor_json() mas abajo, para el valor de
+// retorno de una ruta (Fase 4).
+bool es_escalar_json(Type::Kind k) {
+    return k == Type::Kind::Int || k == Type::Kind::Float || k == Type::Kind::Bool ||
+           k == Type::Kind::String;
+}
+
 // Ver native_abi.hpp: campo de la union de NativeValue que corresponde a
 // cada Type::Kind soportado, y la etiqueta que hay que ponerle.
 std::string campo_abi(Type::Kind k) {
@@ -222,6 +232,54 @@ public:
     // demuestre el mismo tipo -- por induccion, un Ident que resuelve aqui
     // tiene garantizado que su valor real coincide siempre.
     void registrar(int slot, Type t) { ranura_tipos_.insert_or_assign(slot, std::move(t)); }
+
+    // ¿Se puede construir esta expresion como un Value (el tipo dinamico
+    // que ya usa el VM, con to_json_text()) para el valor de retorno de una
+    // ruta (Fase 4)? A diferencia de tipo_provable(), NO exige que un
+    // DictLit/ListLit tenga un tipo homogeneo -- un cuerpo JSON real casi
+    // nunca lo es (bench/lumen/app.lum: un dict con int/string/double/bool
+    // mezclados). Alcance de este primer corte: escalares, y DictLit/ListLit
+    // anidados (recursivamente) de eso mismo -- una List<T> YA construida
+    // (un Ident, por ejemplo) queda fuera todavia a proposito: convertirla
+    // requeriria iterar LList<T> en el .cpp generado (un lumen_valor_de()
+    // que hoy no existe), y ningun caso de prueba lo necesita todavia. Dict
+    // <V> como valor de respuesta tambien queda fuera (LDict no expone
+    // iterar sus pares, solo has/set/keys).
+    bool es_valor_json(const IrExpr& e) const {
+        if (e.kind == IrExprKind::DictLit) {
+            if (e.entries.empty()) return false;
+            for (const auto& entry : e.entries) {
+                if (!entry.key || !entry.value) return false;
+                auto tk = tipo_provable(*entry.key);
+                if (!tk || tk->kind() != Type::Kind::String) return false;
+                if (!es_valor_json(*entry.value)) return false;
+            }
+            return true;
+        }
+        if (e.kind == IrExprKind::ListLit) {
+            if (e.items.empty()) return false;
+            for (const auto& item : e.items)
+                if (!item || !es_valor_json(*item)) return false;
+            return true;
+        }
+        auto t = tipo_provable(e);
+        return t && es_escalar_json(t->kind());
+    }
+
+    // `require cond else status(N)`: el patron de guarda mas comun (ver el
+    // banco de pruebas). status() global escribe la respuesta el mismo
+    // (vm.cpp/natives.cpp: codigo + cuerpo vacio) y no produce ningun valor
+    // que comparar contra el tipo de retorno -- reconocido aqui a mano,
+    // porque tipo_provable() todavia no sabe nada de BuiltinGlobalCall en
+    // general (fuera de alcance de este corte: text()/html()/json()/
+    // redirect()/send_file() quedan para cuando haga falta).
+    bool es_llamada_status(const IrExpr& e) const {
+        if (e.kind != IrExprKind::Call || e.call_shape != IrCallShape::BuiltinGlobalCall)
+            return false;
+        if (e.call_name != "status" || e.args.size() != 1 || !e.args[0].value) return false;
+        auto t = tipo_provable(*e.args[0].value);
+        return t && t->kind() == Type::Kind::Int;
+    }
 
     // Nullopt si no se puede demostrar; si no, el Type exacto que el VM
     // SIEMPRE produciria para esta expresion, con los mismos valores.
@@ -532,6 +590,13 @@ public:
     bool stmt_compilable(const IrStmt& s, const Type& retorno_fn) {
         switch (s.kind) {
             case IrStmtKind::Return: {
+                // Type::Kind::Json es el centinela de "esto es una ruta,
+                // no una funcion" (ver generar_ruta_nativa): el valor de
+                // retorno se serializa a JSON, asi que no tiene que
+                // demostrar un Type nativo concreto, solo ser
+                // construible como Value (es_valor_json()).
+                if (retorno_fn.kind() == Type::Kind::Json)
+                    return !s.value || es_valor_json(*s.value);
                 if (!s.value) return retorno_fn.kind() == Type::Kind::Void;
                 auto t = tipo_provable(*s.value);
                 return t && *t == retorno_fn;
@@ -649,6 +714,11 @@ public:
             case IrStmtKind::Require: {
                 if (!s.value || !tipo_provable(*s.value).has_value()) return false;
                 if (!s.target) return false;
+                // "else status(N)" escribe la respuesta el mismo -- no
+                // produce ningun valor que comparar, ver
+                // es_llamada_status().
+                if (es_llamada_status(*s.target)) return true;
+                if (retorno_fn.kind() == Type::Kind::Json) return es_valor_json(*s.target);
                 auto t = tipo_provable(*s.target);
                 return t && *t == retorno_fn;
             }
@@ -703,8 +773,12 @@ public:
     // preguntar el tipo de una expresion cuando el C++ que emite lo
     // necesita explicito (DictLit, la variable de un `for`): no vuelve a
     // decidir nada, solo consulta lo que tipo_provable() ya demostro.
-    Generador(const std::vector<std::string>& nombre_por_indice, const Comprobador& comprobador)
-        : nombre_por_indice_(nombre_por_indice), comprobador_(comprobador) {}
+    // `ruta`: si es verdad, un Return/Require con destino serializa su
+    // valor como respuesta HTTP en vez de generar un `return <valor>;` de
+    // funcion -- ver esos dos casos en stmt() y generar_ruta_nativa().
+    Generador(const std::vector<std::string>& nombre_por_indice, const Comprobador& comprobador,
+             bool ruta = false)
+        : nombre_por_indice_(nombre_por_indice), comprobador_(comprobador), ruta_(ruta) {}
 
     // Ranura -> nombre C++ ya calculado, para poder generar `nombre = ...`
     // en un Assign(Local): el IrStmt solo trae `assign_slot` (lo unico que
@@ -885,6 +959,7 @@ public:
     std::string stmt(const IrStmt& s, int indent) {
         switch (s.kind) {
             case IrStmtKind::Return:
+                if (ruta_) return respuesta_de_retorno(s.value.get());
                 return s.value ? ("return " + expr(*s.value) + ";") : "return;";
 
             case IrStmtKind::ExprStmt:
@@ -950,6 +1025,16 @@ public:
             }
 
             case IrStmtKind::Require:
+                if (ruta_ && comprobador_.es_llamada_status(*s.target))
+                    // status(N) escribe la respuesta el mismo (mismo texto
+                    // que fn_status en natives.cpp: codigo + cuerpo vacio,
+                    // sin Content-Type) -- no hay ningun valor que
+                    // serializar.
+                    return "if (!(" + expr(*s.value) + ")) { res.status(" +
+                           expr(*s.target->args[0].value) + ").send(\"\"); return; }";
+                if (ruta_)
+                    return "if (!(" + expr(*s.value) + ")) { " +
+                           respuesta_de_retorno(s.target.get()) + " }";
                 return "if (!(" + expr(*s.value) + ")) { return " + expr(*s.target) + "; }";
 
             default:
@@ -957,9 +1042,50 @@ public:
         }
     }
 
+    // El equivalente, en modo ruta, de "return <e>;": serializa el valor a
+    // JSON y escribe la respuesta, igual que la cola de build_routes
+    // (project.cpp) hace con el `Value` que devuelve el VM -- `nullptr`
+    // (un `return` sin valor) es el 204 vacio de esa misma cola.
+    std::string respuesta_de_retorno(const IrExpr* e) const {
+        if (!e) return "res.status(204).send(\"\"); return;";
+        return "res.header(\"Content-Type\", \"application/json; charset=utf-8\").send(" +
+               valor_json(*e) + ".to_json_text()); return;";
+    }
+
+    // Construye un lumen_script::Value equivalente a `e` -- el puente entre
+    // la representacion nativa tipada (rapida, dentro del cuerpo de una
+    // ruta) y el Value dinamico que necesita el cuerpo JSON final
+    // (Comprobador::es_valor_json ya demostro que esto es valido). A
+    // diferencia de expr(), un DictLit/ListLit aqui NO tiene que ser
+    // homogeneo: cada entrada se convierte por su cuenta, recursivamente.
+    std::string valor_json(const IrExpr& e) const {
+        if (e.kind == IrExprKind::DictLit) {
+            std::string s = "([&]{ Value::Dict d; ";
+            for (const auto& entry : e.entries)
+                s += "d[" + expr(*entry.key) + "] = " + valor_json(*entry.value) + "; ";
+            s += "return Value::dict(std::move(d)); }())";
+            return s;
+        }
+        if (e.kind == IrExprKind::ListLit) {
+            std::string s = "([&]{ Value::List l; ";
+            for (const auto& item : e.items) s += "l.push_back(" + valor_json(*item) + "); ";
+            s += "return Value::list(std::move(l)); }())";
+            return s;
+        }
+        auto t = comprobador_.tipo_provable(e);
+        switch (t->kind()) {
+            case Type::Kind::Int:    return "Value::integer(" + expr(e) + ")";
+            case Type::Kind::Float:  return "Value::real(" + expr(e) + ")";
+            case Type::Kind::Bool:   return "Value::boolean(" + expr(e) + ")";
+            case Type::Kind::String: return "Value::str(" + expr(e) + ")";
+            default: return ""; // inalcanzable: es_valor_json() ya lo descarto
+        }
+    }
+
 private:
     const std::vector<std::string>& nombre_por_indice_;
     const Comprobador&               comprobador_;
+    bool                             ruta_ = false;
     std::map<int, std::string>      ranura_a_nombre_;
 
     static std::string pad(int indent) { return std::string(static_cast<size_t>(indent) * 4, ' '); }
@@ -1023,6 +1149,27 @@ bool bloque_siempre_retorna(const IrBlock& b) {
     for (const auto& s : b)
         if (s && stmt_siempre_retorna(*s)) return true; // el resto del bloque queda inalcanzable
     return false;
+}
+
+// Duplicado deliberado de la funcion del mismo nombre en project.cpp (linkage
+// interno en las dos, por el anonimo que las envuelve -- sin choque de
+// simbolos): extrae los nombres :param / {param} del patron de ruta, para
+// saber si un parametro va a req.params (Path) o a req.query (Query) --
+// misma regla exacta que bind_params(). No vale con importarla: vive en un
+// binario distinto (`lumen` enlaza project.cpp, esta libreria no).
+std::vector<std::string> pattern_params(const std::string& pattern) {
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i < pattern.size()) {
+        if (pattern[i] == ':' || pattern[i] == '{') {
+            char close = (pattern[i] == '{') ? '}' : '/';
+            size_t j = i + 1;
+            while (j < pattern.size() && pattern[j] != close) ++j;
+            out.push_back(pattern.substr(i + 1, j - i - 1));
+            i = j;
+        } else ++i;
+    }
+    return out;
 }
 
 } // namespace
@@ -1179,6 +1326,114 @@ std::optional<FuncionNativa> generar_metodo_nativo(const std::string& clase, con
     // C++ desde otra funcion nativa (otro metodo, o una funcion suelta cuyo
     // cuerpo pasa una instancia sin construirla -- ver el comentario sobre
     // classes_ == nullptr en compilar_nativo).
+    return out;
+}
+
+std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBlock& body,
+                                              int indice,
+                                              const std::vector<std::string>& nombre_por_indice,
+                                              const TablaFirmas& firmas,
+                                              const TablaClases& clases,
+                                              const TablaRoles& roles) {
+    // ws/sse no producen un IrBlock comparable (su bucle vive fuera del
+    // cuerpo, en build_routes) -- ni falta que hace: nunca llegan aqui con
+    // logica que valga la pena compilar de esta forma.
+    if (route.method == "WS" || route.method == "SSE") return std::nullopt;
+
+    struct ParamRuta {
+        std::string nombre;
+        Type        tipo;
+        bool        en_path;
+    };
+    const auto en_patron = pattern_params(route.pattern);
+    std::vector<ParamRuta> params;
+    for (const auto& p : route.params) {
+        // Alcance de este primer corte (ver el comentario de RutaNativa en
+        // el header): sin valor por defecto, sin `?`, y solo los cuatro
+        // escalares -- un File/List<File>/clase (cuerpo de peticion) nunca
+        // produce ninguno de esos Type::Kind, asi que ya quedan excluidos
+        // por la misma comprobacion.
+        if (p.type.optional || p.default_value) return std::nullopt;
+        Type t = Type::from_declared(p.type);
+        if (t.kind() != Type::Kind::Int && t.kind() != Type::Kind::Float &&
+            t.kind() != Type::Kind::Bool && t.kind() != Type::Kind::String)
+            return std::nullopt;
+        bool en_path = std::find(en_patron.begin(), en_patron.end(), p.name) != en_patron.end();
+        params.push_back({p.name, std::move(t), en_path});
+    }
+
+    Comprobador comprobador(nombre_por_indice, firmas, clases, roles);
+    // check_route declara los parametros de la ruta, en orden, antes que
+    // nada mas (ver Emitter::check_route) -- mismo orden que se registra
+    // aqui y en Generador::registrar() mas abajo.
+    for (size_t i = 0; i < params.size(); ++i)
+        comprobador.registrar(static_cast<int>(i), params[i].tipo);
+    // Type::json() es el centinela de "esto es una ruta": Return/Require
+    // solo tienen que demostrar que su valor es construible como Value
+    // (Comprobador::es_valor_json), no un Type nativo exacto -- ver esos dos
+    // casos en Comprobador::stmt_compilable.
+    if (!comprobador.block_compilable(body, Type::json())) return std::nullopt;
+
+    RutaNativa out;
+    out.simbolo = "lumen_native_route_" + std::to_string(indice);
+
+    // El binding de parametros: mismo criterio EXACTO que prepare_args()
+    // (project.cpp) -- Path va a req.params, Query a req.query; ausente da
+    // el "cero" del tipo en silencio; presente pero sin parsear es un 400
+    // con el mismo cuerpo {"error":"parametro invalido","param":...,
+    // "esperado":...,"recibido":...}. No hay manera de llamar a prepare_args
+    // desde aqui (vive en otro binario, y trabaja sobre Value/ParamBind, no
+    // sobre los tipos nativos que declara esta ruta) -- se reproduce en vez
+    // de reusarse, con las mismas funciones de conversion que
+    // route_runtime_prelude() antepone una sola vez.
+    std::string cuerpo = "{\n";
+    for (const auto& p : params) {
+        const std::string mapa = p.en_path ? "req.params" : "req.query";
+        const std::string nombre = nombre_cpp(p.nombre);
+        cuerpo += "    " + tipo_cpp(p.tipo) + " " + nombre + ";\n";
+        cuerpo += "    {\n";
+        cuerpo += "        auto it = " + mapa + ".find(" + literal_string(p.nombre) + ");\n";
+        if (p.tipo.kind() == Type::Kind::String) {
+            cuerpo += "        " + nombre + " = (it != " + mapa +
+                      ".end()) ? it->second : std::string();\n";
+        } else {
+            const std::string cero = p.tipo.kind() == Type::Kind::Bool   ? "false"
+                                    : p.tipo.kind() == Type::Kind::Float ? "0.0"
+                                                                          : "0";
+            const std::string fn = p.tipo.kind() == Type::Kind::Bool   ? "lumen_route_coerce_bool"
+                                  : p.tipo.kind() == Type::Kind::Float ? "lumen_route_coerce_float"
+                                                                        : "lumen_route_coerce_int";
+            cuerpo += "        if (it == " + mapa + ".end()) {\n";
+            cuerpo += "            " + nombre + " = " + cero + ";\n";
+            cuerpo += "        } else if (!" + fn + "(it->second, " + nombre + ")) {\n";
+            cuerpo += "            Value::Dict __d;\n";
+            cuerpo += "            __d[\"error\"] = Value::str(\"parametro invalido\");\n";
+            cuerpo += "            __d[\"param\"] = Value::str(" + literal_string(p.nombre) + ");\n";
+            cuerpo += "            __d[\"esperado\"] = Value::str(" + literal_string(p.tipo.to_string()) +
+                      ");\n";
+            cuerpo += "            __d[\"recibido\"] = Value::str(it->second);\n";
+            cuerpo += "            res.status(400).header(\"Content-Type\", "
+                      "\"application/json; charset=utf-8\")"
+                      ".send(Value::dict(std::move(__d)).to_json_text());\n";
+            cuerpo += "            return;\n";
+            cuerpo += "        }\n";
+        }
+        cuerpo += "    }\n";
+    }
+
+    Generador gen(nombre_por_indice, comprobador, /*ruta=*/true);
+    for (size_t i = 0; i < params.size(); ++i) gen.registrar(static_cast<int>(i), params[i].nombre);
+    cuerpo += gen.block(body, 1);
+    // A diferencia de una funcion, aqui NO hace falta bloque_siempre_retorna:
+    // la funcion generada es `void`, asi que "caer al final" es C++
+    // perfectamente valido (nunca comportamiento indefinido) -- y es,
+    // ademas, EXACTAMENTE lo mismo que hace el VM cuando el cuerpo de una
+    // ruta termina sin `return` explicito (null -> 204, ver build_routes).
+    cuerpo += "    res.status(204).send(\"\");\n";
+    cuerpo += "}";
+
+    out.cuerpo_cpp = "extern \"C\" void " + out.simbolo +
+                     "(lumen::Request& req, lumen::Response& res) " + cuerpo;
     return out;
 }
 
@@ -1478,6 +1733,27 @@ std::string dict_runtime_prelude() {
         "};\n"
         "template <class V>\n"
         "LDict(std::initializer_list<std::pair<std::string, V>>) -> LDict<V>;\n";
+}
+
+std::string route_runtime_prelude() {
+    // Mismas tres reglas que coerce() en project.cpp, reproducidas a mano
+    // (ver el comentario de generar_ruta_nativa): std::stoll/std::stod
+    // aceptan basura al final ("12abc" -> 12) sin comprobar cuanto
+    // consumieron -- eso NO es un descuido de aqui, es replicar el mismo
+    // comportamiento del interprete bit a bit, para que --native nunca
+    // acepte (o rechace) un valor que bytecode habria tratado distinto.
+    return
+        "inline bool lumen_route_coerce_int(const std::string& t, int64_t& out) {\n"
+        "    try { out = std::stoll(t); return true; } catch (...) { return false; }\n"
+        "}\n"
+        "inline bool lumen_route_coerce_float(const std::string& t, double& out) {\n"
+        "    try { out = std::stod(t); return true; } catch (...) { return false; }\n"
+        "}\n"
+        "inline bool lumen_route_coerce_bool(const std::string& t, bool& out) {\n"
+        "    if (t == \"true\" || t == \"1\")  { out = true;  return true; }\n"
+        "    if (t == \"false\" || t == \"0\") { out = false; return true; }\n"
+        "    return false;\n"
+        "}\n";
 }
 
 } // namespace lumen_script
