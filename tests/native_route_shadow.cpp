@@ -41,19 +41,21 @@ struct Resultado {
 };
 
 static Resultado pedir(Module& mod, const std::string& metodo, const std::string& path) {
-    lumen::RouteMatch m = mod.router.match(metodo, path);
+    // Query string: match() (igual que HttpConnection, que la separa ANTES
+    // de llamar a match()) solo entiende el patron -- un '?' colado en el
+    // path que se le pasa nunca encontraria la ruta.
+    auto        qpos     = path.find('?');
+    std::string solo_ruta = (qpos == std::string::npos) ? path : path.substr(0, qpos);
+
+    lumen::RouteMatch m = mod.router.match(metodo, solo_ruta);
     if (!m.found) return {};
 
     lumen::Request  req;
     lumen::Response res;
     req.method = metodo;
-    req.path   = path;
+    req.path   = solo_ruta;
     req.params = m.params;
 
-    // Query string: match() no la separa (solo el patron), asi que un path
-    // con '?' hay que partirlo a mano, igual que hace HttpConnection antes
-    // de llamar a match().
-    auto qpos = path.find('?');
     if (qpos != std::string::npos) {
         std::string qs = path.substr(qpos + 1);
         size_t i = 0;
@@ -81,7 +83,11 @@ int main() {
         "get endpoint(\"/compute/fib/:n\", int n):\n"
         "    require n >= 1 and n <= 32 else status(400)\n"
         "    int r = fib(n)\n"
-        "    return { \"n\": n, \"result\": r }\n";
+        "    return { \"n\": n, \"result\": r }\n"
+        "\n"
+        "get endpoint(\"/compute/fibq\", int n = 5):\n"
+        "    require n >= 0 and n <= 32 else status(400)\n"
+        "    return { \"n\": n, \"result\": fib(n) }\n";
 
     const auto dir  = std::filesystem::temp_directory_path() / "lumen_native_route_check";
     std::error_code ec;
@@ -167,6 +173,14 @@ int main() {
     // el caso que prueba que el 400 {"error":"parametro invalido",...} sale
     // BYTE A BYTE igual, JSON-escapado incluido.
     comparar("parametro invalido n='abc'", "/compute/fib/abc");
+
+    // Query con valor por defecto (`int n = 5`): ausente usa el defecto (el
+    // mismo texto que bind_params() extrae del AST, corriendo por el MISMO
+    // coerce() que un valor real), presente lo sustituye, y mal tipada da
+    // el mismo 400 -- las tres vias que prepare_args() distingue.
+    comparar("query con defecto, ausente", "/compute/fibq");
+    comparar("query con defecto, presente", "/compute/fibq?n=8");
+    comparar("query con defecto, mal tipada", "/compute/fibq?n=xyz");
 
     if (ok) {
         std::printf("native_route_shadow: la ruta nativa coincide con bytecode en los tres "

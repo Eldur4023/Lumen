@@ -1142,15 +1142,19 @@ simplemente antepone `res.status(204).send("");` al final de cada ruta generada:
 hay un `return`/`require` en todo camino, y el 204 correcto si no lo hay.
 
 Alcance deliberadamente estrecho de este primer corte: solo parámetros escalares de patrón (`:id`) o
-query string, **sin valor por defecto** — un `File`, un parámetro de tipo clase (cuerpo de petición),
-o cualquier `?` dejan la ruta entera sin compilar, igual que un cuerpo que use `session`/`jwt`/
-`render`/`await` (`Comprobador::block_compilable` ya los rechaza sin necesitar ningún caso nuevo: no
-forman parte de ningún `IrExprKind`/`IrStmtKind` que reconozca — el mismo invariante de "no hay
-generación parcial" que ya regía funciones). El *binding* de parámetros se reproduce a mano dentro de
-la ruta generada, EXACTAMENTE con las mismas reglas que `prepare_args()`/`coerce()` en `project.cpp`
-(ausente → cero silencioso del tipo; presente pero sin parsear → el mismo 400
-`{"error":"parametro invalido","param":...,"esperado":...,"recibido":...}`, incluido el detalle de
-que `std::stoll`/`std::stod` aceptan basura al final sin comprobarlo, `"12abc"` → `12`) — no hay
+query string — un `File`, un parámetro de tipo clase (cuerpo de petición), o cualquier `?` (opcional)
+dejan la ruta entera sin compilar, igual que un cuerpo que use `session`/`jwt`/`render`/`await`
+(`Comprobador::block_compilable` ya los rechaza sin necesitar ningún caso nuevo: no forman parte de
+ningún `IrExprKind`/`IrStmtKind` que reconozca — el mismo invariante de "no hay generación parcial"
+que ya regía funciones). El *binding* de parámetros se reproduce a mano dentro de la ruta generada,
+EXACTAMENTE con las mismas reglas que `prepare_args()`/`coerce()` en `project.cpp`: ausente → cero
+silencioso del tipo (o el valor por defecto, si el parámetro es de query y lo declara — un `int
+limit = 20` extrae el texto del literal en el propio AST, en tiempo de compilación, y lo hace pasar
+por el MISMO `coerce()` que un valor real, así que un defecto mal tipado a propósito daría el mismo
+400 que uno real; un parámetro de PATRÓN con defecto es, como en `bind_params`, un error de
+compilación, nunca algo que este generador intente resolver); presente pero sin parsear → el mismo
+400 `{"error":"parametro invalido","param":...,"esperado":...,"recibido":...}`, incluido el detalle
+de que `std::stoll`/`std::stod` aceptan basura al final sin comprobarlo, `"12abc"` → `12`. No hay
 manera de llamar a `prepare_args` desde el `.cpp` generado (vive en otro binario, sobre `Value`, no
 sobre los tipos C++ que declara la ruta), así que se duplica a propósito, con `route_runtime_prelude()`
 antepuesto una sola vez por módulo. Cuando la ruta entera es representable, el handler nativo
@@ -1170,7 +1174,9 @@ get endpoint("/compute/fib/:n", int n):
 ```
 
 comparando status+cuerpo byte a byte en tres casos (`n=10` normal, `n=50` rechazado por la guarda,
-`n="abc"` que no parsea) — las tres coinciden. Contra el binario real, sirviendo HTTP de verdad, con
+`n="abc"` que no parsea) y, sobre una segunda ruta con un parámetro de query CON defecto
+(`get endpoint("/compute/fibq", int n = 5)`), tres más (ausente → usa el defecto, presente lo
+sustituye, mal tipada → el mismo 400) — las seis coinciden. Contra el binario real, sirviendo HTTP de verdad, con
 `bench/lumen/app.lum` completo en dos instancias (una `--native`, otra sin): `/compute/fib/10`,
 `/compute/fib/32` (límite), `/compute/fib/33` y `/compute/fib/0` (rechazados por la guarda),
 `/compute/fib/abc` (parámetro inválido) y `/compute/primes/1000` dan la respuesta IDÉNTICA en las dos

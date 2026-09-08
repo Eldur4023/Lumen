@@ -1344,22 +1344,46 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
         std::string nombre;
         Type        tipo;
         bool        en_path;
+        bool        con_defecto;
+        std::string texto_defecto; // solo si con_defecto
     };
     const auto en_patron = pattern_params(route.pattern);
     std::vector<ParamRuta> params;
     for (const auto& p : route.params) {
         // Alcance de este primer corte (ver el comentario de RutaNativa en
-        // el header): sin valor por defecto, sin `?`, y solo los cuatro
-        // escalares -- un File/List<File>/clase (cuerpo de peticion) nunca
-        // produce ninguno de esos Type::Kind, asi que ya quedan excluidos
-        // por la misma comprobacion.
-        if (p.type.optional || p.default_value) return std::nullopt;
+        // el header): sin `?`, y solo los cuatro escalares -- un
+        // File/List<File>/clase (cuerpo de peticion) nunca produce ninguno
+        // de esos Type::Kind, asi que ya quedan excluidos por la misma
+        // comprobacion.
+        if (p.type.optional) return std::nullopt;
         Type t = Type::from_declared(p.type);
         if (t.kind() != Type::Kind::Int && t.kind() != Type::Kind::Float &&
             t.kind() != Type::Kind::Bool && t.kind() != Type::Kind::String)
             return std::nullopt;
         bool en_path = std::find(en_patron.begin(), en_patron.end(), p.name) != en_patron.end();
-        params.push_back({p.name, std::move(t), en_path});
+
+        bool        con_defecto = false;
+        std::string texto_defecto;
+        if (p.default_value) {
+            // "un parametro de ruta no puede tener valor por defecto" -- la
+            // misma regla que bind_params() (project.cpp): si esta ruta
+            // llega a compilar de todas formas (no deberia, bind_params la
+            // rechazara en build_routes), mejor que se quede en bytecode a
+            // que un handler nativo silencie el error.
+            if (en_path) return std::nullopt;
+            // Mismo extractor EXACTO que bind_params(): solo constantes
+            // literales, resueltas aqui, en tiempo de compilacion -- un
+            // valor por defecto que no sea uno de estos tres tipos de
+            // literal ya es un error de compilacion en bind_params, asi
+            // que esta ruta tampoco necesita intentarlo.
+            const Expr& d = *p.default_value;
+            if (d.kind == ExprKind::StringLit) texto_defecto = d.text;
+            else if (d.kind == ExprKind::IntLit) texto_defecto = std::to_string(d.int_value);
+            else if (d.kind == ExprKind::BoolLit) texto_defecto = d.bool_value ? "true" : "false";
+            else return std::nullopt;
+            con_defecto = true;
+        }
+        params.push_back({p.name, std::move(t), en_path, con_defecto, std::move(texto_defecto)});
     }
 
     Comprobador comprobador(nombre_por_indice, firmas, clases, roles);
@@ -1393,9 +1417,18 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
         cuerpo += "    " + tipo_cpp(p.tipo) + " " + nombre + ";\n";
         cuerpo += "    {\n";
         cuerpo += "        auto it = " + mapa + ".find(" + literal_string(p.nombre) + ");\n";
+        cuerpo += "        bool presente = it != " + mapa + ".end();\n";
+        cuerpo += "        std::string raw = presente ? it->second : std::string();\n";
+        // Ausente pero con valor por defecto: se trata como SI hubiera
+        // llegado ese texto -- exactamente lo que hace prepare_args()
+        // (project.cpp) antes de llamar a coerce(), asi que un defecto mal
+        // tipado (p.ej. `bool activo = "20"`) da el mismo 400 que un valor
+        // real mal tipado, con "recibido" mostrando el propio defecto.
+        if (p.con_defecto)
+            cuerpo += "        if (!presente) { raw = " + literal_string(p.texto_defecto) +
+                      "; presente = true; }\n";
         if (p.tipo.kind() == Type::Kind::String) {
-            cuerpo += "        " + nombre + " = (it != " + mapa +
-                      ".end()) ? it->second : std::string();\n";
+            cuerpo += "        " + nombre + " = raw;\n";
         } else {
             const std::string cero = p.tipo.kind() == Type::Kind::Bool   ? "false"
                                     : p.tipo.kind() == Type::Kind::Float ? "0.0"
@@ -1403,15 +1436,15 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
             const std::string fn = p.tipo.kind() == Type::Kind::Bool   ? "lumen_route_coerce_bool"
                                   : p.tipo.kind() == Type::Kind::Float ? "lumen_route_coerce_float"
                                                                         : "lumen_route_coerce_int";
-            cuerpo += "        if (it == " + mapa + ".end()) {\n";
+            cuerpo += "        if (!presente) {\n";
             cuerpo += "            " + nombre + " = " + cero + ";\n";
-            cuerpo += "        } else if (!" + fn + "(it->second, " + nombre + ")) {\n";
+            cuerpo += "        } else if (!" + fn + "(raw, " + nombre + ")) {\n";
             cuerpo += "            Value::Dict __d;\n";
             cuerpo += "            __d[\"error\"] = Value::str(\"parametro invalido\");\n";
             cuerpo += "            __d[\"param\"] = Value::str(" + literal_string(p.nombre) + ");\n";
             cuerpo += "            __d[\"esperado\"] = Value::str(" + literal_string(p.tipo.to_string()) +
                       ");\n";
-            cuerpo += "            __d[\"recibido\"] = Value::str(it->second);\n";
+            cuerpo += "            __d[\"recibido\"] = Value::str(raw);\n";
             cuerpo += "            res.status(400).header(\"Content-Type\", "
                       "\"application/json; charset=utf-8\")"
                       ".send(Value::dict(std::move(__d)).to_json_text());\n";
