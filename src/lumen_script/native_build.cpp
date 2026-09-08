@@ -221,8 +221,8 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
     const bool con_rutas = !rutas_generadas.empty() || !rutas_async_generadas.empty();
 
     std::string codigo =
-        "#include <cctype>\n#include <cstdint>\n#include <initializer_list>\n#include <string>\n"
-        "#include <utility>\n#include <vector>\n\n" +
+        "#include <cctype>\n#include <cstdint>\n#include <initializer_list>\n#include <map>\n"
+        "#include <string>\n#include <utility>\n#include <vector>\n\n" +
         abi_prelude() + "\n" + error_runtime_prelude() + "\n" + list_runtime_prelude() + "\n" +
         dict_runtime_prelude() + "\n" + string_runtime_prelude() + "\n";
     // lumen_script::Value hace falta SIEMPRE que algo pueda usar str() --
@@ -245,9 +245,13 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
     // hace falta siempre que haya rutas, no solo las que de verdad usan
     // `await`: es mas simple incluirla siempre que decidir aqui cual de
     // ellas la necesita de verdad (route_runtime_prelude() la usa igual).
+    // <lumen_script/db.hpp>: DbOp/await_db() -- Fase 5.5, `await
+    // <modulo>.query/exec/last_id(...)` -- mismo criterio que Task/sleep:
+    // siempre que haya rutas, no solo las que de verdad usan una base de
+    // datos.
     if (con_rutas)
         codigo += "#include <lumen/request.hpp>\n#include <lumen/response.hpp>\n"
-                  "#include <lumen/task.hpp>\n\n" +
+                  "#include <lumen/task.hpp>\n#include <lumen_script/db.hpp>\n\n" +
                   route_runtime_prelude() + "\n";
     codigo += clases_texto + "\n" + prototipos + "\n" + cuerpos;
     if (con_rutas) codigo += rutas_cuerpos;

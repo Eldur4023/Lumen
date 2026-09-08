@@ -1,4 +1,5 @@
 #include <lumen_script/native_gen.hpp>
+#include <lumen_script/natives.hpp>
 
 #include <algorithm>
 #include <cstdio>
@@ -8,9 +9,22 @@
 namespace lumen_script {
 namespace {
 
+// Los mismos native_id() que resuelve member_native_id("sqlite"/"postgres"/
+// "mysql", "query"/"exec"/"last_id") en el checker real (natives.cpp) --
+// las tres modulos comparten el mismo id para cada operacion (una sola
+// entrada "__db_query"/"__db_exec"/"__db_last_id" en la tabla de nativos),
+// asi que basta con el nombre de la operacion, sin mirar de que modulo
+// vino la llamada.
+int db_query_id()   { static const int id = native_id("__db_query");   return id; }
+int db_exec_id()    { static const int id = native_id("__db_exec");    return id; }
+int db_last_id_id() { static const int id = native_id("__db_last_id"); return id; }
+
 // Los unicos elementos de List o valores de Dict que esta fase sabe
 // representar -- un nivel, sin anidar (List<List<int>>, Dict<string,List<int>>
 // quedan fuera: su elemento/valor no es ninguno de estos cuatro).
+// Type::Kind::Json entra tambien -- Fase 5.5 (COMPILACION-NATIVA.md): un
+// List<Json>/Dict<string,Json> (la forma real de una fila de base de
+// datos) se representa igual que un Json suelto, ver tipo_cpp() mas abajo.
 bool tipo_elemento_contenedor_soportado(const Type& elem) {
     if (elem.is_optional()) return false;
     switch (elem.kind()) {
@@ -18,6 +32,7 @@ bool tipo_elemento_contenedor_soportado(const Type& elem) {
         case Type::Kind::Float:
         case Type::Kind::Bool:
         case Type::Kind::String:
+        case Type::Kind::Json:
             return true;
         default:
             return false;
@@ -62,6 +77,13 @@ bool tipo_soportado(const Type& t, const TablaClases* clases = nullptr) {
         case Type::Kind::Bool:
         case Type::Kind::Void:
         case Type::Kind::String:
+        // Fase 5.5: el valor dinamico que devuelve una consulta de base de
+        // datos (Value en tiempo de generacion, ver tipo_cpp()) -- nunca
+        // demostrable con un Type nativo fijo (el driver puede fallar en
+        // tiempo de ejecucion y devolver una forma distinta, ver el
+        // comentario grande sobre esto en COMPILACION-NATIVA.md), asi que
+        // se representa como lo que de verdad es: dinamico.
+        case Type::Kind::Json:
             return true;
         case Type::Kind::List:
         case Type::Kind::Dict:
@@ -87,7 +109,7 @@ bool es_numerico(Type::Kind k) { return k == Type::Kind::Int || k == Type::Kind:
 // llamada desde bytecode.
 bool tipo_abi_soportado(const Type& t) {
     return tipo_soportado(t) && t.kind() != Type::Kind::String && t.kind() != Type::Kind::List &&
-           t.kind() != Type::Kind::Dict;
+           t.kind() != Type::Kind::Dict && t.kind() != Type::Kind::Json;
 }
 
 std::string tipo_cpp(const Type& t) {
@@ -97,8 +119,21 @@ std::string tipo_cpp(const Type& t) {
         case Type::Kind::Bool:   return "bool";
         case Type::Kind::Void:   return "void";
         case Type::Kind::String: return "std::string";
-        case Type::Kind::List:   return "LList<" + tipo_cpp(t.element()) + ">";
-        case Type::Kind::Dict:   return "LDict<" + tipo_cpp(t.element()) + ">";
+        // Json es dinamico -- ya ES el Value que usa el VM, ver el
+        // comentario de tipo_soportado(). Un List<Json>/Dict<string,Json>
+        // (una fila/tabla de base de datos) se representa IGUAL, no como
+        // LList<Value>/LDict<Value>: esas dos plantillas existen para
+        // contenedores HOMOGENEOS de tipo fijo (§8), y aqui el propio
+        // Value ya sabe ser una lista o un diccionario por su cuenta --
+        // envolverlo en otra caja no anadiria nada, solo una indireccion
+        // de mas.
+        case Type::Kind::Json:   return "Value";
+        case Type::Kind::List:
+            return t.element().kind() == Type::Kind::Json ? "Value"
+                                                            : "LList<" + tipo_cpp(t.element()) + ">";
+        case Type::Kind::Dict:
+            return t.element().kind() == Type::Kind::Json ? "Value"
+                                                            : "LDict<" + tipo_cpp(t.element()) + ">";
         case Type::Kind::Class:  return "L" + t.class_name();
         default: return ""; // inalcanzable si tipo_soportado() dio el visto bueno
     }
@@ -142,6 +177,22 @@ std::string nombre_cpp(const std::string& lumen) { return "l_" + lumen; }
 bool es_escalar_json(Type::Kind k) {
     return k == Type::Kind::Int || k == Type::Kind::Float || k == Type::Kind::Bool ||
            k == Type::Kind::String;
+}
+
+// ¿Es este Type, en la practica, un Value dinamico (Fase 5.5)? Bare Json
+// (el resultado directo de `await <modulo>.query/exec/last_id(...)`) O un
+// List<Json>/Dict<string,Json> (element() == Json) -- las dos formas
+// comparten el MISMO tipo_cpp() ("Value", ver mas arriba): un
+// List<Json> no se envuelve en LList<Value>, porque Value ya sabe ser una
+// lista por su cuenta. Usado en vez de comparar `kind() == Json` a secas en
+// cualquier sitio que necesite tratar las dos formas igual (Index/Binary/
+// len()/int()/str()/valor_json()).
+bool es_json_dinamico(const Type& t) {
+    if (t.kind() == Type::Kind::Json) return true;
+    if ((t.kind() == Type::Kind::List || t.kind() == Type::Kind::Dict) &&
+        t.element().kind() == Type::Kind::Json)
+        return true;
+    return false;
 }
 
 // Ver native_abi.hpp: campo de la union de NativeValue que corresponde a
@@ -278,7 +329,7 @@ public:
         }
         auto t = tipo_provable(e);
         return t && (es_escalar_json(t->kind()) || t->kind() == Type::Kind::List ||
-                    t->kind() == Type::Kind::Dict);
+                    t->kind() == Type::Kind::Dict || t->kind() == Type::Kind::Json);
     }
 
     // `require cond else status(N)` (el patron de guarda mas comun, ver el
@@ -339,26 +390,58 @@ public:
             case IrExprKind::NullLit:
                 return std::nullopt;
 
-            // Fase 5: el UNICO await que esta fase sabe representar --
-            // `await sleep(ms)` -- traducido a `co_await lumen::sleep(...)`
-            // de verdad (ver Generador::expr, y route_runtime_prelude para
-            // el clamp de 1ms). Cualquier otro await (una consulta a base
-            // de datos, ws.recv()...) sigue devolviendo null aqui: ni
-            // siquiera existe una nocion de "tipo" para ellos todavia
-            // (Fase 5 completa, mas alla de este primer paso). No hay caso
-            // aparte para IrCallShape aqui: e.lhs siempre es IrExprKind::
-            // Call (Emitter::check_expr lo garantiza para Await), asi que
-            // basta con mirar su call_name/call_shape directamente.
+            // Fase 5/5.5: los awaits que esta fase sabe representar --
+            // `await sleep(ms)` (traducido a `co_await lumen::sleep(...)`
+            // de verdad) y `await <modulo>.query/exec/last_id(...)`
+            // (traducido a `co_await lumen_script::await_db(...)`, el mismo
+            // camino que ya usa bytecode -- ver el comentario de esa
+            // funcion en db.hpp). `begin()`/`commit()`/`rollback()` quedan
+            // fuera todavia (necesitan coordinar el cierre de la
+            // transaccion al final de la ruta, ver el comentario grande en
+            // COMPILACION-NATIVA.md); cualquier otro await (ws.recv()...)
+            // tampoco tiene representacion. No hay caso aparte para
+            // IrCallShape aqui: e.lhs siempre es IrExprKind::Call
+            // (Emitter::check_expr lo garantiza para Await), asi que basta
+            // con mirar su call_name/call_shape/call_index directamente.
             case IrExprKind::Await: {
-                if (!e.lhs || e.lhs->kind != IrExprKind::Call ||
-                    e.lhs->call_shape != IrCallShape::BuiltinGlobalCall ||
-                    e.lhs->call_name != "sleep" || e.lhs->args.size() != 1 ||
-                    !e.lhs->args[0].value)
-                    return std::nullopt;
-                auto t = tipo_provable(*e.lhs->args[0].value);
-                if (!t || t->kind() != Type::Kind::Int) return std::nullopt;
-                usa_await_ = true;
-                return Type::void_();
+                if (!e.lhs || e.lhs->kind != IrExprKind::Call) return std::nullopt;
+                const IrExpr& call = *e.lhs;
+
+                if (call.call_shape == IrCallShape::BuiltinGlobalCall &&
+                    call.call_name == "sleep") {
+                    if (call.args.size() != 1 || !call.args[0].value) return std::nullopt;
+                    auto t = tipo_provable(*call.args[0].value);
+                    if (!t || t->kind() != Type::Kind::Int) return std::nullopt;
+                    usa_await_ = true;
+                    return Type::void_();
+                }
+
+                if (call.call_shape == IrCallShape::DbModuleCall) {
+                    // query/exec: el primer argumento es la SQL (string), el
+                    // resto son parametros -- cualquier escalar o un Json ya
+                    // construido (una fila de otra consulta, reusada como
+                    // parametro; el driver ya acepta un Value cualquiera).
+                    if (call.call_index == db_query_id() || call.call_index == db_exec_id()) {
+                        if (call.args.empty() || !call.args[0].value) return std::nullopt;
+                        auto tsql = tipo_provable(*call.args[0].value);
+                        if (!tsql || tsql->kind() != Type::Kind::String) return std::nullopt;
+                        for (size_t i = 1; i < call.args.size(); ++i) {
+                            if (!call.args[i].value) return std::nullopt;
+                            auto ta = tipo_provable(*call.args[i].value);
+                            if (!ta || !(es_escalar_json(ta->kind()) || ta->kind() == Type::Kind::Json))
+                                return std::nullopt;
+                        }
+                        usa_await_ = true;
+                        return Type::json();
+                    }
+                    // last_id(): sin argumentos.
+                    if (call.call_index == db_last_id_id()) {
+                        if (!call.args.empty()) return std::nullopt;
+                        usa_await_ = true;
+                        return Type::json();
+                    }
+                }
+                return std::nullopt;
             }
 
             // El unico nodo del IR que YA lleva el nombre de la clase
@@ -438,12 +521,31 @@ public:
             // critica). No demostrable, se queda sin compilar a proposito;
             // Dict SI admite escribir por indice (ver Assign mas abajo, sin
             // esa ambiguedad: el VM siempre acepta la escritura).
+            //
+            // Json (Fase 5.5): el objeto YA es dinamico -- una fila de base
+            // de datos puede ser una List (`filas[0]`) o, dentro de ella,
+            // un Dict-por-nombre-de-columna (`f["nombre"]`). Aqui NO hay
+            // ambiguedad que evitar (a diferencia de Dict<V> arriba): el
+            // Value entero, con su ausencia-da-null incluida, viaja intacto
+            // -- es EXACTAMENTE lo que vm.cpp::GetIndex ya hace, solo que
+            // resuelto en tiempo de ejecucion por lumen_json_index_int/_str
+            // (route_runtime_prelude) en vez de por un opcode. El indice
+            // decide la forma (Int -> acceso de List, String -> acceso de
+            // Dict); Comprobador no sabe -- ni le hace falta saber -- si el
+            // Value sera realmente una List o un Dict en tiempo de
+            // ejecucion, igual que el VM tampoco lo sabe hasta ese momento.
             case IrExprKind::Index: {
                 if (!e.object || !e.lhs) return std::nullopt;
                 auto tobj = tipo_provable(*e.object);
                 auto tidx = tipo_provable(*e.lhs);
-                if (!tobj || tobj->kind() != Type::Kind::List) return std::nullopt;
-                if (!tidx || tidx->kind() != Type::Kind::Int) return std::nullopt;
+                if (!tobj || !tidx) return std::nullopt;
+                if (es_json_dinamico(*tobj)) {
+                    if (tidx->kind() == Type::Kind::Int || tidx->kind() == Type::Kind::String)
+                        return Type::json();
+                    return std::nullopt;
+                }
+                if (tobj->kind() != Type::Kind::List) return std::nullopt;
+                if (tidx->kind() != Type::Kind::Int) return std::nullopt;
                 return tobj->element();
             }
 
@@ -460,6 +562,36 @@ public:
                 auto tl = tipo_provable(*e.lhs);
                 auto tr = tipo_provable(*e.rhs);
                 if (!tl || !tr) return std::nullopt;
+
+                // Json (Fase 5.5) en cualquiera de los dos lados: se
+                // resuelve en tiempo de ejecucion con la MISMA logica que
+                // vm.cpp -- numeric_pair()/compare()/Op::Add/Sub/Mul/Div/
+                // Mod/Eq/Ne, ver los lumen_json_* de route_runtime_prelude.
+                // and/or quedan fuera: la semantica "el operando que gana"
+                // (ver el comentario de mas abajo) tampoco se generaba para
+                // dos operandos YA tipados que no fueran bool, y un Json es
+                // menos demostrable que eso todavia.
+                if (es_json_dinamico(*tl) || es_json_dinamico(*tr)) {
+                    // El lado que NO es dinamico tiene que ser algo que
+                    // Generador::valor_json() sepa convertir a Value -- si
+                    // fuera, por ejemplo, una instancia de clase, no habria
+                    // ninguna llamada de C++ que generar (valor_json() no
+                    // la cubre) y esto quedaria en un cuerpo roto en vez de
+                    // caer a bytecode a tiempo.
+                    auto compatible = [](const Type& t) {
+                        return es_escalar_json(t.kind()) || t.kind() == Type::Kind::List ||
+                               t.kind() == Type::Kind::Dict || t.kind() == Type::Kind::Json;
+                    };
+                    if (!compatible(*tl) || !compatible(*tr)) return std::nullopt;
+                    if (e.text == "and" || e.text == "or") return std::nullopt;
+                    if (e.text == "==" || e.text == "!=" || e.text == "<" || e.text == "<=" ||
+                        e.text == ">" || e.text == ">=")
+                        return Type::primitive(Type::Kind::Bool);
+                    if (e.text == "+" || e.text == "-" || e.text == "*" || e.text == "/" ||
+                        e.text == "%")
+                        return Type::json();
+                    return std::nullopt;
+                }
 
                 // and/or (vm.cpp: JumpIfFalsePeek/JumpIfTruePeek) devuelven
                 // el VALOR del operando que gana, al estilo Python -- NO un
@@ -656,18 +788,26 @@ public:
                 // cero: atrapado por el wrapper de una funcion o por el
                 // try/catch de una ruta, nunca sin red).
                 if (e.call_shape == IrCallShape::BuiltinGlobalCall) {
+                    // Fase 5.5: los tres aceptan tambien un Json dinamico --
+                    // str()/int() lo resuelven en tiempo de ejecucion
+                    // (Value::to_string()/lumen_json_as_int(), mismo canal
+                    // de error que ya usan sobre un tipo fijo); len() sobre
+                    // un Json puede ser string/List/Dict, igual que fn_len.
                     if (e.call_name == "str" && e.args.size() == 1 && e.args[0].value) {
                         auto t = tipo_provable(*e.args[0].value);
-                        if (t && es_escalar_json(t->kind())) return Type::primitive(Type::Kind::String);
+                        if (t && (es_escalar_json(t->kind()) || es_json_dinamico(*t)))
+                            return Type::primitive(Type::Kind::String);
                     }
                     if (e.call_name == "len" && e.args.size() == 1 && e.args[0].value) {
                         auto t = tipo_provable(*e.args[0].value);
-                        if (t && (t->kind() == Type::Kind::String || t->kind() == Type::Kind::List))
+                        if (t && (t->kind() == Type::Kind::String || t->kind() == Type::Kind::List ||
+                                 es_json_dinamico(*t)))
                             return Type::primitive(Type::Kind::Int);
                     }
                     if (e.call_name == "int" && e.args.size() == 1 && e.args[0].value) {
                         auto t = tipo_provable(*e.args[0].value);
-                        if (t && es_escalar_json(t->kind())) return Type::primitive(Type::Kind::Int);
+                        if (t && (es_escalar_json(t->kind()) || es_json_dinamico(*t)))
+                            return Type::primitive(Type::Kind::Int);
                     }
                 }
                 return std::nullopt;
@@ -703,14 +843,33 @@ public:
                 return s.value && tipo_provable(*s.value).has_value();
 
             case IrStmtKind::VarDecl: {
-                if (!tipo_soportado(s.decl_type, &clases_)) return false;
                 if (s.value) {
                     auto t = tipo_provable(*s.value);
-                    if (!t || *t != s.decl_type) return false;
+                    if (!t) return false;
+                    if (*t == s.decl_type) {
+                        registrar(s.slot, s.decl_type);
+                        return true;
+                    }
+                    // Fase 5.5: el valor real es Json (dinamico) aunque el
+                    // tipo declarado sea otra cosa -- `int stock =
+                    // filas[0]["stock"]` es valido Lumen (el tipo declarado
+                    // es decorativo, ver el comentario grande sobre esto en
+                    // COMPILACION-NATIVA.md) y el VM no le exige nada en la
+                    // asignacion, solo cuando el valor se USA de verdad. Se
+                    // registra el tipo REAL (Json), no el que puso el
+                    // programador: las operaciones posteriores (aritmetica,
+                    // comparacion, indexado...) ya saben resolverlo en
+                    // tiempo de ejecucion, exactamente como el VM. Cualquier
+                    // reasignacion futura de esta ranura tiene que demostrar
+                    // Json tambien (Assign(Local) exige el mismo tipo que
+                    // registro() dejo aqui).
+                    if (es_json_dinamico(*t)) {
+                        registrar(s.slot, Type::json());
+                        return true;
+                    }
+                    return false;
                 }
-                // Registrar DESPUES de comprobar el valor: una redeclaracion
-                // (mismo nombre, ranura nueva) no debe validarse contra si
-                // misma.
+                if (!tipo_soportado(s.decl_type, &clases_)) return false;
                 registrar(s.slot, s.decl_type);
                 return true;
             }
@@ -939,8 +1098,23 @@ public:
                 return s;
             }
 
-            case IrExprKind::Index:
+            case IrExprKind::Index: {
+                // Json (Fase 5.5): el objeto es dinamico -- el indice
+                // (Int -> lectura de List, String -> lectura de Dict, ver
+                // el comentario de Comprobador::tipo_provable) decide que
+                // funcion llamar; cual de las dos es ya se sabe en tiempo
+                // de generacion (el indice demostro Int o String, nunca los
+                // dos), aunque el objeto en si solo se sepa en tiempo de
+                // ejecucion.
+                auto tobj = comprobador_.tipo_provable(*e.object);
+                if (es_json_dinamico(*tobj)) {
+                    auto tidx = comprobador_.tipo_provable(*e.lhs);
+                    const char* fn = tidx->kind() == Type::Kind::Int ? "lumen_json_index_int"
+                                                                      : "lumen_json_index_str";
+                    return std::string(fn) + "(" + expr(*e.object) + ", " + expr(*e.lhs) + ")";
+                }
                 return expr(*e.object) + ".lumen_get(" + expr(*e.lhs) + ")";
+            }
 
             // "l_this" es el nombre fijo del receptor en un metodo generado
             // (ver generar_metodo_nativo) -- This no lleva `text` en el IR
@@ -963,13 +1137,36 @@ public:
             // no tiene ningun caso de fallo en tiempo de ejecucion que el
             // VM trate como error controlado, asi que van directos al
             // operador de C++ equivalente.
-            case IrExprKind::Binary:
+            case IrExprKind::Binary: {
+                auto tl = comprobador_.tipo_provable(*e.lhs);
+                auto tr = comprobador_.tipo_provable(*e.rhs);
+                if (es_json_dinamico(*tl) || es_json_dinamico(*tr)) {
+                    // Cada lado se lleva a Value con valor_json() -- si YA
+                    // es Json, es la identidad; si es un escalar/List/Dict
+                    // nativo, lo envuelve (Value::integer/real/boolean/str
+                    // o lumen_valor_de()) -- la MISMA conversion que ya usa
+                    // el valor de retorno de una ruta.
+                    std::string a = valor_json(*e.lhs);
+                    std::string b = valor_json(*e.rhs);
+                    if (e.text == "+")  return "lumen_json_add("  + a + ", " + b + ")";
+                    if (e.text == "-")  return "lumen_json_arit(" + a + ", " + b + ", '-')";
+                    if (e.text == "*")  return "lumen_json_arit(" + a + ", " + b + ", '*')";
+                    if (e.text == "/")  return "lumen_json_arit(" + a + ", " + b + ", '/')";
+                    if (e.text == "%")  return "lumen_json_arit(" + a + ", " + b + ", '%')";
+                    if (e.text == "<")  return "lumen_json_lt("   + a + ", " + b + ")";
+                    if (e.text == "<=") return "lumen_json_le("   + a + ", " + b + ")";
+                    if (e.text == ">")  return "lumen_json_gt("   + a + ", " + b + ")";
+                    if (e.text == ">=") return "lumen_json_ge("   + a + ", " + b + ")";
+                    if (e.text == "==") return "lumen_json_eq("   + a + ", " + b + ")";
+                    return "lumen_json_ne(" + a + ", " + b + ")"; // "!="
+                }
                 if (e.text == "/")
                     return "lumen_div_check(" + expr(*e.lhs) + ", " + expr(*e.rhs) + ")";
                 if (e.text == "%")
                     return "lumen_mod_check(" + expr(*e.lhs) + ", " + expr(*e.rhs) + ")";
                 return "(" + expr(*e.lhs) + " " + operadores_binarios().at(e.text) + " " +
                        expr(*e.rhs) + ")";
+            }
 
             case IrExprKind::Ternary:
                 return "(" + expr(*e.object) + " ? " + expr(*e.lhs) + " : " + expr(*e.rhs) + ")";
@@ -1042,6 +1239,10 @@ public:
                     return valor_json(*e.args[0].value) + ".to_string()";
                 if (e.call_shape == IrCallShape::BuiltinGlobalCall && e.call_name == "len") {
                     auto t = comprobador_.tipo_provable(*e.args[0].value);
+                    // Json (Fase 5.5): puede ser string/List/Dict en tiempo
+                    // de ejecucion -- lumen_json_len() decide, igual que
+                    // fn_len (natives.cpp).
+                    if (es_json_dinamico(*t)) return "lumen_json_len(" + expr(*e.args[0].value) + ")";
                     return t->kind() == Type::Kind::String
                                ? "static_cast<int64_t>(" + expr(*e.args[0].value) + ".size())"
                                : expr(*e.args[0].value) + ".lumen_len()";
@@ -1052,8 +1253,11 @@ public:
                 // fallo real de verdad (lumen_str_to_int, mismo mensaje EXACTO
                 // que fn_int -- error_runtime_prelude) -- el unico de los
                 // tres casos de int(x) que puede tomar el canal de error.
+                // Json (Fase 5.5): lumen_json_as_int() hace la MISMA
+                // comprobacion dinamica que fn_int, en tiempo de ejecucion.
                 if (e.call_shape == IrCallShape::BuiltinGlobalCall && e.call_name == "int") {
                     auto t = comprobador_.tipo_provable(*e.args[0].value);
+                    if (es_json_dinamico(*t)) return "lumen_json_as_int(" + expr(*e.args[0].value) + ")";
                     if (t->kind() == Type::Kind::Int) return expr(*e.args[0].value);
                     if (t->kind() == Type::Kind::String)
                         return "lumen_str_to_int(" + expr(*e.args[0].value) + ")";
@@ -1088,8 +1292,47 @@ public:
             // reprogramando un temporizador de 0ms sin parar (ver el
             // comentario de clamp_sleep_ms en project.cpp).
             case IrExprKind::Await:
-                return "co_await lumen::sleep(lumen_clamp_sleep_ms(" +
-                       expr(*e.lhs->args[0].value) + "))";
+                if (e.lhs->call_shape == IrCallShape::BuiltinGlobalCall)
+                    return "co_await lumen::sleep(lumen_clamp_sleep_ms(" +
+                           expr(*e.lhs->args[0].value) + "))";
+                // await <modulo>.query/exec/last_id(...) (Fase 5.5): mismo
+                // camino que bytecode (lumen_script::await_db(), ver
+                // db.hpp) -- l_pinned_workers/l_last_exec_workers son las
+                // dos variables locales que generar_ruta_nativa() declara
+                // al principio de cualquier ruta asincrona, equivalentes a
+                // los mapas que NativeCtx lleva para una peticion bytecode.
+                // El vector de parametros NUNCA se construye con
+                // `std::vector<Value>{...}` inline aqui -- GCC 13.3 da un
+                // ICE real (internal compiler error en
+                // build_special_member_call) al ver un braced-init-list de
+                // Value como argumento directo de una llamada que se hace
+                // co_await, encontrado compilando la primera ruta con `await
+                // <modulo>.query(...)` de verdad (aislado con un
+                // reproductor minimo antes de descartarlo como error
+                // propio). lumen_db_params(...) (route_runtime_prelude) es
+                // el mismo vector, construido por una llamada de funcion
+                // normal en su lugar -- eso SI compila limpio, confirmado
+                // con el mismo reproductor.
+                {
+                    const IrExpr& call = *e.lhs;
+                    const std::string dbop = call.call_index == db_query_id()   ? "Query"
+                                            : call.call_index == db_exec_id()   ? "Exec"
+                                                                                : "LastId";
+                    std::string sql    = "std::string()";
+                    std::string params = "lumen_db_params()";
+                    if (dbop != "LastId") {
+                        sql = expr(*call.args[0].value);
+                        params = "lumen_db_params(";
+                        for (size_t i = 1; i < call.args.size(); ++i) {
+                            if (i > 1) params += ", ";
+                            params += valor_json(*call.args[i].value);
+                        }
+                        params += ")";
+                    }
+                    return "co_await lumen_script::await_db(lumen_script::DbOp::" + dbop + ", " +
+                           literal_string(call.call_name) + ", req.loop, " + sql + ", " + params +
+                           ", l_pinned_workers, l_last_exec_workers)";
+                }
 
             default:
                 return ""; // inalcanzable: Comprobador ya lo descarto antes de llegar aqui
@@ -1116,7 +1359,14 @@ public:
 
             case IrStmtKind::VarDecl: {
                 registrar(s.slot, s.name);
-                return tipo_cpp(s.decl_type) + " " + nombre_cpp(s.name) + " = " +
+                // El tipo REAL (el que Comprobador registro, ver su caso
+                // VarDecl) no siempre es el declarado -- Fase 5.5: `int
+                // stock = filas[0]["stock"]` genera un `Value stock = ...`,
+                // no un `int64_t`, porque el tipo declarado es decorativo y
+                // Comprobador ya resolvio que el valor real es dinamico.
+                // Cuando coinciden (el caso de siempre) esto no cambia nada.
+                Type tipo_real = s.value ? *comprobador_.tipo_provable(*s.value) : s.decl_type;
+                return tipo_cpp(tipo_real) + " " + nombre_cpp(s.name) + " = " +
                        (s.value ? expr(*s.value) : valor_por_defecto(s.decl_type)) + ";";
             }
 
@@ -1221,6 +1471,10 @@ public:
             return s;
         }
         auto t = comprobador_.tipo_provable(e);
+        // Json (Fase 5.5), o un List<Json>/Dict<string,Json> (mismo
+        // tipo_cpp() que Json, ver native_gen.cpp): la expresion YA es un
+        // Value -- identidad, sin envolver nada.
+        if (es_json_dinamico(*t)) return expr(e);
         switch (t->kind()) {
             case Type::Kind::Int:    return "Value::integer(" + expr(e) + ")";
             case Type::Kind::Float:  return "Value::real(" + expr(e) + ")";
@@ -1644,6 +1898,18 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
     // (que si depende de `params`) se llama despues, mas abajo.
     Generador gen(nombre_por_indice, comprobador, /*ruta=*/true, asincrona);
     std::string cuerpo = "{\n    try {\n";
+    // Fase 5.5: equivalentes locales, para toda la duracion de esta peticion,
+    // de NativeCtx::pinned_workers/last_exec_workers -- lumen_script::
+    // await_db() (db.hpp) los toma por referencia para fijar una consulta a
+    // la misma conexion que abrio una transaccion (todavia sin generar --
+    // begin()/commit()/rollback() no son representables aqui, ver el
+    // comentario grande en COMPILACION-NATIVA.md) o que hizo el ultimo
+    // exec() (para que last_id() lea la conexion correcta). Declarados
+    // siempre que la ruta es asincrona, se usen o no: mas simple que
+    // detectar de antemano si el cuerpo de verdad toca una base de datos, y
+    // el coste de un std::map vacio es insignificante.
+    if (asincrona)
+        cuerpo += "    std::map<std::string, int> l_pinned_workers, l_last_exec_workers;\n";
     for (const auto& p : params) {
         const std::string mapa = p.en_path ? "req.params" : "req.query";
         const std::string nombre = nombre_cpp(p.nombre);
@@ -2074,6 +2340,137 @@ std::string route_runtime_prelude() {
         // comentario de clamp_sleep_ms alli).
         "inline int lumen_clamp_sleep_ms(int64_t ms) {\n"
         "    return ms < 1 ? 1 : static_cast<int>(ms);\n"
+        "}\n"
+        // Fase 5.5: operaciones dinamicas sobre un Json (el Value que
+        // devuelve `await <modulo>.query/exec/last_id(...)`) -- misma
+        // semantica EXACTA que vm.cpp (numeric_pair()/compare()/
+        // Op::Add/Sub/Mul/Div/Mod/Eq/Ne/GetIndex), mismos mensajes de
+        // error, mismo canal (lumen_native_fail -- atrapado por el
+        // try/catch de la ruta, ver generar_ruta_nativa). Un valor de base
+        // de datos no tiene un tipo fijo demostrable en tiempo de
+        // compilacion (el driver puede fallar y devolver una forma
+        // distinta), asi que estas decisiones se resuelven aqui, en tiempo
+        // de ejecucion, exactamente como lo haria el interprete sobre el
+        // mismo Value -- no una version mas permisiva ni mas estricta.
+        "inline bool lumen_json_numeric_pair(const Value& a, const Value& b) {\n"
+        "    return a.is_num() && b.is_num();\n"
+        "}\n"
+        "inline Value lumen_json_add(const Value& a, const Value& b) {\n"
+        "    if (a.is_str() && b.is_str()) return Value::str(a.as_str() + b.as_str());\n"
+        "    if (a.is_str() || b.is_str())\n"
+        "        lumen_native_fail(std::string(\"no se puede sumar \") + a.type_name() + \" y \" +\n"
+        "                          b.type_name() +\n"
+        "                          \"; para concatenar usa str(): \\\"...\\\" + str(x)\");\n"
+        "    if (lumen_json_numeric_pair(a, b)) {\n"
+        "        if (a.is_int() && b.is_int()) return Value::integer(a.as_int() + b.as_int());\n"
+        "        return Value::real(a.as_float() + b.as_float());\n"
+        "    }\n"
+        "    if (a.is_list() && b.is_list()) {\n"
+        "        Value::List out = a.as_list();\n"
+        "        for (const auto& v : b.as_list()) out.push_back(v);\n"
+        "        return Value::list(std::move(out));\n"
+        "    }\n"
+        "    lumen_native_fail(std::string(\"no se puede sumar \") + a.type_name() + \" y \" +\n"
+        "                      b.type_name());\n"
+        "}\n"
+        "inline Value lumen_json_arit(const Value& a, const Value& b, char op) {\n"
+        "    if (!lumen_json_numeric_pair(a, b))\n"
+        "        lumen_native_fail(std::string(\"operacion aritmetica entre \") + a.type_name() +\n"
+        "                          \" y \" + b.type_name());\n"
+        "    bool ints = a.is_int() && b.is_int();\n"
+        "    if (op == '%') {\n"
+        "        if (!ints) lumen_native_fail(\"'%' solo aplica a enteros\");\n"
+        "        if (b.as_int() == 0) lumen_native_fail(\"modulo por cero\");\n"
+        "        return Value::integer(a.as_int() % b.as_int());\n"
+        "    }\n"
+        "    if (op == '/') {\n"
+        "        if (b.as_float() == 0) lumen_native_fail(\"division por cero\");\n"
+        "        if (ints && a.as_int() % b.as_int() == 0) return Value::integer(a.as_int() / b.as_int());\n"
+        "        return Value::real(a.as_float() / b.as_float());\n"
+        "    }\n"
+        "    if (ints) {\n"
+        "        long long x = a.as_int(), y = b.as_int();\n"
+        "        return Value::integer(op == '-' ? x - y : x * y);\n"
+        "    }\n"
+        "    double x = a.as_float(), y = b.as_float();\n"
+        "    return Value::real(op == '-' ? x - y : x * y);\n"
+        "}\n"
+        "inline int lumen_json_compare(const Value& a, const Value& b) {\n"
+        "    if (lumen_json_numeric_pair(a, b)) {\n"
+        "        if (a.is_int() && b.is_int()) {\n"
+        "            long long x = a.as_int(), y = b.as_int();\n"
+        "            return x < y ? -1 : (x > y ? 1 : 0);\n"
+        "        }\n"
+        "        double x = a.as_float(), y = b.as_float();\n"
+        "        return x < y ? -1 : (x > y ? 1 : 0);\n"
+        "    }\n"
+        "    if (a.is_str() && b.is_str()) {\n"
+        "        int c = a.as_str().compare(b.as_str());\n"
+        "        return c < 0 ? -1 : (c > 0 ? 1 : 0);\n"
+        "    }\n"
+        "    lumen_native_fail(std::string(\"no se pueden comparar \") + a.type_name() + \" y \" +\n"
+        "                      b.type_name());\n"
+        "}\n"
+        "inline bool lumen_json_lt(const Value& a, const Value& b) { return lumen_json_compare(a, b) < 0; }\n"
+        "inline bool lumen_json_le(const Value& a, const Value& b) { return lumen_json_compare(a, b) <= 0; }\n"
+        "inline bool lumen_json_gt(const Value& a, const Value& b) { return lumen_json_compare(a, b) > 0; }\n"
+        "inline bool lumen_json_ge(const Value& a, const Value& b) { return lumen_json_compare(a, b) >= 0; }\n"
+        "inline bool lumen_json_eq(const Value& a, const Value& b) { return a.equals(b); }\n"
+        "inline bool lumen_json_ne(const Value& a, const Value& b) { return !a.equals(b); }\n"
+        // GetIndex (vm.cpp): cual de las dos formas (List/Dict) decide el
+        // OBJETO en tiempo de ejecucion, no el indice -- el indice solo
+        // dice si esta ruta espera un acceso de List (int) o de Dict
+        // (string), ver Comprobador::tipo_provable caso Index.
+        "inline Value lumen_json_index_int(const Value& obj, int64_t idx) {\n"
+        "    if (obj.is_list()) {\n"
+        "        auto& l = obj.as_list();\n"
+        "        if (idx < 0 || idx >= (int64_t)l.size())\n"
+        "            lumen_native_fail(\"indice fuera de rango: \" + std::to_string(idx) +\n"
+        "                              \" (tamano \" + std::to_string(l.size()) + \")\");\n"
+        "        return l[(size_t)idx];\n"
+        "    }\n"
+        "    if (obj.is_dict()) lumen_native_fail(\"la clave de un Dict tiene que ser string\");\n"
+        "    lumen_native_fail(std::string(\"no se puede indexar \") + obj.type_name());\n"
+        "}\n"
+        "inline Value lumen_json_index_str(const Value& obj, const std::string& key) {\n"
+        "    if (obj.is_dict()) {\n"
+        "        auto& d = obj.as_dict();\n"
+        "        auto it = d.find(key);\n"
+        "        return it == d.end() ? Value::null() : it->second;\n"
+        "    }\n"
+        "    if (obj.is_list()) lumen_native_fail(\"el indice de una List tiene que ser int\");\n"
+        "    lumen_native_fail(std::string(\"no se puede indexar \") + obj.type_name());\n"
+        "}\n"
+        // len()/int() sobre un Json -- mismas reglas que fn_len/fn_int
+        // (natives.cpp).
+        "inline int64_t lumen_json_len(const Value& v) {\n"
+        "    if (v.is_str())  return (int64_t)v.as_str().size();\n"
+        "    if (v.is_list()) return (int64_t)v.as_list().size();\n"
+        "    if (v.is_dict()) return (int64_t)v.as_dict().size();\n"
+        "    lumen_native_fail(std::string(\"len() no aplica a \") + v.type_name());\n"
+        "}\n"
+        "inline int64_t lumen_json_as_int(const Value& v) {\n"
+        "    if (v.is_int())   return v.as_int();\n"
+        "    if (v.is_float()) return (int64_t)v.as_float();\n"
+        "    if (v.is_bool())  return v.as_bool() ? 1 : 0;\n"
+        "    if (v.is_str())   return lumen_str_to_int(v.as_str());\n"
+        "    lumen_native_fail(std::string(\"int() no aplica a \") + v.type_name());\n"
+        "}\n"
+        // Los parametros de `await <modulo>.query/exec(sql, ...)` -- NUNCA
+        // se construyen con `std::vector<Value>{...}` directo en la
+        // llamada a await_db() que se hace co_await: GCC 13.3 da un
+        // internal compiler error real ahi (build_special_member_call) con
+        // un braced-init-list de Value como argumento inline de una
+        // llamada co_await-eada -- confirmado con un reproductor minimo,
+        // no un error de este generador. Una funcion normal que devuelve
+        // el mismo vector SI compila limpio (ver Generador::expr, caso
+        // Await).
+        "template <class... Args>\n"
+        "inline std::vector<Value> lumen_db_params(Args&&... args) {\n"
+        "    std::vector<Value> v;\n"
+        "    v.reserve(sizeof...(args));\n"
+        "    (v.push_back(std::forward<Args>(args)), ...);\n"
+        "    return v;\n"
         "}\n";
 }
 

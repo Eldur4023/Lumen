@@ -1378,37 +1378,98 @@ arriba, contra el binario real). `bench/lumen/app.lum` pasa de 3 a 4 rutas nativ
 (`/slow/:ms` se suma a `/health`, `/compute/fib/:n`, `/compute/primes/:n`). 79/79 del corpus y las 8
 suites de `ctest` en verde.
 
-**Por qué `await sqlite.query(...)`/`exec(...)` NO son el siguiente paso natural — un límite
-arquitectónico real, no falta de tiempo.** La tentación es tratar una consulta como "`sleep()` pero
-con un valor de retorno". No lo es. `run_db()` (project.cpp) devuelve SIEMPRE un `Value` dinámico —
-pero cuál exactamente depende de si el driver tuvo éxito: `List<Json>` para `query()`, `int` para
-`exec()`/`last_id()`... salvo que el driver falle, en cuyo caso CUALQUIERA de ellos devuelve
-`db_error(msg)`, un `Dict` con `{"error": msg}` — **sin pasar por el canal de error de la VM**: "un
-fallo del motor no revienta el handler; llega como un valor con `error`, que el `.lum` puede mirar o
-dejar pasar" (comentario original de `run_db`). Es decir: `List<Json> filas = await
-sqlite.query(...)` puede legítimamente, en tiempo de ejecución, dejar en `filas` un `Dict`, no una
-`List` — el propio lenguaje lo permite (dinámicamente tipado) y el framework lo usa a propósito (para
-que el `.lum` decida qué hacer con el fallo, en vez de que decida el runtime). `tipo_provable()`
-exige exactamente lo contrario: que el tipo de una expresión sea el MISMO siempre, demostrado, no
-"normalmente, salvo fallo de I/O" — es el invariante que motivó las dos correcciones críticas de más
-arriba, y una consulta de base de datos lo rompe por diseño, no por descuido.
+**`await sqlite.query(...)`/`exec(...)`/`last_id()` — el slot `Value` dinámico, construido como su
+propio incremento deliberado.** La primera versión de este documento dejó esto fuera, con el
+argumento de que `run_db()` devuelve un `Value` cuyo tipo real depende de si el driver tuvo éxito
+(`List<Json>` o, si falla, un `Dict` con `{"error": msg}`, **sin pasar por el canal de error de la
+VM**) — exactamente lo que `tipo_provable()` está diseñado para rechazar (un tipo que no es SIEMPRE
+el mismo). Ese análisis seguía siendo correcto; lo que cambió fue la conclusión: en vez de dejarlo
+fuera, se construyó la única representación honesta que puede sostenerlo — un `Type::Kind::Json`
+que ya existía como centinela puntual (el valor de retorno de una ruta) pasa a ser un tipo nativo de
+pleno derecho, respaldado por `lumen_script::Value` de verdad, con sus propias reglas de
+indexado/aritmética/comparación resueltas en tiempo de ejecución — exactamente del tamaño que se
+había estimado (el de la Fase 2), construido con la misma disciplina (un operador a la vez,
+verificado contra `vm.cpp` línea a línea, probado contra HTTP real con datos reales).
 
-La única forma honesta de representar esto sería un slot nativo `Value` de verdad — no `LList<T>`/
-`LDict<V>` tipados, sino el mismo tipo dinámico que ya usa el puente de retorno de una ruta
-(`Generador::valor_json`) — y hacer que TODA operación sobre él (indexado, iteración, lectura de
-campo) sea dinámica, con la misma semántica exacta que `vm.cpp` (incluida su gestión de errores en
-tiempo de ejecución: indexar un campo que no existe, o tratar un `Dict` como si fuera una `List`).
-Eso no es "añadir un caso más" a `Comprobador`/`Generador` — es una segunda vía de ejecución dentro de
-la vía nativa, con su propio conjunto de reglas, del tamaño de la Fase 2 entera. Fuera de proporción
-para lo que este incremento puede permitirse sin arriesgar la misma clase de fallo silencioso que ya
-se pagó dos veces. **Decisión: `await` sobre un módulo de base de datos (`query`/`exec`/`last_id`/
-`begin`/`commit`/`rollback`) queda fuera de esta fase — una ruta que lo use sigue cayendo entera a
-bytecode, exactamente como hoy.** No es una limitación temporal a resolver "cuando haya tiempo": es
-un límite del modelo de tipos nativos tal como existe, y cualquier intento de saltárselo reproduciría
-el mismo patrón de fallo que motivó las correcciones críticas anteriores. Si en el futuro hace falta
-de verdad, el camino es diseñar ese slot `Value` dinámico como su propio incremento deliberado — con
-la misma disciplina de esta fase (probar el caso incómodo, verificar contra HTTP real) — no
-improvisarlo dentro de esta.
+*El tipo.* `tipo_cpp(Json)` es `Value` — no una plantilla nueva. Un `List<Json>`/`Dict<string,Json>`
+(la forma declarada de una fila o una tabla) se representa IGUAL, no como `LList<Value>`/
+`LDict<Value>`: esas dos plantillas existen para contenedores HOMOGÉNEOS de tipo fijo (§8), y aquí
+el propio `Value` ya sabe ser una lista o un diccionario por su cuenta — envolverlo en otra caja no
+añadiría nada. `es_json_dinamico(Type)` trata las tres formas (`Json` suelto, `List<Json>`,
+`Dict<string,Json>`) como una sola cosa en todo el generador, para no triplicar cada caso.
+
+*De dónde sale un Json.* Solo de `await <módulo>.query/exec/last_id(...)` — nunca de una función
+suelta ni de un parámetro declarado `Json` a mano (aunque, una vez que existe, SÍ puede pasarse como
+argumento a otra función nativa: `tipo_soportado`/`tipo_provable` no le ponen ninguna barrera
+especial ahí, `Type::operator==` ya trata dos `Json` como el mismo tipo). `begin()`/`commit()`/
+`rollback()` siguen sin representación: coordinar el cierre de una transacción pendiente al final de
+una ruta (el `rollback_pendientes()` que ya hace `build_routes()` para bytecode) es trabajo aparte,
+no necesario para que `query`/`exec`/`last_id` sean correctos por sí solos — una ruta que abre una
+transacción sigue cayendo entera a bytecode.
+
+*`VarDecl` deja de fiarse del tipo declarado cuando el valor real es Json.* `int stock =
+filas[0]["stock"]` es Lumen válido — el tipo declarado es decorativo, Lumen Script nunca lo exige en
+la asignación, solo en el uso (§ el resto de este documento ya lo explica largo y tendido) — así que
+`Comprobador::stmt_compilable` registra el tipo REAL de la ranura (`Json`, no `Int`) cuando el valor
+inicial es Json, sea cual sea la anotación; toda reasignación futura de esa ranura tiene que
+demostrar Json también (la misma regla de inducción de siempre, sin excepción nueva). El `Value
+stock = ...;` que sale de `Generador::stmt` en vez de un `int64_t stock = ...;` es la consecuencia
+directa, no un caso aparte.
+
+*Indexado, aritmética y comparación se resuelven en tiempo de ejecución, con la MISMA lógica que
+`vm.cpp`, no una versión más permisiva ni más estricta.* `lumen_json_index_int`/`_str` reproducen
+`Op::GetIndex` (una `List` con clave string, o una `Dict` con clave int, fallan con el MISMO mensaje;
+una clave de `Dict` ausente da `null`, nunca un error). `lumen_json_add`/`_arit`/`_compare` reproducen
+`Op::Add`/`Sub`/`Mul`/`Div`/`Mod`/`Lt`/`Le`/`Gt`/`Ge` (`numeric_pair()`/`compare()` de `vm.cpp`,
+mensajes de error incluidos). `lumen_json_eq`/`_ne` son `Value::equals()` directo. Todos usan
+`lumen_native_fail()` — el MISMO canal que división/módulo por cero — así que el try/catch que ya
+envuelve cualquier ruta (la corrección crítica de más arriba) los atrapa sin necesitar nada nuevo:
+añadir el primer conjunto de operaciones Json que puede fallar de verdad no reabrió ningún hueco,
+otra vez. `len()`/`str()`/`int()` se extendieron con el mismo criterio (`lumen_json_len`, mismas
+reglas que `fn_len`; `str()` reusa `Generador::valor_json()`, que ahora trata Json como identidad;
+`int()` con `lumen_json_as_int`, mismas reglas que `fn_int`).
+
+*Enlazar bytecode y `--native` al MISMO código, no a una reproducción aparte.* `run_db()`
+(`project.cpp`) tenía toda la lógica real de una suspensión de base de datos atada a `VM::Result`/
+`NativeCtx`. Extraída a `lumen_script::await_db()` (`db.hpp`/`db.cpp`, un `DbOp` en vez del
+`native_id` de turno, los mapas `pinned_workers`/`last_exec_workers` por referencia en vez de un
+`NativeCtx` entero) — `run_db()` pasa a ser un adaptador delgado sobre esto, y el código que genera
+una ruta nativa llama exactamente a la misma función. Una ruta asíncrona declara sus propios
+`l_pinned_workers`/`l_last_exec_workers` locales (equivalentes a los de `NativeCtx`, vivos durante
+toda la petición) — necesarios de verdad solo para encadenar `exec()` con `last_id()` sobre la MISMA
+conexión (`last_insert_rowid()` es específico de la conexión que hizo el `INSERT`), pero declarados
+siempre que la ruta es asíncrona, se usen o no: más simple que detectar de antemano si el cuerpo
+toca una base de datos.
+
+*Un ICE real de GCC 13.3, no un error propio, encontrado al compilar la primera ruta con `await
+sqlite.query(...)` de verdad.* `g++` fallaba con "internal compiler error: in
+build_special_member_call" al ver un `std::vector<Value>{...}` (con al menos un elemento)
+construido DIRECTAMENTE como argumento de una llamada que se hace `co_await` — aislado con un
+reproductor mínimo hasta confirmar que ni el vector, ni los locales previos al `await`, ni el
+try/catch, eran la causa por separado: la combinación exacta "braced-init-list de `Value` como
+argumento inline de una llamada co-awaited" sí, de forma reproducible. Una llamada de función
+NORMAL que construye y devuelve el mismo vector no lo dispara — `lumen_db_params(a, b, ...)`
+(variádica, con un *fold expression*) es exactamente eso, y con ella el mismo código compila limpio.
+Documentado aquí porque es la clase de hallazgo que un futuro cambio de compilador podría revertir
+sin previo aviso: si algún día esto vuelve a fallar de la misma forma, la causa ya está identificada.
+
+*Verificación.* `bench/lumen/app.lum` pasa de 4 a 10 rutas nativas: las seis que tocan `sqlite` con
+`query`/`last_id` sin transacción (`/users/:id`, `/users`, `/products/:id`, `/products`,
+`/orders/:id`, `/stats/sales`) se suman a las cuatro de antes. Verificado con las dos vías
+compitiendo lado a lado, con el `seed.db` real del banco de pruebas (5000 usuarios, productos y
+pedidos reales) sirviendo HTTP de verdad: paginación, `JOIN`s de tres tablas, `GROUP BY`/`SUM`/
+`COUNT` con `ORDER BY`/`LIMIT`, objetos anidados construidos a mano (`{"user": {...}, "product":
+{...}}`) y los casos de error (404 de fila inexistente, 400 de paginación inválida) — respuesta
+IDÉNTICA, byte a byte, en las dos vías, en cada caso. `POST /users`/`POST /products`/`PUT
+/products/:id` siguen en bytecode (el parámetro es una clase, con o sin campos opcionales — fuera de
+esta fase); `POST /orders` sigue en bytecode (usa `begin()`/`commit()`, sin representación
+todavía); `/counter/*`/`/payload/:n` siguen en bytecode por razones ajenas a esto (no relacionadas
+con `sqlite`). `tests/native_route_shadow.cpp` gana una ruta (`/db/:id`) que solo comprueba que
+COMPILA como asíncrona (vía `rutas_informe`, Fase 6) — ejecutarla en la prueba aislada, sin un
+*event loop* real, se quedaría colgada para siempre (`DbAwaitable`, a diferencia de
+`SleepAwaitable`, no tiene atajo sin *loop*: SIEMPRE reanuda desde el hilo del `DbPool` vía
+`loop->post(...)`) — la ejecución de verdad es la de arriba, contra el binario real. 79/79 del
+corpus y las 8 suites de `ctest` en verde.
 
 ### Fase 6 — Empaquetado y modo mixto
 - `--native` de punta a punta: caché, `.so`, `dlopen`, informe de arranque, diagnóstico
@@ -1422,16 +1483,16 @@ se decide ruta por ruta, de forma independiente, desde que `build_routes()` gan�
 ruta que no compila a nativo simplemente no aparece en `NativeModule::rutas_por_indice`/
 `rutas_async_por_indice`, y cae al `Nivel 2` (VM) con exactamente el mismo camino que tenía antes de
 que `--native` existiera. Lo que sí faltaba era el **diagnóstico explícito**: el arranque solo daba
-un conteo agregado ("2 función(es), 4 ruta(s) compiladas"), sin decir CUÁLES de las 16 rutas con
-lógica son esas 4. Añadido con `Module::rutas_informe` (`RutaInforme{metodo, patron, via}`,
-`via ∈ {declarativa, nativa, nativa (async), bytecode, ws, sse}`), rellenado en cada uno de los seis
-puntos donde `build_routes()` ya decide/registra un handler — no una comprobación nueva, solo anotar
-la decisión que cada rama ya toma. `main.cpp`, con `--native`, imprime una línea por ruta con
-lógica (omite declarativas/`ws`/`sse`: esas nunca dependen de si `--native` compiló algo). Contra
-`bench/lumen/app.lum` esto hace evidente, sin adivinar ni leer el código fuente, exactamente el
-límite documentado arriba: las diez rutas que tocan `sqlite` (`/users`, `/products`, `/orders`,
-`/stats/sales`, `/counter`, `/payload/:n`) se listan `bytecode`, las tres puras (`/compute/fib/:n`,
-`/compute/primes/:n`) `nativa`, y `/slow/:ms` (el único `await` que compila) `nativa (async)`. 79/79
+un conteo agregado, sin decir CUÁLES rutas son esas. Añadido con `Module::rutas_informe`
+(`RutaInforme{metodo, patron, via}`, `via ∈ {declarativa, nativa, nativa (async), bytecode, ws,
+sse}`), rellenado en cada uno de los seis puntos donde `build_routes()` ya decide/registra un
+handler — no una comprobación nueva, solo anotar la decisión que cada rama ya toma. `main.cpp`, con
+`--native`, imprime una línea por ruta con lógica (omite declarativas/`ws`/`sse`: esas nunca dependen
+de si `--native` compiló algo). En el momento de escribir esto (antes del incremento de base de
+datos que sigue más abajo), contra `bench/lumen/app.lum`: las diez rutas que tocan `sqlite` se
+listaban `bytecode`, las tres puras `nativa`, y `/slow/:ms` `nativa (async)` — la utilidad de este
+diagnóstico quedó demostrada enseguida, cuando pasó a hacer evidente, sin adivinar ni leer código,
+exactamente CUÁLES de esas diez seguían sin compilar tras ese incremento y por qué. 79/79
 del corpus y las 8 suites de `ctest` en verde.
 
 ### Fase 7 — Optimización

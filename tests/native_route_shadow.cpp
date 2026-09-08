@@ -79,7 +79,19 @@ static Resultado pedir(Module& mod, const std::string& metodo, const std::string
 }
 
 int main() {
+    const auto dir_db = std::filesystem::temp_directory_path() / "lumen_native_route_check";
+    std::error_code ec_db;
+    std::filesystem::create_directories(dir_db, ec_db);
+    const auto archivo_db = dir_db / "sqlite_check.db";
+    std::filesystem::remove(archivo_db, ec_db);
+
     const std::string src =
+        "import sqlite\n"
+        "\n"
+        "app:\n"
+        "    sqlite:\n"
+        "        file \"" + archivo_db.string() + "\"\n"
+        "\n"
         "fn int fib(int n):\n"
         "    if n < 2:\n"
         "        return n\n"
@@ -129,7 +141,15 @@ int main() {
         "get endpoint(\"/espera/:ms\", int ms):\n"
         "    require ms >= 0 and ms <= 3000 else status(400)\n"
         "    await sleep(ms)\n"
-        "    return { \"waited_ms\": ms }\n";
+        "    return { \"waited_ms\": ms }\n"
+        "\n"
+        "get endpoint(\"/db/:id\", int id):\n"
+        "    List<Json> filas = await sqlite.query(\"select id, nombre from cosas where id = ?\", id)\n"
+        "    if len(filas) == 0:\n"
+        "        return status(404)\n"
+        "    Json fila = filas[0]\n"
+        "    int fid = fila[\"id\"]\n"
+        "    return { \"id\": fid, \"nombre\": fila[\"nombre\"] }\n";
 
     const auto dir  = std::filesystem::temp_directory_path() / "lumen_native_route_check";
     std::error_code ec;
@@ -180,6 +200,30 @@ int main() {
     }
 
     bool ok = true;
+
+    // Fase 5.5: `/db/:id` (List<Json>/Json/indexado/len() sobre el
+    // resultado de `await sqlite.query(...)`) tiene que compilar como ruta
+    // asincrona -- SOLO se comprueba que compilo (rutas_informe, Fase 6),
+    // no se ejecuta: un await sobre DbAwaitable de verdad suspende sobre un
+    // DbPool y solo se reanuda cuando el EventLoop real hace
+    // loop->post(...) -- esta prueba no tiene uno (a diferencia de `await
+    // sleep()`, que se reanuda al acto sin loop, ver SleepAwaitable), asi
+    // que ejecutarla aqui se quedaria colgada para siempre en vez de fallar
+    // limpio. La ejecucion de verdad (con datos reales, contra el binario
+    // real sirviendo HTTP) esta verificada a mano -- ver COMPILACION-NATIVA.md.
+    {
+        std::string via;
+        for (const auto& r : mod_nat->rutas_informe)
+            if (r.patron == "/db/:id") { via = r.via; break; }
+        if (via != "nativa (async)") {
+            std::printf("  FALLA /db/:id: se esperaba 'nativa (async)', rutas_informe dice "
+                        "'%s'\n", via.empty() ? "(no aparece)" : via.c_str());
+            ok = false;
+        } else {
+            std::printf("  ok    /db/:id compila como ruta asincrona (await sqlite.query + "
+                        "Json + indexado + len())\n");
+        }
+    }
     auto comparar = [&](const char* etiqueta, const std::string& path) {
         Resultado bc  = pedir(*mod_bc, "GET", path);
         Resultado nat = pedir(*mod_nat, "GET", path);
