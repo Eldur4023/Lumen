@@ -118,6 +118,7 @@ add_library(lumen_script STATIC
     src/lumen_script/plantilla.cpp
     src/lumen_script/natives.cpp
     src/lumen_script/emitter.cpp
+    src/lumen_script/native_gen.cpp
     src/lumen_script/vm.cpp
     src/lumen_script/autotest.cpp
     src/lumen_script/project.cpp
@@ -210,6 +211,13 @@ add_test(NAME check_stmt_shadow COMMAND prueba_check_stmt)
 add_executable(prueba_emit_ir tests/emit_ir_shadow.cpp)
 target_link_libraries(prueba_emit_ir PRIVATE lumen_script)
 add_test(NAME emit_ir_shadow COMMAND prueba_emit_ir)
+
+# Fase 2 de --native: genera C++ real desde el IR, lo compila con el
+# compilador del sistema (invoca `g++` como subproceso) y compara su
+# ejecucion contra la VM -- el criterio de aceptacion de la fase.
+add_executable(prueba_native_gen tests/native_gen_shadow.cpp)
+target_link_libraries(prueba_native_gen PRIVATE lumen_script)
+add_test(NAME native_gen_shadow COMMAND prueba_native_gen)
 
 # El traductor de marcadores de postgres es una funcion pura: se prueba sin
 # servidor incluyendo el .cpp del driver, para probar EL codigo y no una copia.

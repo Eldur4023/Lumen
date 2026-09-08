@@ -625,6 +625,36 @@ backends por igual.
   idénticos a la VM, y `bench/` mide el salto de rendimiento esperado frente a Go. **Esta fase
   es la que valida o tumba la tesis entera del documento**, y llega pronto a propósito.
 
+**Primer corte hecho.** `include/lumen_script/native_gen.hpp` + `src/lumen_script/native_gen.cpp`:
+`generar_funcion_nativa(fn, body, nombre_por_indice)` genera el C++ de una función a partir de
+su `IrBlock` ya construido por `check_function` — no traduce nodo a nodo de forma genérica,
+sino que reconoce directamente `int`→`int64_t`, `float`→`double`, `bool`→`bool`, y el control de
+flujo (`if`/`while`/`return`/`break`/`continue`/asignación/declaración) como construcciones C++
+literales. Todo lo que queda fuera de "primitivos y control de flujo" (`string`, `List`/`Dict`,
+clases, `for` — itera una `List` —, `await`, `try`, cualquier `IrCallShape` que no sea
+`UserFunctionCall`) hace que la función entera devuelva `std::nullopt`: **no hay generación
+parcial**, ni intento de forzar algo que esta fase no sabe representar todavía.
+
+Un detalle que sólo apareció al escribir el generador de verdad: `IrStmt::Assign` (forma
+`Local`) sólo lleva `assign_slot` (un número, lo único que necesita el bytecode) — no un nombre.
+Para C++ hace falta el nombre real, así que el generador lleva su propia tabla ranura→nombre,
+sembrada con los parámetros (la ranura *i*-ésima es siempre el parámetro *i*-ésimo, por cómo los
+declara `check_function`) y actualizada en cada `VarDecl` que genera.
+
+**Validado de punta a punta, no con un PoC escrito a mano esta vez**: `tests/native_gen_shadow.cpp`
+(`ctest -R native_gen_shadow`) toma las `fib`/`cuenta_primos` exactas de `bench/lumen/app.lum`,
+las compila con la vía real (`emit_function` → VM) *y* genera su C++ con `generar_funcion_nativa`,
+invoca `g++` de verdad como subproceso, ejecuta el binario resultante, y compara su salida contra
+la VM para varias entradas (`fib(10/25/30)`, `cuenta_primos(1000/100000)`) — coinciden en todos
+los casos. Es la primera vez que este documento valida su tesis central con el compilador real
+en vez de con código escrito a mano para la ocasión (ese PoC, en `experiments/native_poc/`, sigue
+siendo válido como primera señal, pero éste es el generador de verdad).
+
+Pendiente de esta fase: invocar el compilador de C++ desde el propio `lumen` (no sólo desde una
+prueba), enlazar el resultado, y repetir la medición de `bench/` con el camino real en vez del
+PoC a mano — hasta ahora sólo se validó *corrección*, no se remidió *rendimiento* con el
+generador real.
+
 ### Fase 3 — Tipos compuestos y clases
 - `string`, `List<T>`, `Dict<K,V>` con representación nativa tipada (§7).
 - Clases de usuario como structs con layout fijo, **con semántica de referencia** (§8).
