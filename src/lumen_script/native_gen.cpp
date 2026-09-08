@@ -266,19 +266,48 @@ public:
         return t && es_escalar_json(t->kind());
     }
 
-    // `require cond else status(N)`: el patron de guarda mas comun (ver el
-    // banco de pruebas). status() global escribe la respuesta el mismo
-    // (vm.cpp/natives.cpp: codigo + cuerpo vacio) y no produce ningun valor
-    // que comparar contra el tipo de retorno -- reconocido aqui a mano,
-    // porque tipo_provable() todavia no sabe nada de BuiltinGlobalCall en
-    // general (fuera de alcance de este corte: text()/html()/json()/
-    // redirect()/send_file() quedan para cuando haga falta).
-    bool es_llamada_status(const IrExpr& e) const {
+    // `require cond else status(N)` (el patron de guarda mas comun, ver el
+    // banco de pruebas) y sus hermanos -- las seis funciones globales de
+    // natives.cpp que escriben la respuesta ELLAS MISMAS y devuelven `null`
+    // (`ctx.response_written = true`, nunca un valor que comparar contra el
+    // tipo de retorno): reconocidas aqui a mano, porque tipo_provable()
+    // todavia no sabe nada de BuiltinGlobalCall en general. Cada argumento
+    // se exige demostrable con la MISMA regla que usaria su lugar en la
+    // ABI/en un valor de retorno -- `text`/`html` solo escalares (son
+    // texto/numero, no una estructura), `json` cualquier cosa que
+    // es_valor_json() ya sepa serializar.
+    bool es_llamada_respuesta(const IrExpr& e) const {
         if (e.kind != IrExprKind::Call || e.call_shape != IrCallShape::BuiltinGlobalCall)
             return false;
-        if (e.call_name != "status" || e.args.size() != 1 || !e.args[0].value) return false;
-        auto t = tipo_provable(*e.args[0].value);
-        return t && t->kind() == Type::Kind::Int;
+        const auto& a = e.args;
+        if (e.call_name == "status") {
+            if (a.size() != 1 || !a[0].value) return false;
+            auto t = tipo_provable(*a[0].value);
+            return t && t->kind() == Type::Kind::Int;
+        }
+        if (e.call_name == "text" || e.call_name == "html") {
+            if (a.size() != 1 || !a[0].value) return false;
+            auto t = tipo_provable(*a[0].value);
+            return t && es_escalar_json(t->kind());
+        }
+        if (e.call_name == "json") return a.size() == 1 && a[0].value && es_valor_json(*a[0].value);
+        if (e.call_name == "redirect") {
+            if (a.empty() || a.size() > 2 || !a[0].value) return false;
+            auto destino = tipo_provable(*a[0].value);
+            if (!destino || destino->kind() != Type::Kind::String) return false;
+            if (a.size() == 2) {
+                if (!a[1].value) return false;
+                auto codigo = tipo_provable(*a[1].value);
+                if (!codigo || codigo->kind() != Type::Kind::Int) return false;
+            }
+            return true;
+        }
+        if (e.call_name == "send_file") {
+            if (a.size() != 1 || !a[0].value) return false;
+            auto t = tipo_provable(*a[0].value);
+            return t && t->kind() == Type::Kind::String;
+        }
+        return false;
     }
 
     // Nullopt si no se puede demostrar; si no, el Type exacto que el VM
@@ -593,10 +622,12 @@ public:
                 // Type::Kind::Json es el centinela de "esto es una ruta,
                 // no una funcion" (ver generar_ruta_nativa): el valor de
                 // retorno se serializa a JSON, asi que no tiene que
-                // demostrar un Type nativo concreto, solo ser
-                // construible como Value (es_valor_json()).
+                // demostrar un Type nativo concreto -- basta con ser
+                // construible como Value (es_valor_json()) o ser una de las
+                // llamadas que escriben la respuesta ellas mismas
+                // (es_llamada_respuesta(), p.ej. "return status(404)").
                 if (retorno_fn.kind() == Type::Kind::Json)
-                    return !s.value || es_valor_json(*s.value);
+                    return !s.value || es_llamada_respuesta(*s.value) || es_valor_json(*s.value);
                 if (!s.value) return retorno_fn.kind() == Type::Kind::Void;
                 auto t = tipo_provable(*s.value);
                 return t && *t == retorno_fn;
@@ -714,10 +745,10 @@ public:
             case IrStmtKind::Require: {
                 if (!s.value || !tipo_provable(*s.value).has_value()) return false;
                 if (!s.target) return false;
-                // "else status(N)" escribe la respuesta el mismo -- no
-                // produce ningun valor que comparar, ver
-                // es_llamada_status().
-                if (es_llamada_status(*s.target)) return true;
+                // "else status(N)"/"else text(...)"/... escribe la
+                // respuesta el mismo -- no produce ningun valor que
+                // comparar, ver es_llamada_respuesta().
+                if (es_llamada_respuesta(*s.target)) return true;
                 if (retorno_fn.kind() == Type::Kind::Json) return es_valor_json(*s.target);
                 auto t = tipo_provable(*s.target);
                 return t && *t == retorno_fn;
@@ -959,6 +990,8 @@ public:
     std::string stmt(const IrStmt& s, int indent) {
         switch (s.kind) {
             case IrStmtKind::Return:
+                if (ruta_ && s.value && comprobador_.es_llamada_respuesta(*s.value))
+                    return codigo_llamada_respuesta(*s.value) + "; return;";
                 if (ruta_) return respuesta_de_retorno(s.value.get());
                 return s.value ? ("return " + expr(*s.value) + ";") : "return;";
 
@@ -1025,13 +1058,12 @@ public:
             }
 
             case IrStmtKind::Require:
-                if (ruta_ && comprobador_.es_llamada_status(*s.target))
-                    // status(N) escribe la respuesta el mismo (mismo texto
-                    // que fn_status en natives.cpp: codigo + cuerpo vacio,
-                    // sin Content-Type) -- no hay ningun valor que
-                    // serializar.
-                    return "if (!(" + expr(*s.value) + ")) { res.status(" +
-                           expr(*s.target->args[0].value) + ").send(\"\"); return; }";
+                if (ruta_ && comprobador_.es_llamada_respuesta(*s.target))
+                    // "else status(N)"/"else text(...)"/... escribe la
+                    // respuesta el mismo (mismo texto que su fn_* en
+                    // natives.cpp) -- no hay ningun valor que serializar.
+                    return "if (!(" + expr(*s.value) + ")) { " +
+                           codigo_llamada_respuesta(*s.target) + "; return; }";
                 if (ruta_)
                     return "if (!(" + expr(*s.value) + ")) { " +
                            respuesta_de_retorno(s.target.get()) + " }";
@@ -1080,6 +1112,34 @@ public:
             case Type::Kind::String: return "Value::str(" + expr(e) + ")";
             default: return ""; // inalcanzable: es_valor_json() ya lo descarto
         }
+    }
+
+    // El texto C++ (sin `return;` -- lo antepone quien llama) de una de las
+    // llamadas que Comprobador::es_llamada_respuesta() ya valido: cada una
+    // escribe la respuesta directamente sobre `res`, igual que su fn_* en
+    // natives.cpp. `text`/`html`/`json` pasan por valor_json() + el mismo
+    // to_string()/to_json_text() de Value que usa la VM -- para un escalar
+    // (el unico caso que es_llamada_respuesta acepta para text/html) es la
+    // misma llamada, byte a byte, que haria fn_text/fn_html sobre el
+    // Value equivalente.
+    std::string codigo_llamada_respuesta(const IrExpr& e) const {
+        const auto& a = e.args;
+        if (e.call_name == "status")
+            return "res.status(" + expr(*a[0].value) + ").send(\"\")";
+        if (e.call_name == "text")
+            return "res.text(" + valor_json(*a[0].value) + ".to_string())";
+        if (e.call_name == "html")
+            return "res.html(" + valor_json(*a[0].value) + ".to_string())";
+        if (e.call_name == "json")
+            return "res.header(\"Content-Type\", \"application/json; charset=utf-8\").send(" +
+                   valor_json(*a[0].value) + ".to_json_text())";
+        if (e.call_name == "redirect") {
+            const std::string codigo = a.size() > 1 ? expr(*a[1].value) : "302";
+            return "res.status(" + codigo + ").header(\"Location\", " + expr(*a[0].value) +
+                   ").send(\"\")";
+        }
+        if (e.call_name == "send_file") return "res.send_file(" + expr(*a[0].value) + ")";
+        return ""; // inalcanzable: es_llamada_respuesta() ya lo descarto
     }
 
 private:

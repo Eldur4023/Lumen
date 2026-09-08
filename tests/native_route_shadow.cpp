@@ -6,12 +6,14 @@
 // resultado de compilar el MISMO fuente con native=false y con native=true.
 //
 // El objetivo es que una ruta nativa sea indistinguible, desde fuera
-// (status + cuerpo JSON), de la misma ruta servida por bytecode -- guarda de
-// grupo (`require ... else status(400)`), un parametro de patron mal
-// tipado (el mismo 400 exacto que prepare_args), y el valor de retorno
-// heterogeneo (`{"n": n, "result": r}`, int + int en el mismo dict, pero
-// generado con el puente Value de Generador::valor_json en vez de Dict<V>
-// homogeneo).
+// (status + cabeceras + cuerpo), de la misma ruta servida por bytecode --
+// guarda de grupo (`require ... else status(400)`), un parametro de patron
+// mal tipado (el mismo 400 exacto que prepare_args), un parametro de query
+// con valor por defecto, el valor de retorno heterogeneo (`{"n": n,
+// "result": r}`, generado con el puente Value de Generador::valor_json en
+// vez de Dict<V> homogeneo), y las otras funciones globales que escriben la
+// respuesta ellas mismas (text/html/status/redirect como "else" de una
+// guarda o como el propio `return`, ver Comprobador::es_llamada_respuesta).
 #include <lumen_script/project.hpp>
 
 #include <lumen/request.hpp>
@@ -38,6 +40,7 @@ struct Resultado {
     bool        encontrada = false;
     int         status     = 0;
     std::string body;
+    std::string location; // header "Location" (redirect()), vacio si no hay
 };
 
 static Resultado pedir(Module& mod, const std::string& metodo, const std::string& path) {
@@ -70,7 +73,9 @@ static Resultado pedir(Module& mod, const std::string& metodo, const std::string
     }
 
     ejecutar_sincrono(m.handler(req, res));
-    return {true, res.status_code(), res.body()};
+    const auto&      hdrs = res.headers_map();
+    auto              it  = hdrs.find("Location");
+    return {true, res.status_code(), res.body(), it != hdrs.end() ? it->second : std::string()};
 }
 
 int main() {
@@ -87,7 +92,17 @@ int main() {
         "\n"
         "get endpoint(\"/compute/fibq\", int n = 5):\n"
         "    require n >= 0 and n <= 32 else status(400)\n"
-        "    return { \"n\": n, \"result\": fib(n) }\n";
+        "    return { \"n\": n, \"result\": fib(n) }\n"
+        "\n"
+        "get endpoint(\"/saluda/:n\", int n):\n"
+        "    require n >= 1 and n <= 100 else text(\"fuera de rango\")\n"
+        "    if n > 50:\n"
+        "        return html(\"<b>grande</b>\")\n"
+        "    return status(204)\n"
+        "\n"
+        "get endpoint(\"/ir/:n\", int n):\n"
+        "    require n >= 1 else redirect(\"/saluda/1\", 301)\n"
+        "    return redirect(\"/saluda/1\")\n";
 
     const auto dir  = std::filesystem::temp_directory_path() / "lumen_native_route_check";
     std::error_code ec;
@@ -147,13 +162,15 @@ int main() {
             ok = false;
             return;
         }
-        if (bc.status != nat.status || bc.body != nat.body) {
-            std::printf("  FALLA %s: bytecode(%d, '%s') != nativo(%d, '%s')\n", etiqueta,
-                        bc.status, bc.body.c_str(), nat.status, nat.body.c_str());
+        if (bc.status != nat.status || bc.body != nat.body || bc.location != nat.location) {
+            std::printf("  FALLA %s: bytecode(%d, '%s', Location='%s') != nativo(%d, '%s', "
+                        "Location='%s')\n", etiqueta, bc.status, bc.body.c_str(),
+                        bc.location.c_str(), nat.status, nat.body.c_str(), nat.location.c_str());
             ok = false;
         } else {
-            std::printf("  ok    %s: bytecode y --native dan (%d, '%s') en las dos vias\n",
-                        etiqueta, bc.status, bc.body.c_str());
+            std::printf("  ok    %s: bytecode y --native dan (%d, '%s'%s%s) en las dos vias\n",
+                        etiqueta, bc.status, bc.body.c_str(),
+                        bc.location.empty() ? "" : ", Location=", bc.location.c_str());
         }
     };
 
@@ -182,9 +199,19 @@ int main() {
     comparar("query con defecto, presente", "/compute/fibq?n=8");
     comparar("query con defecto, mal tipada", "/compute/fibq?n=xyz");
 
+    // es_llamada_respuesta(): las otras cinco funciones globales que
+    // escriben la respuesta ellas mismas (text/html/status como valor de
+    // Return, no solo como "else" de una guarda) -- cada una debe dar el
+    // mismo status+cuerpo+cabecera que su fn_* en natives.cpp.
+    comparar("guarda con text()", "/saluda/200");           // fuera de rango
+    comparar("return html()", "/saluda/80");                 // n > 50
+    comparar("return status(204)", "/saluda/10");             // n <= 50
+    comparar("guarda con redirect(url, codigo)", "/ir/0");    // n < 1
+    comparar("return redirect(url)", "/ir/5");
+
     if (ok) {
-        std::printf("native_route_shadow: la ruta nativa coincide con bytecode en los tres "
-                    "casos\n");
+        std::printf("native_route_shadow: las rutas nativas coinciden con bytecode en todos "
+                    "los casos\n");
     } else {
         std::printf("native_route_shadow: %d fallo(s)\n", ++fallos);
     }

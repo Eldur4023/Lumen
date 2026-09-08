@@ -1205,6 +1205,23 @@ teoría, la primera vía real de ejecución para código de clase nativo — sin
 todavía en este corte, y `es_valor_json()` tampoco sabe serializar una instancia como valor de
 retorno, así que el caso útil (una clase en la respuesta) sigue sin cubrir.
 
+**Siguiente incremento: `Comprobador::es_llamada_respuesta()` generaliza `es_llamada_status()` a las seis
+funciones globales de `natives.cpp` que escriben la respuesta ELLAS MISMAS y devuelven `null`
+(`status`, `text`, `html`, `json`, `redirect`, `send_file`) — utilizables tanto como el `otherwise` de
+una guarda (`require ... else redirect("/login")`) como el propio valor de un `return`
+(`return status(204)`), cosa que antes de este incremento ni siquiera compilaba: `tipo_provable()` no
+sabe nada de `BuiltinGlobalCall` en general, así que `return status(204)` caía siempre a bytecode
+completo, no solo el `require`. `Generador::codigo_llamada_respuesta()` genera la llamada directa
+sobre `res` — para `text`/`html`, pasando el argumento (solo escalares, no una estructura: son texto
+o número, no JSON) por `valor_json()` y llamando a `.to_string()` sobre el `Value` resultante, la
+MISMA función que usa `fn_text`/`fn_html`, así que el formato de un `float`/`bool` convertido a texto
+coincide por construcción, sin reimplementarlo. `json(v)` reusa `es_valor_json()` entero (cualquier
+cosa que ya sabe serializarse como respuesta puede pasarse a `json()` explícitamente).
+`tests/native_route_shadow.cpp` gana tres rutas más y cinco casos (guarda con `text()`, `return
+html()`, `return status(204)`, guarda con `redirect(url, código)`, `return redirect(url)`) — el
+`Resultado` de la prueba ahora compara también la cabecera `Location`, no solo status+cuerpo. 79/79
+del corpus y las 8 suites de `ctest` en verde.
+
 ### Fase 5 — Asincronía y base de datos
 - `await` → `co_await` sobre los awaitables existentes; transacciones, pool, `last_id`.
 - **Aceptación:** el banco de pruebas completo (`bench/run_all.sh`) corre en modo `--native`
