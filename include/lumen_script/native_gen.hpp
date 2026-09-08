@@ -60,4 +60,12 @@ std::optional<FuncionNativa> generar_funcion_nativa(const FnDecl& fn, const IrBl
 // ensambla el fichero final (native_build.cpp) antepone esto una sola vez.
 std::string abi_prelude();
 
+// Funciones libres (`lumen_str_starts_with`, `lumen_str_upper`...) con la
+// misma semantica exacta que la rama `string` de call_method() en
+// natives.cpp -- lo que usa Generador::expr() al generar una llamada a uno
+// de los metodos de string que reconoce metodo_string_soportado(). Se
+// antepone una sola vez, igual que abi_prelude(); no cuesta nada incluirla
+// aunque una funcion en concreto no use ningun metodo de string.
+std::string string_runtime_prelude();
+
 } // namespace lumen_script

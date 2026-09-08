@@ -63,7 +63,13 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
         std::string simbolo_abi;
     };
     std::vector<Generada> generadas;
-    std::string           codigo = "#include <cstdint>\n#include <string>\n\n" + abi_prelude() + "\n";
+    // Prototipos y cuerpos por separado: sigs (un std::map) itera en orden
+    // alfabetico de nombre, no en el orden en que unas funciones llaman a
+    // otras -- sin un prototipo adelantado, una funcion que llama a otra que
+    // el mapa visita despues (p.ej. "usa" llamando a "valida") no compilaria
+    // porque C++ exige ver la declaracion antes del uso.
+    std::string prototipos;
+    std::string cuerpos;
 
     for (const auto& [nombre, sig] : sigs) {
         const FnDecl* fn = buscar_fn(prog, nombre);
@@ -79,19 +85,24 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
         auto generada = generar_funcion_nativa(*fn, body, nombre_por_indice);
         if (!generada) continue;
 
-        codigo += generada->firma_cpp + " " + generada->cuerpo_cpp + "\n\n";
+        prototipos += generada->firma_cpp + ";\n";
+        cuerpos += generada->firma_cpp + " " + generada->cuerpo_cpp + "\n\n";
         // Sin simbolo_abi: la funcion usa `string` en su frontera y todavia
         // no cruza la ABI fija (ver tipo_abi_soportado en native_gen.cpp).
         // Su cuerpo ya quedo arriba, asi que otra funcion nativa que la
         // llame directamente se sigue beneficiando -- solo se queda fuera
         // del despacho desde la VM (por_indice no tendra entrada para ella).
         if (!generada->simbolo_abi.empty()) {
-            codigo += generada->wrapper_cpp + "\n\n";
+            cuerpos += generada->wrapper_cpp + "\n\n";
             generadas.push_back({sig.index, generada->simbolo_abi});
         }
     }
 
     if (generadas.empty()) return nullptr; // nada que ofrecer nativo: no es un error
+
+    std::string codigo = "#include <cctype>\n#include <cstdint>\n#include <string>\n\n" +
+                         abi_prelude() + "\n" + string_runtime_prelude() + "\n" +
+                         prototipos + "\n" + cuerpos;
 
     std::error_code ec;
     std::filesystem::create_directories(cache_dir, ec);

@@ -739,6 +739,31 @@ wrapper — se beneficia igual, sin esperar a que la ABI se extienda. Validado e
 wrapper, `usa_saluda(int) -> int` sí lo tiene y llama a `saluda` internamente concatenando y
 comparando cadenas, y su resultado por bytecode y por `--native` coincide.
 
+**Segundo corte: los 6 métodos de `string`.** `metodos_de()`/`call_method()` (`natives.cpp`)
+reconocen exactamente seis sobre un string: `starts_with`, `ends_with`, `contains`, `upper`,
+`lower`, `trim`. `native_gen.cpp` los acepta (`metodo_string_soportado`) cuando el receptor tipa
+`string` — es la primera vez que el generador toca `IrCallShape::BuiltinMethodCall`, hasta ahora
+solo aceptaba `UserFunctionCall`. Cada uno se traduce a una función libre (`lumen_str_upper`,
+`lumen_str_contains`...) definida una sola vez en el `.cpp` generado (`string_runtime_prelude()`),
+con la misma lógica exacta que su equivalente en `natives.cpp` — mismo criterio que `abi_prelude()`
+para `NativeValue`: una sola fuente de verdad duplicada a propósito, porque dlopen no comparte
+cabeceras con la biblioteca cargada.
+
+Escribir la prueba de este corte encontró un bug real, independiente de los métodos de string:
+`compilar_nativo()` ensambla el `.cpp` iterando `FunctionSigs` (un `std::map`, orden alfabético de
+nombre), sin ninguna declaración adelantada — una función que llama a otra que el mapa visita
+*después* (p.ej. `usa` llamando a `valida`) no compilaba, porque C++ exige ver la declaración antes
+del uso. `fib`/`cuenta_primos` nunca lo habían destapado porque `fib` solo se llama a sí misma (su
+propia firma ya es visible dentro de su propio cuerpo) y ninguna de las dos llama a la otra.
+Arreglado generando un prototipo para cada función *antes* que ningún cuerpo, en un bloque aparte
+— corrección de alcance general, no solo para cadenas.
+
+Validado en `tests/native_build_shadow.cpp` (`prueba_metodos_string()`): `usa(int) -> int` declara
+una cadena con espacios, la recorta (`trim`), la pasa a mayúsculas (`upper`), compara el resultado,
+y si coincide llama a `valida(string) -> bool` (que usa `contains`/`starts_with`) — declarada
+*después* de `usa` en el código fuente, ejercitando también la corrección del orden. Bytecode y
+`--native` coinciden.
+
 ### Fase 4 — Rutas HTTP síncronas
 - Handler generado como `Task<void>` (o función síncrona si no hay `await`, §9), registrado en
   el router igual que hoy.

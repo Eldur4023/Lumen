@@ -109,6 +109,14 @@ std::string etiqueta_abi(Type::Kind k) {
     }
 }
 
+// Los 6 metodos de string que reconoce metodos_de()/call_method()
+// (natives.cpp) -- misma lista, vista desde este lado. Cada uno tiene su
+// funcion equivalente en runtime_prelude(), con la misma semantica exacta.
+bool metodo_string_soportado(const std::string& nombre) {
+    return nombre == "starts_with" || nombre == "ends_with" || nombre == "contains" ||
+           nombre == "upper" || nombre == "lower" || nombre == "trim";
+}
+
 // ── Comprobacion: ¿esta esto enteramente dentro de lo que compila esta fase? ──
 
 bool expr_compilable(const IrExpr& e);
@@ -153,14 +161,26 @@ bool expr_compilable(const IrExpr& e) {
         case IrExprKind::PostStep:
             return e.lhs && e.lhs->kind == IrExprKind::Ident;
 
-        // Solo llamadas a otra funcion de usuario, con argumentos igual de
-        // compilables. Las otras 7 formas de IrCallShape (builtins, metodos,
-        // BD, objetos reservados) no tienen contrapartida nativa todavia.
+        // Una funcion de usuario, o uno de los 6 metodos de string que
+        // metodos_de()/call_method() reconocen (natives.cpp) -- ver
+        // metodo_string_soportado() mas abajo. Las otras formas de
+        // IrCallShape (builtins globales, metodos de List/Dict, BD, objetos
+        // reservados) no tienen contrapartida nativa todavia.
         case IrExprKind::Call:
-            if (e.call_shape != IrCallShape::UserFunctionCall) return false;
-            for (const auto& a : e.args)
-                if (!expr_compilable_ptr(a.value.get())) return false;
-            return true;
+            if (e.call_shape == IrCallShape::UserFunctionCall) {
+                for (const auto& a : e.args)
+                    if (!expr_compilable_ptr(a.value.get())) return false;
+                return true;
+            }
+            if (e.call_shape == IrCallShape::BuiltinMethodCall &&
+                e.object && e.object->type.kind() == Type::Kind::String &&
+                metodo_string_soportado(e.call_name)) {
+                if (!expr_compilable(*e.object)) return false;
+                for (const auto& a : e.args)
+                    if (!expr_compilable_ptr(a.value.get())) return false;
+                return true;
+            }
+            return false;
     }
     return false;
 }
@@ -277,10 +297,19 @@ public:
             }
 
             case IrExprKind::Call: {
-                std::string s = nombre_cpp(nombre_por_indice_.at(static_cast<size_t>(e.call_index)));
+                // BuiltinMethodCall (solo metodos de string, ver
+                // metodo_string_soportado): funcion libre de
+                // runtime_prelude(), receptor primero, luego los
+                // argumentos -- mismo orden que call_method(recv, args) en
+                // natives.cpp, solo que en tiempo de compilacion en vez de
+                // por nombre en tiempo de ejecucion.
+                std::string s = e.call_shape == IrCallShape::BuiltinMethodCall
+                                   ? "lumen_str_" + e.call_name
+                                   : nombre_cpp(nombre_por_indice_.at(static_cast<size_t>(e.call_index)));
                 s += "(";
+                if (e.call_shape == IrCallShape::BuiltinMethodCall) s += expr(*e.object);
                 for (size_t i = 0; i < e.args.size(); ++i) {
-                    if (i) s += ", ";
+                    if (i || e.call_shape == IrCallShape::BuiltinMethodCall) s += ", ";
                     s += expr(*e.args[i].value);
                 }
                 s += ")";
@@ -439,6 +468,35 @@ std::string abi_prelude() {
         "    union { int64_t i; double d; bool b; };\n"
         "};\n"
         "using NativeFn = NativeValue (*)(const NativeValue*, int32_t);\n";
+}
+
+std::string string_runtime_prelude() {
+    // Cada una calca, a proposito, la rama `string` de call_method() en
+    // natives.cpp -- misma logica, tipos nativos en vez de Value.
+    return
+        "static bool lumen_str_starts_with(const std::string& s, const std::string& n) {\n"
+        "    return s.rfind(n, 0) == 0;\n"
+        "}\n"
+        "static bool lumen_str_ends_with(const std::string& s, const std::string& n) {\n"
+        "    return s.size() >= n.size() && s.compare(s.size() - n.size(), n.size(), n) == 0;\n"
+        "}\n"
+        "static bool lumen_str_contains(const std::string& s, const std::string& n) {\n"
+        "    return s.find(n) != std::string::npos;\n"
+        "}\n"
+        "static std::string lumen_str_upper(std::string s) {\n"
+        "    for (char& c : s) c = static_cast<char>(::toupper((unsigned char)c));\n"
+        "    return s;\n"
+        "}\n"
+        "static std::string lumen_str_lower(std::string s) {\n"
+        "    for (char& c : s) c = static_cast<char>(::tolower((unsigned char)c));\n"
+        "    return s;\n"
+        "}\n"
+        "static std::string lumen_str_trim(const std::string& s) {\n"
+        "    size_t a = s.find_first_not_of(\" \\t\\r\\n\");\n"
+        "    if (a == std::string::npos) return \"\";\n"
+        "    size_t b = s.find_last_not_of(\" \\t\\r\\n\");\n"
+        "    return s.substr(a, b - a + 1);\n"
+        "}\n";
 }
 
 } // namespace lumen_script

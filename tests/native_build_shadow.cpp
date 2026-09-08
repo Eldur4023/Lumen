@@ -155,6 +155,62 @@ static bool prueba_strings() {
     return true;
 }
 
+// Los 6 metodos de string (metodo_string_soportado en native_gen.cpp) y, de
+// paso, el orden alfabetico de FunctionSigs (un std::map): "usa" llama a
+// "valida", que el mapa visita DESPUES por nombre -- sin un prototipo
+// adelantado en el .cpp ensamblado, esto no compilaria (bug real que este
+// caso encontro al escribirlo, corregido en compilar_nativo() generando
+// prototipos para todas las funciones antes que ningun cuerpo).
+static bool prueba_metodos_string() {
+    const std::string src =
+        "fn bool valida(string email):\n"
+        "    return email.contains(\"@\") and email.starts_with(\"a\")\n"
+        "\n"
+        "fn int usa(int n):\n"
+        "    string s = \"  Hola Mundo  \"\n"
+        "    string t = s.trim()\n"
+        "    string u = t.upper()\n"
+        "    if u == \"HOLA MUNDO\":\n"
+        "        if valida(\"a@b.com\"):\n"
+        "            return n\n"
+        "    return -1\n";
+
+    SourceFile    file;
+    DiagnosticBag diag_parse;
+    Program       prog;
+    if (!parse_program(src, file, diag_parse, prog)) {
+        std::printf("FALLA (metodos de string): no parsea (%s)\n",
+                    diag_parse.items().empty() ? "?" : diag_parse.items().front().message.c_str());
+        return false;
+    }
+
+    FunctionSigs                  sigs = firmar(prog);
+    FunctionTable                 tabla_vm;
+    std::unique_ptr<NativeModule> nativo;
+    const auto cache_dir =
+        std::filesystem::temp_directory_path() / "lumen_native_build_check_metodos_str";
+    if (!compilar_las_dos_vias(prog, sigs, tabla_vm, nativo, cache_dir)) return false;
+
+    if (!nativo || nativo->compiladas() != 1) {
+        std::printf("FALLA (metodos de string): se esperaba 1 funcion con wrapper (usa), hay %zu\n",
+                    nativo ? nativo->compiladas() : 0);
+        return false;
+    }
+
+    const Chunk& chunk      = *tabla_vm[sigs.at("usa").index];
+    long long    sin_nativo = ejecutar(chunk, 42, &tabla_vm, nullptr);
+    long long    con_nativo = ejecutar(chunk, 42, &tabla_vm, &nativo->por_indice);
+    if (sin_nativo != con_nativo || sin_nativo != 42) {
+        std::printf("  FALLA usa(42): bytecode=%lld nativo=%lld (se esperaba 42)\n", sin_nativo,
+                    con_nativo);
+        return false;
+    }
+    std::printf("  ok    usa(42) = %lld (bytecode y VM+nativo coinciden: trim/upper/contains/"
+                "starts_with, y una llamada a una funcion declarada despues en el .cpp)\n",
+                sin_nativo);
+    return true;
+}
+
 int main() {
     const std::string src =
         "fn int fib(int n):\n"
@@ -256,6 +312,7 @@ int main() {
     std::filesystem::remove_all(cache_dir, ec);
 
     if (!prueba_strings()) ++fallos;
+    if (!prueba_metodos_string()) ++fallos;
 
     if (fallos == 0) {
         std::printf("native_build_shadow: la VM con --native conectado coincide en todos los "
