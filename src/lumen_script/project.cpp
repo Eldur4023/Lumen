@@ -1540,17 +1540,29 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
         std::vector<ParamBind> binds;
         if (!bind_params(r, classes, binds, diags)) continue;
 
-        // Nivel 1.5: ruta compilada nativamente (Fase 4, --native). Mismo
+        // Nivel 1.5: ruta compilada nativamente (Fase 4/5, --native). Mismo
         // criterio de "todo o nada" que una funcion: generar_ruta_nativa()
         // (native_gen.cpp), invocado durante compile() -> compilar_nativo(),
         // ya decidio si esta ruta entera es representable (parametros
         // escalares de patron/query sin valor por defecto, cuerpo sin
-        // sesion/JWT/render/await/contenedores) -- si lo es, mod.native trae
-        // el puntero ya resuelto por dlsym() y aqui solo hace falta
-        // invocarlo. La funcion generada hace su PROPIO binding de
-        // parametros (lee req.params/req.query ella misma) y escribe la
-        // respuesta directamente sobre `res`: no pasa por bind_params/
-        // prepare_args/begin_auth ni por el VM.
+        // sesion/JWT/render/contenedores, `await` limitado a `sleep`) -- si
+        // lo es, mod.native trae el puntero ya resuelto por dlsym() y aqui
+        // solo hace falta invocarlo. La funcion generada hace su PROPIO
+        // binding de parametros (lee req.params/req.query ella misma) y
+        // escribe la respuesta directamente sobre `res`: no pasa por
+        // bind_params/prepare_args/begin_auth ni por el VM.
+        //
+        // Una ruta con `await` (RutaNativa::asincrona) se genero como
+        // lumen::Task<void> de verdad -- su firma YA coincide exactamente
+        // con Handler (ver types.hpp), asi que se registra directa, sin
+        // ningun envoltorio: envolverla en otra corrutina que la
+        // co_await-ara solo anadiria un frame sin necesidad.
+        if (mod.native && ridx < mod.native->rutas_async_por_indice.size() &&
+            mod.native->rutas_async_por_indice[ridx]) {
+            ++mod.vm_routes;
+            mod.router.add_internal(r.method, r.pattern, mod.native->rutas_async_por_indice[ridx]);
+            continue;
+        }
         if (mod.native && ridx < mod.native->rutas_por_indice.size() &&
             mod.native->rutas_por_indice[ridx]) {
             auto fn = mod.native->rutas_por_indice[ridx];

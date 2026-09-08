@@ -1320,6 +1320,64 @@ de `ctest` en verde.
 - **Aceptación:** el banco de pruebas completo (`bench/run_all.sh`) corre en modo `--native`
   con las mismas respuestas y sin errores de aplicación.
 
+**Primer paso: `await sleep(ms)`.** El único `await` que esta fase representa por ahora — una
+consulta a base de datos necesita mucha más plumbing (pool, *worker pinning*, transacciones) y
+queda para el siguiente incremento. Decisión de diseño consciente: `await` solo se genera dentro de
+una **ruta**, nunca en una función/método suelto — `Comprobador::usa_await()` (puesto a verdad
+dentro de `tipo_provable()`, caso `IrExprKind::Await`) hace que `generar_funcion_nativa()`/
+`generar_metodo_nativo()` **rechacen** cualquier cuerpo que lo use, porque una función suelta se
+invoca directamente en C++ desde otra función nativa — nunca con `co_await` — y suspenderse a mitad
+no tendría a quién avisar. Una ruta sí tiene quién: `build_routes()` ya sabe `co_await`-ar un
+`Handler`. Cuando `usa_await()` da verdad, `generar_ruta_nativa()` genera la ruta entera como
+`lumen::Task<void>` en vez de `void` (`RutaNativa::asincrona`) — una corrutina real — y
+`Generador::ret_vacio()` centraliza la única diferencia mecánica: toda salida temprana pasa a ser
+`co_return;` en vez de `return;` (una corrutina no admite un `return` a secas). `await sleep(ms)` se
+traduce a `co_await lumen::sleep(lumen_clamp_sleep_ms(ms))` — el mismo `lumen::sleep()` y el mismo
+piso de 1ms (`clamp_sleep_ms`) que ya usa una ruta de bytecode, así que el comportamiento —
+suspensión real sobre el *event loop*, no un bloqueo de hilo — es idéntico, no solo el resultado
+final. `NativeModule` gana una segunda tabla, `rutas_async_por_indice` (`Task<void>(*)(Request&,
+Response&)`, distinta de la de rutas síncronas), porque las dos firmas no caben en un solo tipo de
+puntero de función; `build_routes()` la registra **directamente**, sin ningún envoltorio — su firma
+ya coincide exactamente con `Handler`.
+
+**Dos fallos reales encontrados probando esto contra el binario de verdad, ninguno anticipado.**
+
+1. *Un `dlerror()` de más — UB, no solo un mensaje feo.* `dlopen()` puede fallar de verdad (y de
+   hecho falló, la primera vez que se compiló una ruta con `Task<void>`, ver el punto 2). El código
+   de error construía el aviso con `dlerror() ? dlerror() : "..."` — dos llamadas. `dlerror()` tiene
+   semántica de un solo uso: la primera devuelve el mensaje y lo consume: la segunda, en la misma
+   expresión, ya da `nullptr`. `std::string + nullptr` no es "un mensaje raro", es comportamiento
+   indefinido — aquí, un SEGV real, con pila de llamadas confirmándolo (`std::string::append` sobre
+   un `char*` nulo). Corregido guardando el resultado en una variable y llamando a `dlerror()` una
+   sola vez.
+2. *El `.so` no compartía el `event_loop` con el binario — `await sleep()` no esperaba nada.* Con el
+   fallo de arriba corregido, el mensaje real de `dlopen()` apareció: `undefined symbol:
+   EpollLoop::post`. Enlazar `liblumen.a` además de `liblumen_script.a` (necesaria desde que una
+   ruta usa `lumen::Task`/`lumen::Response` — antes solo hacía falta `liblumen_script.a`, para
+   `Value`) lo arregló, pero destapó un fallo más sutil y más grave, que **no daba ningún error de
+   compilación ni de carga**: `await sleep(200)` en una ruta nativa respondía en ~3ms, no ~200ms.
+   Causa: `lumen::detail::current_loop`/`current_token` (`task.hpp`) son variables `inline
+   thread_local` — con vinculación débil pensada para deduplicarse entre unidades de traducción,
+   pero eso solo funciona de verdad entre módulos dinámicos si el símbolo del EJECUTABLE está
+   exportado a la tabla dinámica; sin eso, el `.so` se lleva su PROPIA copia privada, siempre a
+   `nullptr` porque nadie la toca ahí. `SleepAwaitable::await_suspend()`, con `loop == nullptr`,
+   reanuda al acto (`if (!loop) { h.resume(); return; }`) — código defensivo pensado para un uso sin
+   *event loop*, no para este caso, pero que enmascaraba el problema en vez de fallar ruidosamente.
+   Corregido con `-rdynamic` en el ejecutable `lumen` (`target_link_options`): exporta sus símbolos
+   para que el `.so` resuelva contra la copia del binario, no contra una propia. Verificado varias
+   veces contra el binario real, con las dos vías compitiendo lado a lado en `bench/lumen/app.lum`
+   (`/slow/:ms`): antes de la corrección, bytecode tardaba ~204ms y `--native` ~3ms para el mismo
+   `sleep(200)`; después, los dos tardan ~204ms — y una cadena de tres peticiones secuenciales de
+   300ms cada una, más una cuarta concurrente, confirma que la suspensión es real (no un
+   bloqueo disimulado) y que el servidor sigue respondiendo con normalidad durante la espera.
+
+`tests/native_route_shadow.cpp` gana una ruta (`/espera/:ms`) y dos casos (guarda que rechaza,
+`await sleep()` normal) — funcionales, no de tiempo: sin un *event loop* real detrás, la prueba
+aislada no puede medir milisegundos (ni falta que hace: la verificación de tiempo real es la de
+arriba, contra el binario real). `bench/lumen/app.lum` pasa de 3 a 4 rutas nativas
+(`/slow/:ms` se suma a `/health`, `/compute/fib/:n`, `/compute/primes/:n`). 79/79 del corpus y las 8
+suites de `ctest` en verde.
+
 ### Fase 6 — Empaquetado y modo mixto
 - `--native` de punta a punta: caché, `.so`, `dlopen`, informe de arranque, diagnóstico
   explícito de rutas no compilables, respaldo por bytecode ruta a ruta.

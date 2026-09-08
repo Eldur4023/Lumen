@@ -224,6 +224,18 @@ public:
     // corresponde a su call_index -- ver esos casos en Generador::expr.
     const TablaRoles& roles() const { return roles_; }
 
+    // Fase 5: ¿demostro tipo_provable() algun `await` en lo que llevamos
+    // comprobado? Puesto a verdad, nunca a falso, dentro del caso
+    // IrExprKind::Await -- por eso una unica pasada de block_compilable()
+    // basta para saberlo con certeza al final: si el cuerpo entero fue
+    // demostrable Y contenia un await en algun punto, esto ya lo vio.
+    // Quien llama (generar_funcion_nativa/generar_metodo_nativo/
+    // generar_ruta_nativa) decide que hacer con el -- una funcion/metodo lo
+    // rechaza (fuera de alcance: nadie mas espera a que termine), una ruta
+    // lo usa para generar una corrutina de verdad en vez de una funcion
+    // plana.
+    bool usa_await() const { return usa_await_; }
+
     // Ranura -> tipo declarado, en el orden en que VarDecl/parametros/`for`
     // los van presentando -- igual que Generador::ranura_a_nombre_, pero de
     // tipo en vez de nombre. Una vez registrada, una ranura mantiene ESE
@@ -325,8 +337,29 @@ public:
             // Sin representacion en esta fase, o sin sentido fuera de una
             // ruta.
             case IrExprKind::NullLit:
-            case IrExprKind::Await:
                 return std::nullopt;
+
+            // Fase 5: el UNICO await que esta fase sabe representar --
+            // `await sleep(ms)` -- traducido a `co_await lumen::sleep(...)`
+            // de verdad (ver Generador::expr, y route_runtime_prelude para
+            // el clamp de 1ms). Cualquier otro await (una consulta a base
+            // de datos, ws.recv()...) sigue devolviendo null aqui: ni
+            // siquiera existe una nocion de "tipo" para ellos todavia
+            // (Fase 5 completa, mas alla de este primer paso). No hay caso
+            // aparte para IrCallShape aqui: e.lhs siempre es IrExprKind::
+            // Call (Emitter::check_expr lo garantiza para Await), asi que
+            // basta con mirar su call_name/call_shape directamente.
+            case IrExprKind::Await: {
+                if (!e.lhs || e.lhs->kind != IrExprKind::Call ||
+                    e.lhs->call_shape != IrCallShape::BuiltinGlobalCall ||
+                    e.lhs->call_name != "sleep" || e.lhs->args.size() != 1 ||
+                    !e.lhs->args[0].value)
+                    return std::nullopt;
+                auto t = tipo_provable(*e.lhs->args[0].value);
+                if (!t || t->kind() != Type::Kind::Int) return std::nullopt;
+                usa_await_ = true;
+                return Type::void_();
+            }
 
             // El unico nodo del IR que YA lleva el nombre de la clase
             // directamente en su tipo (e.type = Type::class_ref(cls),
@@ -803,6 +836,7 @@ private:
     const TablaClases&               clases_;
     const TablaRoles&                roles_;
     std::map<int, Type>              ranura_tipos_;
+    mutable bool                     usa_await_ = false;
 };
 
 // ── Generacion ────────────────────────────────────────────────────────────
@@ -840,9 +874,15 @@ public:
     // `ruta`: si es verdad, un Return/Require con destino serializa su
     // valor como respuesta HTTP en vez de generar un `return <valor>;` de
     // funcion -- ver esos dos casos en stmt() y generar_ruta_nativa().
+    // `asincrona` (solo tiene sentido si `ruta` tambien lo es, ver
+    // Comprobador::usa_await()): la ruta se genera como `lumen::Task<void>`
+    // -- toda salida temprana tiene que ser `co_return;`, no `return;` (una
+    // corrutina no admite un `return` a secas), y `await sleep(ms)` se
+    // traduce a un `co_await` de verdad, no a una llamada plana.
     Generador(const std::vector<std::string>& nombre_por_indice, const Comprobador& comprobador,
-             bool ruta = false)
-        : nombre_por_indice_(nombre_por_indice), comprobador_(comprobador), ruta_(ruta) {}
+             bool ruta = false, bool asincrona = false)
+        : nombre_por_indice_(nombre_por_indice), comprobador_(comprobador), ruta_(ruta),
+          asincrona_(asincrona) {}
 
     // Ranura -> nombre C++ ya calculado, para poder generar `nombre = ...`
     // en un Assign(Local): el IrStmt solo trae `assign_slot` (lo unico que
@@ -1039,6 +1079,18 @@ public:
                 return s;
             }
 
+            // `await sleep(ms)` (Fase 5, el unico await que Comprobador::
+            // tipo_provable acepta): co_await de verdad sobre el mismo
+            // lumen::sleep() que usa build_routes() para una ruta VM, con
+            // el mismo piso de 1ms (lumen_clamp_sleep_ms,
+            // route_runtime_prelude) que aplica clamp_sleep_ms() alli --
+            // sin el, un `sleep(0)` en un bucle podria fijar un hilo entero
+            // reprogramando un temporizador de 0ms sin parar (ver el
+            // comentario de clamp_sleep_ms en project.cpp).
+            case IrExprKind::Await:
+                return "co_await lumen::sleep(lumen_clamp_sleep_ms(" +
+                       expr(*e.lhs->args[0].value) + "))";
+
             default:
                 return ""; // inalcanzable: Comprobador ya lo descarto antes de llegar aqui
         }
@@ -1055,7 +1107,7 @@ public:
         switch (s.kind) {
             case IrStmtKind::Return:
                 if (ruta_ && s.value && comprobador_.es_llamada_respuesta(*s.value))
-                    return codigo_llamada_respuesta(*s.value) + "; return;";
+                    return codigo_llamada_respuesta(*s.value) + "; " + ret_vacio();
                 if (ruta_) return respuesta_de_retorno(s.value.get());
                 return s.value ? ("return " + expr(*s.value) + ";") : "return;";
 
@@ -1127,7 +1179,7 @@ public:
                     // respuesta el mismo (mismo texto que su fn_* en
                     // natives.cpp) -- no hay ningun valor que serializar.
                     return "if (!(" + expr(*s.value) + ")) { " +
-                           codigo_llamada_respuesta(*s.target) + "; return; }";
+                           codigo_llamada_respuesta(*s.target) + "; " + ret_vacio() + " }";
                 if (ruta_)
                     return "if (!(" + expr(*s.value) + ")) { " +
                            respuesta_de_retorno(s.target.get()) + " }";
@@ -1143,9 +1195,9 @@ public:
     // (project.cpp) hace con el `Value` que devuelve el VM -- `nullptr`
     // (un `return` sin valor) es el 204 vacio de esa misma cola.
     std::string respuesta_de_retorno(const IrExpr* e) const {
-        if (!e) return "res.status(204).send(\"\"); return;";
+        if (!e) return "res.status(204).send(\"\"); " + ret_vacio();
         return "res.header(\"Content-Type\", \"application/json; charset=utf-8\").send(" +
-               valor_json(*e) + ".to_json_text()); return;";
+               valor_json(*e) + ".to_json_text()); " + ret_vacio();
     }
 
     // Construye un lumen_script::Value equivalente a `e` -- el puente entre
@@ -1208,10 +1260,19 @@ public:
         return ""; // inalcanzable: es_llamada_respuesta() ya lo descarto
     }
 
+    // La salida temprana de una ruta: `return;` en una funcion `void`
+    // normal, `co_return;` cuando el cuerpo es una corrutina (`asincrona_`
+    // -- una corrutina no admite un `return` a secas, ver el comentario del
+    // constructor). Usado en TODO punto de salida que no sea la caida
+    // natural al final del cuerpo (esa no necesita nada explicito en
+    // ninguno de los dos casos).
+    std::string ret_vacio() const { return asincrona_ ? "co_return;" : "return;"; }
+
 private:
     const std::vector<std::string>& nombre_por_indice_;
     const Comprobador&               comprobador_;
     bool                             ruta_ = false;
+    bool                             asincrona_ = false;
     std::map<int, std::string>      ranura_a_nombre_;
 
     static std::string pad(int indent) { return std::string(static_cast<size_t>(indent) * 4, ' '); }
@@ -1317,6 +1378,13 @@ std::optional<FuncionNativa> generar_funcion_nativa(const FnDecl& fn, const IrBl
     for (size_t i = 0; i < fn.params.size(); ++i)
         comprobador.registrar(static_cast<int>(i), Type::from_declared(fn.params[i].type));
     if (!comprobador.block_compilable(body, retorno_decl)) return std::nullopt;
+    // Fase 5: `await` solo se representa dentro de una ruta (build_routes()
+    // es el UNICO punto de entrada nativo que se invoca ya como corrutina;
+    // una funcion/metodo suelto se llama directamente en C++ desde otra
+    // funcion nativa, nunca con `co_await`, asi que suspenderse a mitad no
+    // tiene a quien avisar). Rechazar aqui dejala en bytecode entera, igual
+    // que cualquier otra pieza fuera de alcance.
+    if (comprobador.usa_await()) return std::nullopt;
     // Ver el comentario de bloque_siempre_retorna(): sin esto, un cuerpo
     // que "cae al final" en algun camino (el VM da null con naturalidad)
     // generaria una funcion C++ no-void que puede llegar al final sin
@@ -1422,6 +1490,13 @@ std::optional<FuncionNativa> generar_metodo_nativo(const std::string& clase, con
     for (size_t i = 0; i < fn.params.size(); ++i)
         comprobador.registrar(static_cast<int>(i + 1), Type::from_declared(fn.params[i].type));
     if (!comprobador.block_compilable(body, retorno_decl)) return std::nullopt;
+    // Fase 5: `await` solo se representa dentro de una ruta (build_routes()
+    // es el UNICO punto de entrada nativo que se invoca ya como corrutina;
+    // una funcion/metodo suelto se llama directamente en C++ desde otra
+    // funcion nativa, nunca con `co_await`, asi que suspenderse a mitad no
+    // tiene a quien avisar). Rechazar aqui dejala en bytecode entera, igual
+    // que cualquier otra pieza fuera de alcance.
+    if (comprobador.usa_await()) return std::nullopt;
     // Ver el comentario de bloque_siempre_retorna(): sin esto, un cuerpo
     // que "cae al final" en algun camino (el VM da null con naturalidad)
     // generaria una funcion C++ no-void que puede llegar al final sin
@@ -1523,9 +1598,15 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
     // (Comprobador::es_valor_json), no un Type nativo exacto -- ver esos dos
     // casos en Comprobador::stmt_compilable.
     if (!comprobador.block_compilable(body, Type::json())) return std::nullopt;
+    // Fase 5: si el cuerpo demostro algun `await` (hoy: solo `await
+    // sleep(ms)`, ver Comprobador::tipo_provable), esta ruta se genera
+    // como una corrutina de verdad -- ver el comentario del constructor de
+    // Generador y RutaNativa::asincrona.
+    const bool asincrona = comprobador.usa_await();
 
     RutaNativa out;
-    out.simbolo = "lumen_native_route_" + std::to_string(indice);
+    out.simbolo    = "lumen_native_route_" + std::to_string(indice);
+    out.asincrona  = asincrona;
 
     // El binding de parametros: mismo criterio EXACTO que prepare_args()
     // (project.cpp) -- Path va a req.params, Query a req.query; ausente da
@@ -1558,6 +1639,10 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
     // el mismo respaldo que ya usa build_routes cuando el VM tampoco tiene
     // una ubicacion precisa.
     const std::string donde = literal_string(route.method + " " + route.pattern);
+    // Construido ya aqui (antes del binding de parametros) solo para poder
+    // usar gen.ret_vacio() en el 400 de un parametro invalido -- registrar()
+    // (que si depende de `params`) se llama despues, mas abajo.
+    Generador gen(nombre_por_indice, comprobador, /*ruta=*/true, asincrona);
     std::string cuerpo = "{\n    try {\n";
     for (const auto& p : params) {
         const std::string mapa = p.en_path ? "req.params" : "req.query";
@@ -1596,20 +1681,21 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
             cuerpo += "            res.status(400).header(\"Content-Type\", "
                       "\"application/json; charset=utf-8\")"
                       ".send(Value::dict(std::move(__d)).to_json_text());\n";
-            cuerpo += "            return;\n";
+            cuerpo += "            " + gen.ret_vacio() + "\n";
             cuerpo += "        }\n";
         }
         cuerpo += "    }\n";
     }
 
-    Generador gen(nombre_por_indice, comprobador, /*ruta=*/true);
     for (size_t i = 0; i < params.size(); ++i) gen.registrar(static_cast<int>(i), params[i].nombre);
     cuerpo += gen.block(body, 1);
     // A diferencia de una funcion, aqui NO hace falta bloque_siempre_retorna:
-    // la funcion generada es `void`, asi que "caer al final" es C++
-    // perfectamente valido (nunca comportamiento indefinido) -- y es,
-    // ademas, EXACTAMENTE lo mismo que hace el VM cuando el cuerpo de una
-    // ruta termina sin `return` explicito (null -> 204, ver build_routes).
+    // la funcion generada es `void`/`Task<void>`, asi que "caer al final"
+    // es C++ perfectamente valido en los dos casos (nunca comportamiento
+    // indefinido, y una corrutina `Task<void>` que cae al final hace
+    // return_void() con la misma naturalidad) -- y es, ademas, EXACTAMENTE
+    // lo mismo que hace el VM cuando el cuerpo de una ruta termina sin
+    // `return` explicito (null -> 204, ver build_routes).
     cuerpo += "    res.status(204).send(\"\");\n";
     cuerpo += "    } catch (const LumenNativeError&) {\n";
     cuerpo += "        Value::Dict __e;\n";
@@ -1620,8 +1706,8 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
     cuerpo += "    }\n";
     cuerpo += "}";
 
-    out.cuerpo_cpp = "extern \"C\" void " + out.simbolo +
-                     "(lumen::Request& req, lumen::Response& res) " + cuerpo;
+    out.cuerpo_cpp = "extern \"C\" " + std::string(asincrona ? "lumen::Task<void>" : "void") +
+                     " " + out.simbolo + "(lumen::Request& req, lumen::Response& res) " + cuerpo;
     return out;
 }
 
@@ -1981,6 +2067,13 @@ std::string route_runtime_prelude() {
         "    for (int64_t i = 0; i < d.lumen_len(); ++i)\n"
         "        out[d.lumen_key_at(i)] = lumen_valor_de(d.lumen_val_at(i));\n"
         "    return Value::dict(std::move(out));\n"
+        "}\n"
+        // Fase 5: mismo piso de 1ms que clamp_sleep_ms() en project.cpp --
+        // sin el, un `await sleep(0)` en un bucle podria fijar un hilo
+        // entero reprogramando un temporizador de 0ms sin parar (ver el
+        // comentario de clamp_sleep_ms alli).
+        "inline int lumen_clamp_sleep_ms(int64_t ms) {\n"
+        "    return ms < 1 ? 1 : static_cast<int>(ms);\n"
         "}\n";
 }
 

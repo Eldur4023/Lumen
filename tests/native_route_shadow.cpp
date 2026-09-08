@@ -124,7 +124,12 @@ int main() {
         "    while i < n:\n"
         "        d[\"c\" + str(i)] = i * 2\n"
         "        i = i + 1\n"
-        "    return { \"total\": d }\n";
+        "    return { \"total\": d }\n"
+        "\n"
+        "get endpoint(\"/espera/:ms\", int ms):\n"
+        "    require ms >= 0 and ms <= 3000 else status(400)\n"
+        "    await sleep(ms)\n"
+        "    return { \"waited_ms\": ms }\n";
 
     const auto dir  = std::filesystem::temp_directory_path() / "lumen_native_route_check";
     std::error_code ec;
@@ -247,6 +252,19 @@ int main() {
     // orden de insercion (LDict es un vector, igual que Value::Dict).
     comparar("Dict<string,int> ya construido en el retorno", "/contadores/0");
     comparar("Dict<string,int> ya construido en el retorno", "/contadores/4");
+
+    // Fase 5: `await sleep(ms)` -- la ruta se genera como lumen::Task<void>
+    // de verdad (RutaNativa::asincrona), no como una funcion void. Esta
+    // prueba, sin un event loop real detras (current_loop queda a nullptr
+    // en este binario, nunca lo pone HttpConnection::dispatch()), no
+    // verifica el TIEMPO de espera -- SleepAwaitable::await_suspend()
+    // reanuda al acto sin loop, asi que un solo handle.resume() basta --
+    // solo que status+cuerpo coincidan, exactamente igual que cualquier
+    // otra ruta. El tiempo de espera de verdad (~ms reales, no ~0) esta
+    // verificado a mano contra el binario real sirviendo HTTP -- ver
+    // COMPILACION-NATIVA.md.
+    comparar("guarda rechaza ms=9999", "/espera/9999");
+    comparar("await sleep(ms)", "/espera/50");
 
     // Bug real, encontrado probando esto a proposito (no una precaucion
     // especulativa): una ruta nativa no tiene NINGUN wrapper de la ABI (a

@@ -17,18 +17,20 @@ NativeModule::~NativeModule() {
 
 NativeModule::NativeModule(NativeModule&& o) noexcept
     : por_indice(std::move(o.por_indice)), error_message(o.error_message),
-      rutas_por_indice(std::move(o.rutas_por_indice)), handle_(o.handle_) {
+      rutas_por_indice(std::move(o.rutas_por_indice)),
+      rutas_async_por_indice(std::move(o.rutas_async_por_indice)), handle_(o.handle_) {
     o.handle_ = nullptr;
 }
 
 NativeModule& NativeModule::operator=(NativeModule&& o) noexcept {
     if (this != &o) {
         if (handle_) dlclose(handle_);
-        por_indice       = std::move(o.por_indice);
-        error_message    = o.error_message;
-        rutas_por_indice = std::move(o.rutas_por_indice);
-        handle_          = o.handle_;
-        o.handle_        = nullptr;
+        por_indice             = std::move(o.por_indice);
+        error_message          = o.error_message;
+        rutas_por_indice       = std::move(o.rutas_por_indice);
+        rutas_async_por_indice = std::move(o.rutas_async_por_indice);
+        handle_                = o.handle_;
+        o.handle_              = nullptr;
     }
     return *this;
 }
@@ -42,6 +44,7 @@ size_t NativeModule::compiladas() const {
 size_t NativeModule::rutas_compiladas() const {
     size_t n = 0;
     for (auto* f : rutas_por_indice) if (f) ++n;
+    for (auto* f : rutas_async_por_indice) if (f) ++n;
     return n;
 }
 
@@ -186,7 +189,8 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
         size_t      indice;
         std::string simbolo;
     };
-    std::vector<RutaGenerada> rutas_generadas;
+    std::vector<RutaGenerada> rutas_generadas;       // void(Request&, Response&)
+    std::vector<RutaGenerada> rutas_async_generadas; // Task<void>(Request&, Response&)
     std::string               rutas_cuerpos;
     for (size_t i = 0; i < prog.routes.size(); ++i) {
         const RouteDecl& r = prog.routes[i];
@@ -207,13 +211,14 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
         if (!generada) continue;
 
         rutas_cuerpos += generada->cuerpo_cpp + "\n\n";
-        rutas_generadas.push_back({i, generada->simbolo});
+        (generada->asincrona ? rutas_async_generadas : rutas_generadas)
+            .push_back({i, generada->simbolo});
     }
 
-    if (generadas.empty() && rutas_generadas.empty())
+    if (generadas.empty() && rutas_generadas.empty() && rutas_async_generadas.empty())
         return nullptr; // nada que ofrecer nativo: no es un error
 
-    const bool con_rutas = !rutas_generadas.empty();
+    const bool con_rutas = !rutas_generadas.empty() || !rutas_async_generadas.empty();
 
     std::string codigo =
         "#include <cctype>\n#include <cstdint>\n#include <initializer_list>\n#include <string>\n"
@@ -236,8 +241,13 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
     // Cabeceras de lumen::Request/Response y el binding de parametros SOLO
     // si hay al menos una ruta: eso si es exclusivo de rutas (ninguna
     // funcion suelta ve jamas un Request/Response).
+    // <lumen/task.hpp>: Task<void>/sleep() -- Fase 5, `await sleep(ms)` --
+    // hace falta siempre que haya rutas, no solo las que de verdad usan
+    // `await`: es mas simple incluirla siempre que decidir aqui cual de
+    // ellas la necesita de verdad (route_runtime_prelude() la usa igual).
     if (con_rutas)
-        codigo += "#include <lumen/request.hpp>\n#include <lumen/response.hpp>\n\n" +
+        codigo += "#include <lumen/request.hpp>\n#include <lumen/response.hpp>\n"
+                  "#include <lumen/task.hpp>\n\n" +
                   route_runtime_prelude() + "\n";
     codigo += clases_texto + "\n" + prototipos + "\n" + cuerpos;
     if (con_rutas) codigo += rutas_cuerpos;
@@ -267,20 +277,36 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
     cmd << "-I" << std::quoted(std::string(LUMEN_NATIVE_INCLUDE_DIR)) << " ";
     cmd << std::quoted(src_path.string()) << " -o " << std::quoted(so_path.string());
     cmd << " " << std::quoted(std::string(LUMEN_NATIVE_SCRIPT_LIB));
+    // liblumen.a: SOLO si hay rutas -- una funcion suelta nunca usa
+    // lumen::Task/lumen::Response, asi que nunca deja un simbolo de lumen
+    // sin resolver. Orden importante para un enlazado estatico: DESPUES de
+    // liblumen_script.a (que ya la necesita transitivamente) y del propio
+    // .cpp (que la necesita directamente para Task<void>::promise_type::
+    // FinalAwaitable::await_suspend -- EpollLoop::post -- en cualquier ruta
+    // con `await`, ver el comentario de LUMEN_NATIVE_LIB en CMakeLists.txt).
+    if (con_rutas) cmd << " " << std::quoted(std::string(LUMEN_NATIVE_LIB));
     cmd << " 2> " << std::quoted(err_path.string());
     if (std::system(cmd.str().c_str()) != 0) {
         std::ifstream errf(err_path);
         std::ostringstream errs;
         errs << errf.rdbuf();
-        aviso = "--native: " + std::to_string(generadas.size() + rutas_generadas.size()) +
+        aviso = "--native: " + std::to_string(generadas.size() + rutas_generadas.size() +
+                                              rutas_async_generadas.size()) +
                 " funcion(es)/ruta(s) no se pudieron compilar (g++ fallo): " + errs.str();
         return nullptr;
     }
 
     void* handle = dlopen(so_path.c_str(), RTLD_NOW);
     if (!handle) {
+        // dlerror() tiene semantica "de un solo uso": una segunda llamada
+        // (la que hacia el ternario de antes, `dlerror() ? dlerror() : ...`)
+        // ya devuelve nullptr porque la primera consumio el mensaje --
+        // std::string + nullptr es UB (aqui, un SEGV real, encontrado
+        // probando esto contra un dlopen que de verdad fallaba). Una sola
+        // llamada, guardada.
+        const char* motivo = dlerror();
         aviso = std::string("--native: no se pudo cargar la biblioteca generada: ") +
-                (dlerror() ? dlerror() : "motivo desconocido");
+                (motivo ? motivo : "motivo desconocido");
         return nullptr;
     }
 
@@ -288,6 +314,7 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
     out->handle_ = handle;
     out->por_indice.assign(nombre_por_indice.size(), nullptr);
     out->rutas_por_indice.assign(prog.routes.size(), nullptr);
+    out->rutas_async_por_indice.assign(prog.routes.size(), nullptr);
 
     out->error_message =
         reinterpret_cast<ErrorMessageFn>(dlsym(handle, "lumen_native_error_message"));
@@ -302,6 +329,11 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
         void* sym = dlsym(handle, g.simbolo.c_str());
         if (!sym) { simbolos_sin_resolver += " " + g.simbolo; continue; }
         out->rutas_por_indice[g.indice] = reinterpret_cast<NativeModule::RouteFn>(sym);
+    }
+    for (const auto& g : rutas_async_generadas) {
+        void* sym = dlsym(handle, g.simbolo.c_str());
+        if (!sym) { simbolos_sin_resolver += " " + g.simbolo; continue; }
+        out->rutas_async_por_indice[g.indice] = reinterpret_cast<NativeModule::RouteFnAsync>(sym);
     }
     if (!out->error_message) simbolos_sin_resolver += " lumen_native_error_message";
     if (!simbolos_sin_resolver.empty())

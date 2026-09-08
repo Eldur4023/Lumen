@@ -8,6 +8,8 @@
 #include "emitter.hpp"
 #include "native_abi.hpp"
 
+#include <lumen/task.hpp>
+
 namespace lumen {
 class Request;
 class Response;
@@ -56,6 +58,14 @@ public:
     // sirviendo con bytecode".
     using RouteFn = void (*)(lumen::Request&, lumen::Response&);
     std::vector<RouteFn> rutas_por_indice;
+
+    // Fase 5: una ruta cuyo cuerpo usa `await` (hoy: solo `await
+    // sleep(ms)`, ver Comprobador::usa_await()) se genera como una
+    // corrutina real -- mismo indexado que rutas_por_indice, pero una ruta
+    // dada esta en UNA sola de las dos tablas nunca en las dos (ver
+    // RutaNativa::asincrona).
+    using RouteFnAsync = lumen::Task<void> (*)(lumen::Request&, lumen::Response&);
+    std::vector<RouteFnAsync> rutas_async_por_indice;
 
     size_t compiladas() const;
     size_t rutas_compiladas() const;

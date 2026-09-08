@@ -137,17 +137,23 @@ add_library(lumen_script STATIC
 target_include_directories(lumen_script PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(lumen_script PUBLIC lumen ${CMAKE_DL_LIBS})
 
-# --native (Fase 4, rutas): native_build.cpp invoca g++ como subproceso para
-# compilar el .cpp que genera una ruta -- necesita saber, en tiempo de
+# --native (Fase 4/5, rutas): native_build.cpp invoca g++ como subproceso
+# para compilar el .cpp que genera una ruta -- necesita saber, en tiempo de
 # ejecucion del binario `lumen`, donde estan las cabeceras del propio
 # proyecto (para #include <lumen/response.hpp>, <lumen_script/value.hpp>...)
-# y donde quedo liblumen_script.a ya compilada (para enlazar Value::write_json,
-# que no es inline -- ver el comentario en generar_ruta_nativa). No hay forma
-# de que un binario ya enlazado adivine esas rutas por su cuenta: se hornean
-# aqui, en tiempo de compilacion de CMake, como estas dos macros.
+# y donde quedaron liblumen_script.a/liblumen.a ya compiladas. liblumen_script
+# hace falta para Value::write_json (no es inline); liblumen para
+# lumen::core::EpollLoop::post -- que necesita cualquier ruta con `await`,
+# porque el Task<void> que genera una corrutina la agenda para autodestruirse
+# ahi cuando termina (ver Task<void>::promise_type::FinalAwaitable en
+# task.hpp) -- encontrado en la practica (undefined symbol al cargar el .so)
+# probando la primera ruta con `await sleep(...)`, no adivinado de antemano.
+# No hay forma de que un binario ya enlazado adivine estas rutas por su
+# cuenta: se hornean aqui, en tiempo de compilacion de CMake.
 target_compile_definitions(lumen_script PRIVATE
     LUMEN_NATIVE_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
-    LUMEN_NATIVE_SCRIPT_LIB="$<TARGET_FILE:lumen_script>")
+    LUMEN_NATIVE_SCRIPT_LIB="$<TARGET_FILE:lumen_script>"
+    LUMEN_NATIVE_LIB="$<TARGET_FILE:lumen>")
 
 if(LUMEN_SQLITE)
     find_path(SQLITE3_INC sqlite3.h)
@@ -196,6 +202,17 @@ target_compile_options(lumen_script PRIVATE -Wall -Wextra)
 add_executable(lumen-bin src/lumen_script/main.cpp)
 set_target_properties(lumen-bin PROPERTIES OUTPUT_NAME lumen)
 target_link_libraries(lumen-bin PRIVATE lumen_script)
+# --native (Fase 5, `await`): sin esto, el .so que dlopen() carga en tiempo
+# de ejecucion NO comparte los `inline thread_local` de task.hpp
+# (lumen::detail::current_loop/current_token, que HttpConnection::dispatch()
+# deja puestos antes de cada peticion) con este ejecutable -- cada uno se
+# lleva su propia copia privada, siempre a null en la del .so. Sin loop,
+# SleepAwaitable::await_suspend() resume el acto, sin esperar nada: `await
+# sleep(200)` en una ruta nativa respondia en ~3ms en vez de ~200ms,
+# encontrado probando la primera ruta con `await` de verdad contra HTTP, no
+# adivinado de antemano. -rdynamic exporta los simbolos de este binario al
+# tabla dinamica para que el .so resuelva contra ELLOS, no cree los suyos.
+target_link_options(lumen-bin PRIVATE -rdynamic)
 
 # Herramientas de desarrollo del frontend.
 add_executable(dump_tokens src/lumen_script/tools/dump_tokens.cpp)

@@ -240,7 +240,17 @@ std::string dict_runtime_prelude();
 // mismos codigo generado.
 struct RutaNativa {
     std::string simbolo;    // "lumen_native_route_<indice>"
-    std::string cuerpo_cpp; // "extern \"C\" void <simbolo>(lumen::Request&, lumen::Response&) { ... }"
+    std::string cuerpo_cpp; // "extern \"C\" void/Task<void> <simbolo>(lumen::Request&, lumen::Response&) { ... }"
+
+    // Fase 5: un cuerpo que usa `await` (hoy: solo `await sleep(ms)`, ver
+    // Comprobador::usa_await()) se genera como `lumen::Task<void>` de
+    // verdad -- una corrutina, no una funcion plana -- porque es el UNICO
+    // punto de entrada nativo que build_routes() invoca directamente (nadie
+    // mas necesita suspenderse a mitad). `simbolo` es el mismo en los dos
+    // casos; compilar_nativo() usa este campo para saber en cual de las dos
+    // tablas de NativeModule (rutas_por_indice / rutas_async_por_indice)
+    // dejar el puntero que resuelva dlsym().
+    bool asincrona = false;
 };
 
 // Genera el C++ de una ruta, o nullopt si algo de ella (parametros o cuerpo)
