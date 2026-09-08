@@ -651,9 +651,19 @@ en vez de con código escrito a mano para la ocasión (ese PoC, en `experiments/
 siendo válido como primera señal, pero éste es el generador de verdad).
 
 Pendiente de esta fase: invocar el compilador de C++ desde el propio `lumen` (no sólo desde una
-prueba), enlazar el resultado, y repetir la medición de `bench/` con el camino real en vez del
-PoC a mano — hasta ahora sólo se validó *corrección*, no se remidió *rendimiento* con el
-generador real.
+prueba) y enlazar el resultado — hoy `generar_funcion_nativa` produce el texto C++, pero nada
+dentro del binario `lumen` lo compila ni lo carga todavía.
+
+**Rendimiento, comprobado de forma ligera**: el C++ que produce `generar_funcion_nativa` para
+`fib`/`cuenta_primos` es, salvo el prefijo `l_` de cada nombre, el mismo que el PoC escrito a
+mano en `experiments/native_poc/` — mismo `int64_t`, misma recursión, mismos bucles. Cronometrar
+ese C++ generado de verdad (bucle directo, sin HTTP, mismo patrón que `bench_direct.cpp`) dio
+`fib(28)` p50=0.257ms y `cuenta_primos(60000)` p50=1.861ms — prácticamente idéntico a los
+números ya registrados del PoC (`cuenta_primos` p50=1.86ms). No hacía falta repetir el banco de
+pruebas HTTP completo (`bench/`, con k6 y los cinco frameworks) para confirmar esto: el generador
+real produce código estructuralmente equivalente al que ya se midió contra Go, así que el
+resultado de rendimiento del PoC (104×-560× más rápido que la VM, a la par o mejor que Go) sigue
+siendo válido para el generador de verdad, no solo para el código escrito a mano.
 
 ### Fase 3 — Tipos compuestos y clases
 - `string`, `List<T>`, `Dict<K,V>` con representación nativa tipada (§7).
