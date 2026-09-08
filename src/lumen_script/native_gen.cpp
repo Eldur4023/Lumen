@@ -7,6 +7,22 @@
 namespace lumen_script {
 namespace {
 
+// Los unicos elementos de List que esta fase sabe representar -- un nivel,
+// sin anidar (List<List<int>> queda fuera: su elemento no es ninguno de
+// estos cuatro).
+bool tipo_elemento_lista_soportado(const Type& elem) {
+    if (elem.is_optional()) return false;
+    switch (elem.kind()) {
+        case Type::Kind::Int:
+        case Type::Kind::Float:
+        case Type::Kind::Bool:
+        case Type::Kind::String:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Los unicos Type que esta fase sabe representar de forma nativa -- ver la
 // tabla de §7. `?` (optional) haria falta empaquetarlo (std::optional<T> o
 // un centinela) y esta fase no lo cubre todavia: una funcion con un
@@ -16,10 +32,9 @@ namespace {
 // intrusivo que describe §8 para listas/diccionarios/instancias -- porque en
 // Lumen Script una cadena es inmutable (concatenar produce una cadena nueva,
 // nunca muta la existente), asi que compartirla o copiarla es exactamente lo
-// mismo desde fuera: no hay manera de observar la diferencia. Compartir por
-// refcount es una optimizacion de rendimiento reservada para cuando haga
-// falta (la Fase 7 aplica el mismo razonamiento a clases, mediante analisis
-// de escape); por ahora, correcto antes que rapido.
+// mismo desde fuera: no hay manera de observar la diferencia. `List`, en
+// cambio, SI es mutable (`.add()`) y SI necesita semantica de referencia
+// real -- ver LList en list_runtime_prelude() y el comentario de §8.
 bool tipo_soportado(const Type& t) {
     if (t.is_optional()) return false;
     switch (t.kind()) {
@@ -29,6 +44,8 @@ bool tipo_soportado(const Type& t) {
         case Type::Kind::Void:
         case Type::Kind::String:
             return true;
+        case Type::Kind::List:
+            return tipo_elemento_lista_soportado(t.element());
         default:
             return false;
     }
@@ -40,13 +57,14 @@ bool es_numerico(Type::Kind k) { return k == Type::Kind::Int || k == Type::Kind:
 // native_abi.hpp (NativeValue solo tiene un int64_t/double/bool en su
 // union): una funcion cuyos parametros y retorno caen todos aqui puede
 // recibir un wrapper `extern "C"` y ser invocada desde la VM; una que use
-// `string` en su frontera todavia no -- pero SI se genera su cuerpo C++
-// (ver generar_funcion_nativa), asi que otra funcion nativa que la llame
-// directamente (sin pasar por la ABI) se beneficia igual. Extender la ABI
-// para que tambien lleve cadenas queda para cuando una funcion con `string`
-// en la frontera sea, ella misma, el objetivo de una llamada desde bytecode.
+// `string`/`List` en su frontera todavia no -- pero SI se genera su cuerpo
+// C++ (ver generar_funcion_nativa), asi que otra funcion nativa que la
+// llame directamente (sin pasar por la ABI) se beneficia igual. Extender la
+// ABI para que tambien lleve esos tipos queda para cuando una funcion con
+// uno de ellos en la frontera sea, ella misma, el objetivo de una llamada
+// desde bytecode.
 bool tipo_abi_soportado(const Type& t) {
-    return tipo_soportado(t) && t.kind() != Type::Kind::String;
+    return tipo_soportado(t) && t.kind() != Type::Kind::String && t.kind() != Type::Kind::List;
 }
 
 std::string tipo_cpp(const Type& t) {
@@ -56,6 +74,7 @@ std::string tipo_cpp(const Type& t) {
         case Type::Kind::Bool:   return "bool";
         case Type::Kind::Void:   return "void";
         case Type::Kind::String: return "std::string";
+        case Type::Kind::List:   return "LList<" + tipo_cpp(t.element()) + ">";
         default: return ""; // inalcanzable si tipo_soportado() dio el visto bueno
     }
 }
@@ -98,7 +117,7 @@ std::string campo_abi(Type::Kind k) {
         case Type::Kind::Int:   return "i";
         case Type::Kind::Float: return "d";
         case Type::Kind::Bool:  return "b";
-        default: return ""; // inalcanzable: tipo_soportado() ya lo descarto
+        default: return ""; // inalcanzable: tipo_abi_soportado() ya lo descarto
     }
 }
 
@@ -156,53 +175,86 @@ bool metodo_string_devuelve_bool(const std::string& nombre) {
 // para casi todo) porque solo necesita servir a un puñado de comprobaciones
 // puntuales del checker; esta funcion necesita ser SOLIDA, asi que es un
 // analisis propio, mas estricto y mas completo, solo para esta fase.
+//
+// Devuelve un Type COMPLETO, no solo un Kind: List<int> y List<string>
+// tienen el mismo Kind pero son tipos distintos, y Type::operator== ya sabe
+// comparar eso (incluido el elemento, recursivamente).
 class Comprobador {
 public:
     explicit Comprobador(const std::vector<std::string>& nombre_por_indice,
                         const TablaFirmas& firmas)
         : nombre_por_indice_(nombre_por_indice), firmas_(firmas) {}
 
-    // Ranura -> tipo declarado, en el orden en que VarDecl/parametros los
-    // van presentando -- igual que Generador::ranura_a_nombre_, pero de
+    // Ranura -> tipo declarado, en el orden en que VarDecl/parametros/`for`
+    // los van presentando -- igual que Generador::ranura_a_nombre_, pero de
     // tipo en vez de nombre. Una vez registrada, una ranura mantiene ESE
     // tipo durante toda la funcion: es la CONSECUENCIA (no la causa) de que
     // stmt_compilable() exija que cualquier Assign(Local) sobre esa ranura
     // demuestre el mismo tipo -- por induccion, un Ident que resuelve aqui
     // tiene garantizado que su valor real coincide siempre.
-    void registrar(int slot, Type::Kind k) { ranura_tipos_[slot] = k; }
+    void registrar(int slot, Type t) { ranura_tipos_.insert_or_assign(slot, std::move(t)); }
 
-    // Nullopt si no se puede demostrar; si no, el Type::Kind exacto que el
-    // VM SIEMPRE produciria para esta expresion, con los mismos valores.
-    std::optional<Type::Kind> tipo_provable(const IrExpr& e) const {
+    // Expuesto para que Generador pueda resolver el tipo C++ de la variable
+    // de un `for` (la unica ranura cuyo tipo no viene de una anotacion
+    // explicita en el .lum, sino del elemento de la lista que se recorre --
+    // ver el caso IrStmtKind::For mas abajo).
+    const std::map<int, Type>& ranura_tipos() const { return ranura_tipos_; }
+
+    // Nullopt si no se puede demostrar; si no, el Type exacto que el VM
+    // SIEMPRE produciria para esta expresion, con los mismos valores.
+    std::optional<Type> tipo_provable(const IrExpr& e) const {
         switch (e.kind) {
-            case IrExprKind::IntLit:    return Type::Kind::Int;
-            case IrExprKind::FloatLit:  return Type::Kind::Float;
-            case IrExprKind::BoolLit:   return Type::Kind::Bool;
-            case IrExprKind::StringLit: return Type::Kind::String;
+            case IrExprKind::IntLit:    return Type::primitive(Type::Kind::Int);
+            case IrExprKind::FloatLit:  return Type::primitive(Type::Kind::Float);
+            case IrExprKind::BoolLit:   return Type::primitive(Type::Kind::Bool);
+            case IrExprKind::StringLit: return Type::primitive(Type::Kind::String);
 
             // Sin representacion en esta fase, o sin sentido fuera de una
             // ruta/clase.
             case IrExprKind::NullLit:
-            case IrExprKind::ListLit:
             case IrExprKind::DictLit:
             case IrExprKind::Member:
-            case IrExprKind::Index:
             case IrExprKind::Await:
             case IrExprKind::This:
                 return std::nullopt;
 
             case IrExprKind::Ident: {
                 auto it = ranura_tipos_.find(e.slot);
-                return it == ranura_tipos_.end() ? std::nullopt
-                                                 : std::optional<Type::Kind>(it->second);
+                return it == ranura_tipos_.end() ? std::nullopt : std::optional<Type>(it->second);
+            }
+
+            // [a, b, c]: demostrable solo si TODOS los elementos demuestran
+            // el MISMO tipo (una lista vacia no tiene de donde inferir el
+            // elemento -- se queda fuera).
+            case IrExprKind::ListLit: {
+                if (e.items.empty() || !e.items[0]) return std::nullopt;
+                auto t0 = tipo_provable(*e.items[0]);
+                if (!t0 || !tipo_elemento_lista_soportado(*t0)) return std::nullopt;
+                for (size_t i = 1; i < e.items.size(); ++i) {
+                    if (!e.items[i]) return std::nullopt;
+                    auto ti = tipo_provable(*e.items[i]);
+                    if (!ti || *ti != *t0) return std::nullopt;
+                }
+                return Type::list_of(*t0);
+            }
+
+            // xs[i]: object es el receptor, lhs el indice (ver el
+            // comentario de IrExpr en ir.hpp).
+            case IrExprKind::Index: {
+                if (!e.object || !e.lhs) return std::nullopt;
+                auto tobj = tipo_provable(*e.object);
+                auto tidx = tipo_provable(*e.lhs);
+                if (!tobj || tobj->kind() != Type::Kind::List) return std::nullopt;
+                if (!tidx || tidx->kind() != Type::Kind::Int) return std::nullopt;
+                return tobj->element();
             }
 
             case IrExprKind::Unary: {
                 if (!e.lhs) return std::nullopt;
                 auto t = tipo_provable(*e.lhs);
                 if (!t) return std::nullopt;
-                if (e.text == "not") return Type::Kind::Bool; // Op::Not: siempre bool
-                return es_numerico(*t) ? t : std::nullopt;    // '-': solo sobre numeros
+                if (e.text == "not") return Type::primitive(Type::Kind::Bool); // Op::Not: siempre bool
+                return es_numerico(t->kind()) ? t : std::nullopt; // '-': solo sobre numeros
             }
 
             case IrExprKind::Binary: {
@@ -222,38 +274,41 @@ public:
                 // (evaluar una vez, devolver el operando) -- se queda sin
                 // compilar.
                 if (e.text == "and" || e.text == "or")
-                    return (*tl == Type::Kind::Bool && *tr == Type::Kind::Bool)
-                               ? std::optional<Type::Kind>(Type::Kind::Bool) : std::nullopt;
+                    return (tl->kind() == Type::Kind::Bool && tr->kind() == Type::Kind::Bool)
+                               ? std::optional<Type>(Type::primitive(Type::Kind::Bool))
+                               : std::nullopt;
 
                 if (e.text == "==" || e.text == "!=" || e.text == "<" || e.text == "<=" ||
                     e.text == ">" || e.text == ">=") {
-                    bool numericos = es_numerico(*tl) && es_numerico(*tr);
-                    bool strings   = *tl == Type::Kind::String && *tr == Type::Kind::String;
-                    return (numericos || strings) ? std::optional<Type::Kind>(Type::Kind::Bool)
+                    bool numericos = es_numerico(tl->kind()) && es_numerico(tr->kind());
+                    bool strings   = tl->kind() == Type::Kind::String &&
+                                    tr->kind() == Type::Kind::String;
+                    return (numericos || strings) ? std::optional<Type>(Type::primitive(Type::Kind::Bool))
                                                   : std::nullopt;
                 }
 
-                if (e.text == "+" && *tl == Type::Kind::String && *tr == Type::Kind::String)
-                    return Type::Kind::String;
+                if (e.text == "+" && tl->kind() == Type::Kind::String &&
+                    tr->kind() == Type::Kind::String)
+                    return Type::primitive(Type::Kind::String);
 
-                if (!es_numerico(*tl) || !es_numerico(*tr)) return std::nullopt;
+                if (!es_numerico(tl->kind()) || !es_numerico(tr->kind())) return std::nullopt;
 
                 if (e.text == "%") // vm.cpp: '%' exige enteros a los dos lados
-                    return (*tl == Type::Kind::Int && *tr == Type::Kind::Int)
-                               ? std::optional<Type::Kind>(Type::Kind::Int) : std::nullopt;
+                    return (tl->kind() == Type::Kind::Int && tr->kind() == Type::Kind::Int)
+                               ? std::optional<Type>(Type::primitive(Type::Kind::Int)) : std::nullopt;
 
                 if (e.text == "/")
                     // vm.cpp: entre dos int, Int si la division es EXACTA y
                     // Float si no -- una rama que solo el valor en tiempo de
                     // ejecucion decide. No demostrable estaticamente.
-                    return (*tl == Type::Kind::Int && *tr == Type::Kind::Int)
-                               ? std::nullopt : std::optional<Type::Kind>(Type::Kind::Float);
+                    return (tl->kind() == Type::Kind::Int && tr->kind() == Type::Kind::Int)
+                               ? std::nullopt : std::optional<Type>(Type::primitive(Type::Kind::Float));
 
                 // +, -, *: Int si los dos son Int, Float en cualquier otra
                 // combinacion numerica (vm.cpp: `ints ? integer : real`).
-                return (*tl == Type::Kind::Int && *tr == Type::Kind::Int)
-                           ? std::optional<Type::Kind>(Type::Kind::Int)
-                           : std::optional<Type::Kind>(Type::Kind::Float);
+                return (tl->kind() == Type::Kind::Int && tr->kind() == Type::Kind::Int)
+                           ? std::optional<Type>(Type::primitive(Type::Kind::Int))
+                           : std::optional<Type>(Type::primitive(Type::Kind::Float));
             }
 
             case IrExprKind::Ternary: {
@@ -272,18 +327,35 @@ public:
             case IrExprKind::PostStep: {
                 if (!e.lhs || e.lhs->kind != IrExprKind::Ident) return std::nullopt;
                 auto t = tipo_provable(*e.lhs);
-                return (t && es_numerico(*t)) ? t : std::nullopt;
+                return (t && es_numerico(t->kind())) ? t : std::nullopt;
             }
 
             case IrExprKind::Call: {
                 if (e.call_shape == IrCallShape::BuiltinMethodCall) {
-                    if (!e.object || e.object->type.kind() != Type::Kind::String ||
-                        !metodo_string_soportado(e.call_name) || !tipo_provable(*e.object))
-                        return std::nullopt;
-                    for (const auto& a : e.args)
-                        if (!a.value || !tipo_provable(*a.value)) return std::nullopt;
-                    return metodo_string_devuelve_bool(e.call_name)
-                               ? Type::Kind::Bool : Type::Kind::String;
+                    if (!e.object) return std::nullopt;
+                    auto tobj = tipo_provable(*e.object);
+                    if (!tobj) return std::nullopt;
+
+                    if (tobj->kind() == Type::Kind::String) {
+                        if (!metodo_string_soportado(e.call_name)) return std::nullopt;
+                        for (const auto& a : e.args)
+                            if (!a.value || !tipo_provable(*a.value)) return std::nullopt;
+                        return metodo_string_devuelve_bool(e.call_name)
+                                   ? Type::primitive(Type::Kind::Bool)
+                                   : Type::primitive(Type::Kind::String);
+                    }
+                    // El unico metodo de List que reconoce metodos_de()
+                    // (natives.cpp: kList) es "add" -- muta la lista en
+                    // sitio y devuelve la MISMA lista (recv), igual que
+                    // call_method(). El argumento tiene que ser exactamente
+                    // el tipo del elemento.
+                    if (tobj->kind() == Type::Kind::List && e.call_name == "add") {
+                        if (e.args.size() != 1 || !e.args[0].value) return std::nullopt;
+                        auto targ = tipo_provable(*e.args[0].value);
+                        if (!targ || *targ != tobj->element()) return std::nullopt;
+                        return tobj;
+                    }
+                    return std::nullopt;
                 }
                 if (e.call_shape == IrCallShape::UserFunctionCall) {
                     if (e.call_index < 0 ||
@@ -305,16 +377,16 @@ public:
         return std::nullopt;
     }
 
-    bool block_compilable(const IrBlock& b, Type::Kind retorno_fn) {
+    bool block_compilable(const IrBlock& b, const Type& retorno_fn) {
         for (const auto& s : b)
             if (!s || !stmt_compilable(*s, retorno_fn)) return false;
         return true;
     }
 
-    bool stmt_compilable(const IrStmt& s, Type::Kind retorno_fn) {
+    bool stmt_compilable(const IrStmt& s, const Type& retorno_fn) {
         switch (s.kind) {
             case IrStmtKind::Return: {
-                if (!s.value) return retorno_fn == Type::Kind::Void;
+                if (!s.value) return retorno_fn.kind() == Type::Kind::Void;
                 auto t = tipo_provable(*s.value);
                 return t && *t == retorno_fn;
             }
@@ -326,26 +398,45 @@ public:
                 if (!tipo_soportado(s.decl_type)) return false;
                 if (s.value) {
                     auto t = tipo_provable(*s.value);
-                    if (!t || *t != s.decl_type.kind()) return false;
+                    if (!t || *t != s.decl_type) return false;
                 }
                 // Registrar DESPUES de comprobar el valor: una redeclaracion
                 // (mismo nombre, ranura nueva) no debe validarse contra si
                 // misma.
-                registrar(s.slot, s.decl_type.kind());
+                registrar(s.slot, s.decl_type);
                 return true;
             }
 
-            // Solo la forma Local: Session/Index/Member implican sesion, un
-            // contenedor o una clase. El nuevo valor tiene que demostrar
-            // EXACTAMENTE el tipo con el que esa ranura se declaro -- es la
-            // regla que mantiene solido tipo_provable(Ident) durante el
-            // resto de la funcion (ver el comentario de registrar()).
             case IrStmtKind::Assign: {
-                if (s.assign_target != IrAssignTarget::Local || !s.value) return false;
-                auto original = ranura_tipos_.find(s.assign_slot);
-                if (original == ranura_tipos_.end()) return false;
-                auto t = tipo_provable(*s.value);
-                return t && *t == original->second;
+                if (!s.value) return false;
+                if (s.assign_target == IrAssignTarget::Local) {
+                    // El nuevo valor tiene que demostrar EXACTAMENTE el
+                    // tipo con el que esa ranura se declaro -- es la regla
+                    // que mantiene solido tipo_provable(Ident) durante el
+                    // resto de la funcion (ver el comentario de
+                    // registrar()).
+                    auto original = ranura_tipos_.find(s.assign_slot);
+                    if (original == ranura_tipos_.end()) return false;
+                    auto t = tipo_provable(*s.value);
+                    return t && *t == original->second;
+                }
+                if (s.assign_target == IrAssignTarget::Index) {
+                    // xs[i] = v: solo sobre una variable (una expresion
+                    // temporal -- p.ej. el resultado de una llamada -- no
+                    // tiene sentido mutarla in place) de tipo List, con el
+                    // indice Int y el valor exactamente del tipo del
+                    // elemento.
+                    if (!s.assign_object || s.assign_object->kind != IrExprKind::Ident ||
+                        !s.assign_index)
+                        return false;
+                    auto tobj = tipo_provable(*s.assign_object);
+                    auto tidx = tipo_provable(*s.assign_index);
+                    auto tval = tipo_provable(*s.value);
+                    if (!tobj || tobj->kind() != Type::Kind::List) return false;
+                    if (!tidx || tidx->kind() != Type::Kind::Int) return false;
+                    return tval && *tval == tobj->element();
+                }
+                return false; // Session/Member: sesion o clase, fuera de esta fase
             }
 
             case IrStmtKind::If:
@@ -361,12 +452,25 @@ public:
             case IrStmtKind::Continue:
                 return true;
 
-            // For itera una List (contenedor). Require y Try no son
-            // "primitivos y control de flujo" en el sentido estrecho de
-            // esta fase todavia -- Try en concreto necesita decidir como se
-            // representa un error nativo, que es una decision de la fase 5
-            // (asincronia y errores).
-            case IrStmtKind::For:
+            // `for x in xs:`: s.target es el iterable, s.name/s.slot la
+            // variable del bucle. El tipo de esa variable no viene de una
+            // anotacion en el .lum (Lumen no la exige) -- se DERIVA aqui
+            // del elemento de `xs`, la misma fuente de verdad que usara
+            // Generador para declarar la variable C++ correspondiente (ver
+            // Comprobador::ranura_tipos()).
+            //
+            // Require y Try no son "primitivos y control de flujo" en el
+            // sentido estrecho de esta fase todavia -- Try en concreto
+            // necesita decidir como se representa un error nativo, que es
+            // una decision de la fase 5 (asincronia y errores).
+            case IrStmtKind::For: {
+                if (!s.target) return false;
+                auto titer = tipo_provable(*s.target);
+                if (!titer || titer->kind() != Type::Kind::List) return false;
+                registrar(s.slot, titer->element());
+                return block_compilable(s.body, retorno_fn);
+            }
+
             case IrStmtKind::Require:
             case IrStmtKind::Try:
                 return false;
@@ -377,7 +481,7 @@ public:
 private:
     const std::vector<std::string>& nombre_por_indice_;
     const TablaFirmas&               firmas_;
-    std::map<int, Type::Kind>        ranura_tipos_;
+    std::map<int, Type>              ranura_tipos_;
 };
 
 // ── Generacion ────────────────────────────────────────────────────────────
@@ -407,8 +511,9 @@ const std::map<std::string, std::string>& operadores_binarios() {
 
 class Generador {
 public:
-    explicit Generador(const std::vector<std::string>& nombre_por_indice)
-        : nombre_por_indice_(nombre_por_indice) {}
+    Generador(const std::vector<std::string>& nombre_por_indice,
+             const std::map<int, Type>& ranura_tipos)
+        : nombre_por_indice_(nombre_por_indice), ranura_tipos_(ranura_tipos) {}
 
     // Ranura -> nombre C++ ya calculado, para poder generar `nombre = ...`
     // en un Assign(Local): el IrStmt solo trae `assign_slot` (lo unico que
@@ -420,11 +525,34 @@ public:
 
     std::string expr(const IrExpr& e) const {
         switch (e.kind) {
-            case IrExprKind::IntLit:    return std::to_string(e.int_value) + "LL";
+            // static_cast, no solo el sufijo LL: en glibc/x86-64, int64_t es
+            // `long` pero un literal `LL` es `long long` -- dos tipos
+            // DISTINTOS para el compilador (aunque los dos midan 64 bits),
+            // que la deduccion de tipo de LList{...} (ver ListLit) no
+            // confunde entre si. El cast deja el valor exactamente en el
+            // tipo que tipo_cpp(Int) promete en cualquier plataforma.
+            case IrExprKind::IntLit:
+                return "static_cast<int64_t>(" + std::to_string(e.int_value) + "LL)";
             case IrExprKind::FloatLit:  return literal_float(e.float_value);
             case IrExprKind::BoolLit:   return e.bool_value ? "true" : "false";
             case IrExprKind::StringLit: return "std::string(" + literal_string(e.text) + ")";
             case IrExprKind::Ident:     return nombre_cpp(e.text);
+
+            // CTAD (una guia de deduccion en list_runtime_prelude) deduce T
+            // solo con los elementos, sin que Generador tenga que saber el
+            // tipo aqui.
+            case IrExprKind::ListLit: {
+                std::string s = "LList{";
+                for (size_t i = 0; i < e.items.size(); ++i) {
+                    if (i) s += ", ";
+                    s += expr(*e.items[i]);
+                }
+                s += "}";
+                return s;
+            }
+
+            case IrExprKind::Index:
+                return expr(*e.object) + ".lumen_get(" + expr(*e.lhs) + ")";
 
             case IrExprKind::Unary:
                 return std::string("(") + (e.text == "not" ? "!" : "-") + expr(*e.lhs) + ")";
@@ -453,7 +581,15 @@ public:
             }
 
             case IrExprKind::Call: {
-                // BuiltinMethodCall (solo metodos de string, ver
+                // "add" sobre una List: sintaxis de metodo nativo
+                // (LList::lumen_add), no funcion libre como los de string
+                // -- es el unico metodo que Comprobador acepta sobre un
+                // receptor List (ver metodos_de()/kList en natives.cpp).
+                if (e.call_shape == IrCallShape::BuiltinMethodCall &&
+                    e.object->type.kind() == Type::Kind::List)
+                    return expr(*e.object) + ".lumen_add(" + expr(*e.args[0].value) + ")";
+
+                // BuiltinMethodCall (metodos de string, ver
                 // metodo_string_soportado): funcion libre de
                 // string_runtime_prelude(), receptor primero, luego los
                 // argumentos -- mismo orden que call_method(recv, args) en
@@ -498,12 +634,16 @@ public:
                        (s.value ? expr(*s.value) : valor_por_defecto(s.decl_type)) + ";";
             }
 
-            // stmt_compilable() ya garantizo assign_target == Local: el
-            // nombre C++ es el que se registro cuando esa ranura se declaro
-            // (un parametro o un VarDecl anterior).
-            case IrStmtKind::Assign:
+            case IrStmtKind::Assign: {
+                if (s.assign_target == IrAssignTarget::Index)
+                    return expr(*s.assign_object) + ".lumen_set(" + expr(*s.assign_index) +
+                           ", " + expr(*s.value) + ");";
+                // Local: stmt_compilable() ya garantizo esto. El nombre C++
+                // es el que se registro cuando esa ranura se declaro (un
+                // parametro o un VarDecl anterior).
                 return nombre_cpp(ranura_a_nombre_.at(s.assign_slot)) + " = " +
                        expr(*s.value) + ";";
+            }
 
             case IrStmtKind::If: {
                 std::string r = "if (" + expr(*s.value) + ") {\n" + block(s.body, indent + 1) +
@@ -520,6 +660,30 @@ public:
             case IrStmtKind::Break:    return "break;";
             case IrStmtKind::Continue: return "continue;";
 
+            // Snapshot del tamaño UNA vez (igual que el bytecode: ver el
+            // comentario de IrStmtKind::For en emitter.cpp -- `count` se
+            // calcula antes del bucle, no en cada vuelta), asi que si el
+            // cuerpo hace `.add()` sobre la misma lista que se recorre, el
+            // bucle sigue iterando solo sobre los elementos que ya habia al
+            // empezar -- el mismo comportamiento que el VM. `break`/
+            // `continue` son los de C++ de siempre: al generar un `for` de
+            // verdad, no hace falta ningun parcheo de saltos como en el
+            // bytecode.
+            case IrStmtKind::For: {
+                const std::string tipo_var = tipo_cpp(ranura_tipos_.at(s.slot));
+                std::string r = "{\n";
+                r += pad(indent + 1) + "const auto& l__for_items = " + expr(*s.target) + ";\n";
+                r += pad(indent + 1) + "const int64_t l__for_count = l__for_items.lumen_len();\n";
+                r += pad(indent + 1) +
+                     "for (int64_t l__for_i = 0; l__for_i < l__for_count; ++l__for_i) {\n";
+                r += pad(indent + 2) + tipo_var + " " + nombre_cpp(s.name) +
+                     " = l__for_items.lumen_get(l__for_i);\n";
+                r += block(s.body, indent + 2);
+                r += pad(indent + 1) + "}\n";
+                r += pad(indent) + "}";
+                return r;
+            }
+
             default:
                 return ""; // inalcanzable: Comprobador ya lo descarto antes de llegar aqui
         }
@@ -527,6 +691,7 @@ public:
 
 private:
     const std::vector<std::string>& nombre_por_indice_;
+    const std::map<int, Type>&       ranura_tipos_;
     std::map<int, std::string>      ranura_a_nombre_;
 
     static std::string pad(int indent) { return std::string(static_cast<size_t>(indent) * 4, ' '); }
@@ -536,7 +701,7 @@ private:
             case Type::Kind::Int:   return "0";
             case Type::Kind::Float: return "0.0";
             case Type::Kind::Bool:  return "false";
-            default:                return "{}";
+            default:                return "{}"; // string: "" ; List: vacia (ver list_runtime_prelude)
         }
     }
 };
@@ -556,9 +721,8 @@ std::optional<FuncionNativa> generar_funcion_nativa(const FnDecl& fn, const IrBl
     // (ver Emitter::check_function): la ranura i-esima es siempre el
     // parametro i-esimo -- mismo orden que Generador::registrar() mas abajo.
     for (size_t i = 0; i < fn.params.size(); ++i)
-        comprobador.registrar(static_cast<int>(i),
-                              Type::from_declared(fn.params[i].type).kind());
-    if (!comprobador.block_compilable(body, retorno_decl.kind())) return std::nullopt;
+        comprobador.registrar(static_cast<int>(i), Type::from_declared(fn.params[i].type));
+    if (!comprobador.block_compilable(body, retorno_decl)) return std::nullopt;
 
     FuncionNativa out;
     out.nombre_lumen = fn.name;
@@ -571,7 +735,12 @@ std::optional<FuncionNativa> generar_funcion_nativa(const FnDecl& fn, const IrBl
     }
     out.firma_cpp = tipo_cpp(retorno_decl) + " " + nombre_cpp(fn.name) + "(" + params + ")";
 
-    Generador gen(nombre_por_indice);
+    // ranura_tipos() ya trae el tipo de cada parametro (se registraron
+    // arriba) y de cada VarDecl/`for` que Comprobador acepto al recorrer el
+    // cuerpo -- Generador la reusa tal cual, en vez de volver a calcularla,
+    // para el tipo C++ de la variable de un `for` (ver el caso
+    // IrStmtKind::For en Generador::stmt).
+    Generador gen(nombre_por_indice, comprobador.ranura_tipos());
     for (size_t i = 0; i < fn.params.size(); ++i)
         gen.registrar(static_cast<int>(i), fn.params[i].name);
     out.cuerpo_cpp = "{\n" + gen.block(body, 1) + "}";
@@ -586,10 +755,11 @@ std::optional<FuncionNativa> generar_funcion_nativa(const FnDecl& fn, const IrBl
     // el final sin invocar lumen_native_fail() nunca lo atraviesa, asi que
     // no cuesta nada en el camino normal.
     //
-    // Si la frontera de la funcion usa `string`, la ABI fija de hoy no la
-    // representa (ver tipo_abi_soportado): el cuerpo de arriba se genera
-    // igual -- otra funcion nativa que la llame directamente se beneficia --
-    // pero sin wrapper, se queda fuera del despacho desde la VM.
+    // Si la frontera de la funcion usa `string`/`List`, la ABI fija de hoy
+    // no los representa (ver tipo_abi_soportado): el cuerpo de arriba se
+    // genera igual -- otra funcion nativa que la llame directamente se
+    // beneficia -- pero sin wrapper, se queda fuera del despacho desde la
+    // VM.
     bool frontera_cruza_abi = tipo_abi_soportado(retorno_decl);
     for (const auto& p : fn.params)
         frontera_cruza_abi = frontera_cruza_abi && tipo_abi_soportado(Type::from_declared(p.type));
@@ -678,12 +848,14 @@ std::string error_runtime_prelude() {
     // -- quien lo lee (vm.cpp) lo copia a su propio std::string antes de
     // hacer cualquier otra cosa.
     //
-    // lumen_div_check/lumen_mod_check son los unicos puntos de fallo que
-    // introduce esta fase (division y modulo por cero, vm.cpp: "division
-    // por cero" / "modulo por cero") -- plantillas porque el generador los
-    // usa tanto para int64_t/int64_t (modulo) como para cualquier mezcla de
-    // int64_t/double (division; ver tipo_provable(), que ya garantiza que
-    // una division entre dos int nunca llega aqui).
+    // lumen_div_check/lumen_mod_check son los puntos de fallo de la
+    // aritmetica (division y modulo por cero, vm.cpp: "division por cero" /
+    // "modulo por cero") -- plantillas porque el generador los usa tanto
+    // para int64_t/int64_t (modulo) como para cualquier mezcla de
+    // int64_t/double (division; ver Comprobador::tipo_provable(), que ya
+    // garantiza que una division entre dos int nunca llega aqui). LList
+    // (list_runtime_prelude) reusa lumen_native_fail() para "indice fuera
+    // de rango".
     return
         "static thread_local std::string g_lumen_native_error;\n"
         "struct LumenNativeError {};\n"
@@ -704,6 +876,68 @@ std::string error_runtime_prelude() {
         "    if (b == 0) lumen_native_fail(\"modulo por cero\");\n"
         "    return a % b;\n"
         "}\n";
+}
+
+std::string list_runtime_prelude() {
+    // Caja con refcount NO atomico -- a diferencia del Caja de value.hpp,
+    // una LList nunca cruza la ABI (tipo_abi_soportado la excluye, igual
+    // que string) asi que nunca viaja entre hilos: nace y muere dentro de
+    // una sola llamada nativa (la de la VM que la desencadeno) en un solo
+    // hilo. Semantica de referencia real (§8): copiar una LList copia el
+    // puntero a la caja, no los datos -- dos variables que apuntan a la
+    // misma lista ven las mutaciones la una de la otra, igual que
+    // Value::List en el VM.
+    //
+    // lumen_get/lumen_set comprueban el indice con lumen_native_fail() en
+    // vez de comportamiento indefinido -- el mismo canal de error que ya
+    // usan division/modulo, con el mismo formato de mensaje que GetIndex/
+    // SetIndex en vm.cpp ("indice fuera de rango: N (tamano M)").
+    //
+    // La guia de deduccion permite escribir `LList{1LL, 2LL, 3LL}` sin
+    // template argument explicito (Generador::expr, caso ListLit): el
+    // compilador deduce T de los elementos, asi que el generador no
+    // necesita saber el tipo para construir el literal.
+    return
+        "template <class T>\n"
+        "struct LListBox { long rc; std::vector<T> v; LListBox() : rc(1) {} };\n"
+        "template <class T>\n"
+        "class LList {\n"
+        "public:\n"
+        "    LList() : b_(new LListBox<T>()) {}\n"
+        "    LList(std::initializer_list<T> init) : b_(new LListBox<T>()) {\n"
+        "        b_->v.assign(init.begin(), init.end());\n"
+        "    }\n"
+        "    LList(const LList& o) : b_(o.b_) { ++b_->rc; }\n"
+        "    LList(LList&& o) noexcept : b_(o.b_) { o.b_ = nullptr; }\n"
+        "    LList& operator=(const LList& o) {\n"
+        "        if (b_ != o.b_) { rel(); b_ = o.b_; ++b_->rc; }\n"
+        "        return *this;\n"
+        "    }\n"
+        "    LList& operator=(LList&& o) noexcept {\n"
+        "        if (this != &o) { rel(); b_ = o.b_; o.b_ = nullptr; }\n"
+        "        return *this;\n"
+        "    }\n"
+        "    ~LList() { rel(); }\n"
+        "    int64_t lumen_len() const { return (int64_t)b_->v.size(); }\n"
+        "    T lumen_get(int64_t i) const {\n"
+        "        if (i < 0 || i >= (int64_t)b_->v.size())\n"
+        "            lumen_native_fail(\"indice fuera de rango: \" + std::to_string(i) +\n"
+        "                              \" (tamano \" + std::to_string(b_->v.size()) + \")\");\n"
+        "        return b_->v[(size_t)i];\n"
+        "    }\n"
+        "    void lumen_set(int64_t i, T x) const {\n"
+        "        if (i < 0 || i >= (int64_t)b_->v.size())\n"
+        "            lumen_native_fail(\"indice fuera de rango: \" + std::to_string(i) +\n"
+        "                              \" (tamano \" + std::to_string(b_->v.size()) + \")\");\n"
+        "        b_->v[(size_t)i] = std::move(x);\n"
+        "    }\n"
+        "    LList lumen_add(T x) const { b_->v.push_back(std::move(x)); return *this; }\n"
+        "private:\n"
+        "    void rel() { if (b_ && --b_->rc == 0) delete b_; }\n"
+        "    LListBox<T>* b_;\n"
+        "};\n"
+        "template <class T>\n"
+        "LList(std::initializer_list<T>) -> LList<T>;\n";
 }
 
 } // namespace lumen_script

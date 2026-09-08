@@ -839,8 +839,8 @@ y lanza una excepción vacía (`LumenNativeError`) que solo el wrapper `extern "
 por medio) deja que la excepción se propague sola por la pila de C++ hasta ahí, igual que un error
 Lumen sin `try` sube hasta quien llama. La VM, del lado de la ABI, lee `NativeDispatch::error_message`
 justo cuando ve `NativeValue::Tag::Error` y lo convierte en el mismo `fail()` que usaría el bytecode
-equivalente. Es infraestructura general, no un parche para `%`: la Fase 3 la reusará para "índice
-fuera de rango" en cuanto llegue a `List`.
+equivalente. Es infraestructura general, no un parche para `%`: el tercer corte de esta fase (más
+abajo) la reusa tal cual para "índice fuera de rango" en `List`.
 
 **Validado con el binario real, no solo con las pruebas.** Los tres casos de arriba se reprodujeron
 primero con el `lumen` de verdad sirviendo HTTP (`--native` contra bytecode, mismo `.lum`, respuestas
@@ -852,6 +852,50 @@ responde 500 con el mensaje correcto, y el proceso sigue vivo y sirviendo para l
 petición. `fib`/`cuenta_primos` y los casos de `string` de más arriba se re-verificaron sin cambios
 (mismo número de funciones compiladas, mismo rendimiento) — la corrección es más estricta, no
 distinta, para el código que ya era seguro.
+
+**Tercer corte: `List<T>`, con semántica de referencia real.** A diferencia de `string`, una lista
+es mutable (`.add()`) y §8 exige que lo sea *por referencia* — `List<int> b = a; b.add(9)` tiene que
+mutar también lo que ve `a`, en los dos backends por igual. `list_runtime_prelude()` define
+`LList<T>`: una caja con un contador de referencias — **no atómico**, a diferencia del `Caja` que usa
+`Value` en el VM, porque una `LList` nunca cruza la ABI (excluida de `tipo_abi_soportado`, igual que
+`string`) así que nunca viaja entre hilos — copiar una `LList` copia el puntero a la caja, no los
+datos. `Type::Kind::List` entra en `tipo_soportado()` cuando su elemento es `int`/`float`/`bool`/
+`string` (nunca otra `List`/`Dict`/clase: sin anidar, por ahora).
+
+El análisis de solidez (`Comprobador::tipo_provable`, ver la corrección de más arriba) se extiende de
+forma natural: un literal `[a, b, c]` es demostrable solo si **todos** los elementos demuestran el
+mismo tipo (una lista vacía no tiene de dónde inferirlo, se queda fuera); `xs[i]` es demostrable
+como el tipo del elemento solo si `xs` es demostrablemente `List<T>` y `i` demostrablemente `int`;
+`xs[i] = v` exige lo mismo más que `v` coincida exactamente con `T`, y que `xs` sea una variable (no una
+expresión temporal); `.add(v)` es el único método que reconoce `metodos_de()` para `List`
+(`natives.cpp`) y devuelve la misma lista, igual que `call_method()`. Un `for T x in xs:` deriva el
+tipo de `x` **del elemento de `xs`**, no de ninguna anotación (Lumen no exige una para `for`) — la
+misma fuente de verdad (`Comprobador::ranura_tipos()`) que usa el generador para declarar la
+variable C++ del bucle, expuesta explícitamente porque es la única ranura cuyo tipo no viene ni de
+un parámetro ni de un `VarDecl`.
+
+`lumen_get`/`lumen_set` comprueban el índice y usan el mismo canal de error que división/módulo
+(`lumen_native_fail`, con el mismo formato de mensaje que `GetIndex`/`SetIndex` en `vm.cpp`:
+"índice fuera de rango: N (tamaño M)") — la razón de construir ese canal ya de forma general en la
+corrección anterior, no como un parche solo para `%`.
+
+Generar el literal sin que el generador tenga que conocer el tipo del elemento se resuelve con CTAD
+(deducción de argumentos de plantilla): una guía de deducción convierte `LList{a, b, c}` en
+`LList<T>` con `T` deducido de los elementos, sin argumento explícito. Esto destapó un bug de una
+sola línea, real pero sutil: el generador escribía los literales enteros con el sufijo `LL`
+(`5LL`), que en glibc/x86-64 es `long long` — un tipo *distinto* de `int64_t` (que ahí es `long`),
+aunque los dos midan 64 bits. `LList{1LL, 2LL, 3LL}` deducía `LList<long long>`, que no convierte a
+`LList<int64_t>` (`LList<long>`): error de compilación (seguro, detectado por `g++`, no una
+respuesta silenciosamente distinta) pero real. Arreglado envolviendo cada literal entero en
+`static_cast<int64_t>(...)`, portable a cualquier plataforma independientemente de qué tipo nativo
+sea `int64_t` ahí.
+
+Validado en `tests/native_build_shadow.cpp` (`prueba_listas()`): un literal, `.add()`, indexado de
+lectura y escritura, `for`, paso como parámetro a otra función nativa (`List<int>` en la frontera se
+queda sin *wrapper*, igual que `string`, pero compila igual), índice fuera de rango con el mismo
+mensaje de error en las dos vías, y el caso que de verdad importaba — dos variables sobre la misma
+lista, mutar una a través de una y comprobar que la otra ve el cambio — coincide entre bytecode y
+`--native`. 79/79 del corpus real y el canario `LUMEN_SHADOW_CHECK` siguen en verde.
 
 ### Fase 4 — Rutas HTTP síncronas
 - Handler generado como `Task<void>` (o función síncrona si no hay `await`, §9), registrado en

@@ -58,8 +58,8 @@ TablaFirmas construir_firmas(const Program& prog) {
     TablaFirmas firmas;
     for (const auto& f : prog.functions) {
         FirmaNativa firma;
-        firma.retorno = Type::from_declared(f.return_type).kind();
-        for (const auto& p : f.params) firma.params.push_back(Type::from_declared(p.type).kind());
+        firma.retorno = Type::from_declared(f.return_type);
+        for (const auto& p : f.params) firma.params.push_back(Type::from_declared(p.type));
         firmas[f.name] = std::move(firma);
     }
     return firmas;
@@ -120,9 +120,11 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
 
     if (generadas.empty()) return nullptr; // nada que ofrecer nativo: no es un error
 
-    std::string codigo = "#include <cctype>\n#include <cstdint>\n#include <string>\n\n" +
-                         abi_prelude() + "\n" + error_runtime_prelude() + "\n" +
-                         string_runtime_prelude() + "\n" + prototipos + "\n" + cuerpos;
+    std::string codigo =
+        "#include <cctype>\n#include <cstdint>\n#include <initializer_list>\n#include <string>\n"
+        "#include <vector>\n\n" +
+        abi_prelude() + "\n" + error_runtime_prelude() + "\n" + list_runtime_prelude() + "\n" +
+        string_runtime_prelude() + "\n" + prototipos + "\n" + cuerpos;
 
     std::error_code ec;
     std::filesystem::create_directories(cache_dir, ec);

@@ -217,6 +217,116 @@ static bool prueba_metodos_string() {
     return true;
 }
 
+// List<int>: literal, indexado de lectura y escritura, `for`, y el unico
+// metodo que reconoce metodos_de() para List ("add") -- y, la parte que de
+// verdad importa segun §8, semantica de REFERENCIA: `List<int> b = a;
+// b.add(n)` tiene que mutar tambien lo que ve `a`, en las dos vias por
+// igual. `List<int>` en la frontera de una funcion (aqui, `suma`) se queda
+// sin wrapper (igual que `string`, ver tipo_abi_soportado) pero se compila
+// igual y es invocable directamente desde otra funcion nativa.
+static bool prueba_listas() {
+    const std::string src =
+        "fn int suma(List<int> xs):\n"
+        "    int total = 0\n"
+        "    for int x in xs:\n"
+        "        total = total + x\n"
+        "    return total\n"
+        "\n"
+        "fn int usa_lista(int n):\n"
+        "    List<int> xs = [1, 2, 3]\n"
+        "    xs.add(n)\n"
+        "    xs[0] = 100\n"
+        "    return suma(xs) + xs[0]\n"
+        "\n"
+        "fn int fuera_de_rango(int n):\n"
+        "    List<int> xs = [1, 2, 3]\n"
+        "    return xs[n]\n"
+        "\n"
+        "fn bool alias(int n):\n"
+        "    List<int> a = [1, 2, 3]\n"
+        "    List<int> b = a\n"
+        "    b.add(n)\n"
+        "    return suma(a) == suma(b)\n";
+
+    SourceFile    file;
+    DiagnosticBag diag_parse;
+    Program       prog;
+    if (!parse_program(src, file, diag_parse, prog)) {
+        std::printf("FALLA (listas): no parsea (%s)\n",
+                    diag_parse.items().empty() ? "?" : diag_parse.items().front().message.c_str());
+        return false;
+    }
+
+    FunctionSigs                  sigs = firmar(prog);
+    FunctionTable                 tabla_vm;
+    std::unique_ptr<NativeModule> nativo;
+    const auto cache_dir = std::filesystem::temp_directory_path() / "lumen_native_build_check_listas";
+    if (!compilar_las_dos_vias(prog, sigs, tabla_vm, nativo, cache_dir)) return false;
+
+    // suma(List<int>) no cruza la ABI (List, como string, se queda sin
+    // wrapper); usa_lista/fuera_de_rango/alias son int->X, las tres deberian
+    // compilar.
+    if (!nativo || nativo->compiladas() != 3) {
+        std::printf("FALLA (listas): se esperaban 3 funciones con wrapper, hay %zu\n",
+                    nativo ? nativo->compiladas() : 0);
+        return false;
+    }
+
+    bool ok = true;
+
+    // add()/indexado de lectura y escritura/paso por parametro a otra
+    // funcion nativa (suma).
+    {
+        const Chunk& chunk = *tabla_vm[sigs.at("usa_lista").index];
+        long long sin_n = ejecutar(chunk, 4, &tabla_vm, nullptr);
+        long long con_n = ejecutar(chunk, 4, &tabla_vm, nativo.get());
+        if (sin_n != con_n) {
+            std::printf("  FALLA usa_lista(4): bytecode=%lld nativo=%lld\n", sin_n, con_n);
+            ok = false;
+        } else {
+            std::printf("  ok    usa_lista(4) = %lld (bytecode y VM+nativo coinciden)\n", sin_n);
+        }
+    }
+
+    // Indice fuera de rango: el mismo canal de error que division/modulo
+    // (lumen_native_fail), con el mismo mensaje que GetIndex en vm.cpp.
+    {
+        const Chunk& chunk = *tabla_vm[sigs.at("fuera_de_rango").index];
+        VM::Result sin_n = ejecutar_result(chunk, {Value::integer(10)}, &tabla_vm, nullptr);
+        VM::Result con_n = ejecutar_result(chunk, {Value::integer(10)}, &tabla_vm, nativo.get());
+        if (sin_n.status != VM::Status::Error || con_n.status != VM::Status::Error ||
+            sin_n.error != con_n.error) {
+            std::printf("  FALLA fuera_de_rango(10): bytecode(status=%d,'%s') nativo(status=%d,"
+                        "'%s')\n", (int)sin_n.status, sin_n.error.c_str(), (int)con_n.status,
+                        con_n.error.c_str());
+            ok = false;
+        } else {
+            std::printf("  ok    fuera_de_rango(10): las dos vias dan Status::Error con el "
+                        "mismo mensaje ('%s')\n", con_n.error.c_str());
+        }
+    }
+
+    // Semantica de referencia (§8): dos variables sobre la MISMA lista ven
+    // las mutaciones la una de la otra -- en las dos vias por igual.
+    {
+        const Chunk& chunk = *tabla_vm[sigs.at("alias").index];
+        VM::Result sin_n = ejecutar_result(chunk, {Value::integer(5)}, &tabla_vm, nullptr);
+        VM::Result con_n = ejecutar_result(chunk, {Value::integer(5)}, &tabla_vm, nativo.get());
+        if (sin_n.status != VM::Status::Done || con_n.status != VM::Status::Done ||
+            !sin_n.value.as_bool() || !con_n.value.as_bool() ||
+            sin_n.value.as_bool() != con_n.value.as_bool()) {
+            std::printf("  FALLA alias(5): se esperaba 'true' en las dos vias (bytecode=%d "
+                        "nativo=%d)\n", sin_n.value.as_bool(), con_n.value.as_bool());
+            ok = false;
+        } else {
+            std::printf("  ok    alias(5): semantica de referencia identica en bytecode y "
+                        "nativo\n");
+        }
+    }
+
+    return ok;
+}
+
 // Los tres casos que encontraron el bug critico documentado en
 // COMPILACION-NATIVA.md (Fase 3, "Correccion critica"): Lumen Script no
 // comprueba en ningun sitio que una reasignacion, un `and`/`or`, o una
@@ -464,6 +574,7 @@ int main() {
 
     if (!prueba_strings()) ++fallos;
     if (!prueba_metodos_string()) ++fallos;
+    if (!prueba_listas()) ++fallos;
     if (!prueba_tipos_dinamicos()) ++fallos;
 
     if (fallos == 0) {

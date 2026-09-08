@@ -61,12 +61,13 @@ struct FuncionNativa {
 };
 
 // La firma de una funcion Lumen, en los terminos que necesita
-// tipo_provable() para comprobar una llamada: el tipo de cada parametro y
-// del retorno, ya reducidos a Type::Kind (nunca opcional: una funcion con
-// un tipo `?` en la frontera no es tipo_soportado() y no se genera).
+// tipo_provable() para comprobar una llamada: el tipo completo (no solo el
+// Kind) de cada parametro y del retorno -- List<int> y List<string> tienen
+// el mismo Kind pero son tipos distintos, y Type::operator== ya sabe
+// comparar eso.
 struct FirmaNativa {
-    std::vector<Type::Kind> params;
-    Type::Kind               retorno = Type::Kind::Void;
+    std::vector<Type> params;
+    Type               retorno = Type::void_();
 };
 // Por nombre de funcion Lumen -- construida una sola vez por
 // compilar_nativo() a partir de TODO el programa (no solo las funciones que
@@ -109,9 +110,18 @@ std::string string_runtime_prelude();
 // wrapper mas externo, exactamente como una funcion Lumen sin `try` deja
 // que el error suba hasta quien la llamo. `lumen_native_error_message` es
 // el simbolo fijo (ver native_abi.hpp::ErrorMessageFn) que expone el
-// mensaje del ultimo fallo en el hilo que llama. Usado hoy solo para
-// division/modulo por cero (los unicos puntos de fallo que introduce esta
-// fase); List (Fase 3) reusara el mismo canal para "indice fuera de rango".
+// mensaje del ultimo fallo en el hilo que llama. Usado para
+// division/modulo por cero y, ahora, "indice fuera de rango" en List.
 std::string error_runtime_prelude();
+
+// `List<T>` para T en int/float/bool/string (§7): una plantilla `LList<T>`
+// con una caja de refcount NO atomico (una funcion nativa nunca comparte
+// una lista entre hilos: no cruza la ABI todavia, igual que `string` --
+// ver tipo_abi_soportado) y semantica de referencia real (§8): copiar un
+// `LList` copia el puntero a la caja, no los datos, asi que dos variables
+// que apuntan a la misma lista ven las mutaciones la una de la otra, igual
+// que el `Value::List` del VM. `lumen_get`/`lumen_set` comprueban el
+// indice y usan lumen_native_fail() en vez de comportamiento indefinido.
+std::string list_runtime_prelude();
 
 } // namespace lumen_script

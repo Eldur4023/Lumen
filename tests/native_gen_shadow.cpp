@@ -97,8 +97,8 @@ int main() {
     TablaFirmas firmas;
     for (const auto& f : prog.functions) {
         FirmaNativa firma;
-        firma.retorno = Type::from_declared(f.return_type).kind();
-        for (const auto& p : f.params) firma.params.push_back(Type::from_declared(p.type).kind());
+        firma.retorno = Type::from_declared(f.return_type);
+        for (const auto& p : f.params) firma.params.push_back(Type::from_declared(p.type));
         firmas[f.name] = std::move(firma);
     }
 
