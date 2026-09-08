@@ -2057,7 +2057,12 @@ IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow
         for (const auto& a : e.args) {
             IrExprPtr v = check_expr(*a.value, shadow);
             if (!v) return nullptr;
-            r->args.push_back({{}, std::move(v), a.loc});
+            // A diferencia de las demas formas, un metodo builtin SI admite
+            // nombrados (comprobar_metodo_builtin los cuenta como un hueco
+            // mas, no los rechaza): a.name viaja, para que emit_method_call_
+            // dynamic pueda agruparlos en el Dict del ultimo hueco
+            // posicional, igual que hace hoy con el Expr original.
+            r->args.push_back({a.name, std::move(v), a.loc});
         }
         return r;
     }
@@ -2071,7 +2076,12 @@ IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow
         for (const auto& a : e.args) {
             IrExprPtr v = check_expr(*a.value, shadow);
             if (!v) return nullptr;
-            r->args.push_back({{}, std::move(v), a.loc});
+            // A diferencia de las demas formas, un metodo builtin SI admite
+            // nombrados (comprobar_metodo_builtin los cuenta como un hueco
+            // mas, no los rechaza): a.name viaja, para que emit_method_call_
+            // dynamic pueda agruparlos en el Dict del ultimo hueco
+            // posicional, igual que hace hoy con el Expr original.
+            r->args.push_back({a.name, std::move(v), a.loc});
         }
         return r;
     }
