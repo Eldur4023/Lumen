@@ -2643,6 +2643,16 @@ void Emitter::emit_stmt(const IrStmt& s) {
         case IrStmtKind::VarDecl:
             if (s.value) emit_expr(*s.value);
             else         chunk_->emit(Op::Const, s.loc, chunk_->add_constant(Value::null()));
+            // declare_local() hay que llamarlo aqui tambien, aunque el slot
+            // real ya lo trae s.slot: es lo que mantiene locals_ (y por
+            // tanto el proximo slot que calcule un declare_local posterior
+            // -- el `for` desazucarado, un `catch`, un temporal de ++/--)
+            // sincronizado con el que ya calculo check_stmt. Sin esto, el
+            // primer VarDecl del cuerpo deja locals_ mas corto de lo que
+            // deberia y todo lo que se declare despues cae en la ranura
+            // equivocada -- exactamente el bug que encontro
+            // tests/emit_ir_shadow.cpp antes de este arreglo.
+            declare_local(s.name, s.loc, s.decl_type);
             chunk_->emit(Op::StoreLocal, s.loc, static_cast<uint32_t>(s.slot));
             break;
 

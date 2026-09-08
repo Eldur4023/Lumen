@@ -163,6 +163,16 @@ public:
     // igual que hoy con `failed_`, un bloque a medio construir no se usa.
     IrBlock   check_block(const Block& body, DiagnosticBag& shadow);
 
+    // Emisor puro que consume el IrBlock que devuelve check_block/check_route/
+    // etc.: no comprueba nada, confia en que el IR ya paso por el checker.
+    // Publico (a diferencia de emit_stmt/emit_expr/emit_call sobre IrExpr/
+    // IrStmt, que son privados e internos a este) porque tests/
+    // emit_ir_shadow.cpp lo llama directamente para probar que el bytecode
+    // que produce se COMPORTA igual que el del emisor viejo, ejecutado de
+    // verdad en el VM -- es exactamente lo que hara emit_function una vez
+    // conectado, asi que la prueba lo replica desde fuera.
+    void emit_block(const IrBlock& body);
+
     // `out`: mismo motivo que en check_condition (declare_local necesita un
     // chunk_ valido). `out_body`, si no es nulo, recibe el IrBlock construido
     // (el mismo que ya se descarta hoy en project.cpp: check_route/etc. lo
@@ -250,8 +260,10 @@ private:
     // -- "emitir esta expresion/sentencia" -- vista desde dos entradas
     // distintas mientras dura la migracion; cuando el corte final sustituya
     // las llamadas Expr/Stmt por estas, los nombres ya son los que hay que
-    // dejar.
-    void emit_block(const IrBlock& body);
+    // dejar. emit_block es publico (ver el comentario junto a check_block)
+    // porque la prueba de equivalencia de ejecucion (tests/emit_ir_shadow.cpp)
+    // necesita invocarlo directamente, tal como hara emit_function una vez
+    // conectado.
     void emit_stmt(const IrStmt& s);
     void emit_expr(const IrExpr& e);
     void emit_call(const IrExpr& e);

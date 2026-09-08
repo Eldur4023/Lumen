@@ -204,6 +204,13 @@ add_executable(prueba_check_stmt tests/check_stmt_shadow.cpp)
 target_link_libraries(prueba_check_stmt PRIVATE lumen_script)
 add_test(NAME check_stmt_shadow COMMAND prueba_check_stmt)
 
+# La otra mitad de la fase 1: no solo que check_expr/check_stmt reproducen
+# los mismos diagnosticos (arriba), sino que el emisor que consume el IR
+# produce bytecode que se COMPORTA igual ejecutado de verdad en el VM.
+add_executable(prueba_emit_ir tests/emit_ir_shadow.cpp)
+target_link_libraries(prueba_emit_ir PRIVATE lumen_script)
+add_test(NAME emit_ir_shadow COMMAND prueba_emit_ir)
+
 # El traductor de marcadores de postgres es una funcion pura: se prueba sin
 # servidor incluyendo el .cpp del driver, para probar EL codigo y no una copia.
 if(LUMEN_POSTGRES AND PQ_INC AND PQ_LIB)
