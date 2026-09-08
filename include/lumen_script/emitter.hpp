@@ -223,47 +223,27 @@ private:
                        Type type = Type::unknown());
     const Type& local_type(const std::string& name) const;
 
-    // Cierto solo si se PUEDE demostrar que la expresion es de tipo int.  Ante
-    // la duda dice que no: especializar de menos solo deja codigo generico,
-    // especializar de mas seria un error.
-    bool es_int(const Expr& e) const;
     int  resolve_local(const std::string& name) const;
     void begin_scope();
     void end_scope();
 
-    void emit_block(const Block& body);
-    void emit_stmt(const Stmt& s);
-    void emit_expr(const Expr& e);
-    void emitir_render_compilado(const Expr& e);
     // Tipo estatico de una expresion, o Type::unknown() si no se puede saber.
     // Solo mira lo que es evidente sin inferencia: un literal, o una variable
-    // declarada.
+    // declarada. Sigue en terminos de Expr (no de IrExpr) porque es al AST a
+    // lo que miran check_expr/check_call/check_campo cuando necesitan el
+    // tipo estatico de un receptor -- no hace falta una version para el IR.
     Type tipo_de(const Expr& e) const;
-    // Comprueba un metodo contra la lista cerrada del tipo del receptor.
-    // Devuelve false —y ya ha dado el error— si ese metodo no existe.
-    bool comprobar_metodo_builtin(const Expr& e);
-    // Idem para un campo, al leerlo y al escribirlo.
-    bool comprobar_campo(const Expr& objeto, const std::string& campo, SourceLoc loc);
-    void emit_call(const Expr& e, bool awaited);
-    // Metodo cuyo receptor no tiene tipo conocido al compilar: se apila y el
-    // despacho por tipo lo hace el VM.
-    void emit_method_call_dynamic(const Expr& e);
 
-    // ── Fase 1: emisor que consume el IR (todavia sin conectar) ─────────────
-    //
-    // Contrapartida de emit_block/emit_stmt/emit_expr/emit_call que en vez de
-    // Expr/Stmt del AST recibe IrExpr/IrStmt ya resueltos por check_expr/
-    // check_stmt. No comprueba nada -- ni una llamada a error(), ni una
-    // busqueda por nombre (resolve_local/native_id/is_reserved_object...):
-    // confia en que el IR que recibe ya paso por el checker. El nombre se
-    // reusa (sobrecarga por tipo del parametro) porque son la MISMA operacion
-    // -- "emitir esta expresion/sentencia" -- vista desde dos entradas
-    // distintas mientras dura la migracion; cuando el corte final sustituya
-    // las llamadas Expr/Stmt por estas, los nombres ya son los que hay que
-    // dejar. emit_block es publico (ver el comentario junto a check_block)
-    // porque la prueba de equivalencia de ejecucion (tests/emit_ir_shadow.cpp)
-    // necesita invocarlo directamente, tal como hara emit_function una vez
-    // conectado.
+    // ── El emisor real: consume el IrExpr/IrStmt que ya construyeron y
+    // validaron check_expr/check_stmt (con diags_ real -- ver emit_route/
+    // emit_function/etc. mas arriba). No comprueba nada -- ni una llamada a
+    // error(), ni una busqueda por nombre (resolve_local/native_id/
+    // is_reserved_object...): confia en que el IR que recibe ya paso por el
+    // checker, leyendo campos ya resueltos (slot, call_shape, call_index,
+    // call_name, type) en vez de resolverlos. emit_block es publico (ver el
+    // comentario junto a check_block) porque tests/emit_ir_shadow.cpp lo
+    // invoca directamente para probar la equivalencia de ejecucion contra el
+    // emisor que existia antes del corte -- lo que hoy hace emit_function.
     void emit_stmt(const IrStmt& s);
     void emit_expr(const IrExpr& e);
     void emit_call(const IrExpr& e);
@@ -280,8 +260,10 @@ private:
     void emit_method_call_dynamic(const IrExpr& e);
     void emitir_render_compilado(const IrExpr& e);
 
-    // Shadow de comprobar_campo/comprobar_metodo_builtin: misma logica, error
-    // a `shadow` en vez de a diags_. Usados por check_expr/check_call.
+    // Comprueba un campo/metodo builtin contra la lista cerrada del tipo del
+    // receptor, dando el error a `shadow` (diags_ real desde los puntos de
+    // entrada, un DiagnosticBag aparte en las pruebas). Usados por
+    // check_expr/check_call.
     bool check_campo(const Expr& objeto, const std::string& campo, SourceLoc loc,
                      DiagnosticBag& shadow) const;
     bool check_metodo_builtin(const Expr& e, DiagnosticBag& shadow) const;
