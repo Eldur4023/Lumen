@@ -37,14 +37,19 @@ static bool parse_program(const std::string& src, SourceFile& file, DiagnosticBa
     return diags.empty();
 }
 
-static long long ejecutar(const Chunk& chunk, long long arg, const FunctionTable* fns,
-                          const NativeModule* nativo) {
+static VM::Result ejecutar_result(const Chunk& chunk, std::vector<Value> args,
+                                  const FunctionTable* fns, const NativeModule* nativo) {
     lumen::Request  req;
     lumen::Response res;
     NativeCtx       ctx{req, res};
     VM              vm;
     NativeDispatch  nd = nativo ? nativo->dispatch() : NativeDispatch{};
-    VM::Result      r  = vm.start(chunk, {Value::integer(arg)}, ctx, fns, &nd);
+    return vm.start(chunk, std::move(args), ctx, fns, &nd);
+}
+
+static long long ejecutar(const Chunk& chunk, long long arg, const FunctionTable* fns,
+                          const NativeModule* nativo) {
+    VM::Result r = ejecutar_result(chunk, {Value::integer(arg)}, fns, nativo);
     if (r.status != VM::Status::Done) {
         std::printf("  FALLA: la VM no termino (status=%d, error=%s)\n",
                     static_cast<int>(r.status), r.error.c_str());
@@ -212,6 +217,151 @@ static bool prueba_metodos_string() {
     return true;
 }
 
+// Los tres casos que encontraron el bug critico documentado en
+// COMPILACION-NATIVA.md (Fase 3, "Correccion critica"): Lumen Script no
+// comprueba en ningun sitio que una reasignacion, un `and`/`or`, o una
+// division/modulo conserven el tipo o eviten el divisor cero -- confiar en
+// el tipo DECLARADO sin demostrarlo daba C++ que compilaba y respondia
+// distinto al bytecode (o, para division/modulo, tumbaba el proceso
+// entero). Estas pruebas fijan la correccion (Comprobador::tipo_provable en
+// native_gen.cpp) para que no se pueda perder sin que ctest lo note.
+static bool prueba_tipos_dinamicos() {
+    bool ok = true;
+
+    // 1) Reasignar `x` (declarado int) a un float: no demostrable -> la
+    // funcion entera se queda sin compilar a nativo. Si SI compilase,
+    // truncaria 3.5 a 3 en silencio (el bug de verdad, ya reproducido y
+    // corregido).
+    {
+        const std::string src =
+            "fn int riesgo(int a):\n"
+            "    int x = a\n"
+            "    x = 3.5\n"
+            "    return x\n";
+        SourceFile file; DiagnosticBag diag; Program prog;
+        if (!parse_program(src, file, diag, prog)) { std::printf("FALLA (reasignacion): no parsea\n"); return false; }
+        FunctionSigs sigs = firmar(prog);
+        std::string aviso;
+        std::error_code ec;
+        auto cache = std::filesystem::temp_directory_path() / "lumen_native_build_check_reasig";
+        std::filesystem::remove_all(cache, ec);
+        auto nativo = compilar_nativo(prog, sigs, cache, aviso);
+        std::filesystem::remove_all(cache, ec);
+        if (nativo) {
+            std::printf("  FALLA reasignacion de tipo: se compilo a nativo (deberia caer a "
+                        "bytecode)\n");
+            ok = false;
+        } else {
+            std::printf("  ok    reasignacion int->float: se queda en bytecode, como debe\n");
+        }
+    }
+
+    // 2) `and`/`or` con operandos no booleanos: el resultado de Lumen es el
+    // VALOR del operando que gana (estilo Python), no un booleano forzado
+    // -- no demostrable con la traduccion a &&/|| de hoy, tiene que caer a
+    // bytecode. Con operandos YA booleanos si es sano (unico caso en el que
+    // &&/|| coincide observablemente), y eso se comprueba tambien: no debe
+    // dejar de compilar por el cambio.
+    {
+        const std::string src =
+            "fn int no_booleano(int a, int b):\n"
+            "    return a and b\n"
+            "\n"
+            "fn bool booleano(bool a, bool b):\n"
+            "    return a and b\n";
+        SourceFile file; DiagnosticBag diag; Program prog;
+        if (!parse_program(src, file, diag, prog)) { std::printf("FALLA (and/or): no parsea\n"); return false; }
+        FunctionSigs sigs = firmar(prog);
+        FunctionTable tabla_vm;
+        std::unique_ptr<NativeModule> nativo;
+        auto cache = std::filesystem::temp_directory_path() / "lumen_native_build_check_andor";
+        if (!compilar_las_dos_vias(prog, sigs, tabla_vm, nativo, cache)) return false;
+        std::error_code ec;
+        std::filesystem::remove_all(cache, ec);
+
+        if (!nativo || nativo->compiladas() != 1) {
+            std::printf("  FALLA and/or: se esperaba exactamente 1 funcion nativa (booleano), "
+                        "hay %zu\n", nativo ? nativo->compiladas() : 0);
+            ok = false;
+        } else {
+            std::printf("  ok    and/or: 'no_booleano' (int) se queda en bytecode, 'booleano' "
+                        "(bool) si compila\n");
+            // Ademas de compilarse, "booleano" tiene que dar el mismo
+            // resultado por las dos vias -- para bool, &&  SI coincide con
+            // "el operando que gana".
+            const Chunk& chunk = *tabla_vm[sigs.at("booleano").index];
+            VM::Result sin_n = ejecutar_result(chunk, {Value::boolean(true), Value::boolean(false)},
+                                              &tabla_vm, nullptr);
+            VM::Result con_n = ejecutar_result(chunk, {Value::boolean(true), Value::boolean(false)},
+                                              &tabla_vm, nativo.get());
+            if (sin_n.value.as_bool() != con_n.value.as_bool()) {
+                std::printf("  FALLA booleano(true,false): bytecode=%d nativo=%d\n",
+                            sin_n.value.as_bool(), con_n.value.as_bool());
+                ok = false;
+            }
+        }
+
+        // 'no_booleano' en si -- confirma que Lumen realmente da el "operando
+        // que gana" (5 -> truthy, gana "b"=10), no un booleano: es la
+        // semantica real que --native tendria que reproducir si algun dia
+        // aprende a compilar and/or fuera del caso bool-bool.
+        const Chunk& chunk = *tabla_vm[sigs.at("no_booleano").index];
+        VM::Result r = ejecutar_result(chunk, {Value::integer(5), Value::integer(10)}, &tabla_vm,
+                                      nullptr);
+        if (r.status != VM::Status::Done || r.value.as_int() != 10) {
+            std::printf("  FALLA no_booleano(5,10): se esperaba 10 (estilo Python), dio %lld "
+                        "(status=%d)\n", r.value.as_int(), static_cast<int>(r.status));
+            ok = false;
+        }
+    }
+
+    // 3) Division y modulo por cero: error controlado en el VM, UB (en la
+    // practica SIGFPE) en C++ puro. La funcion SI debe compilar a nativo
+    // (el tipo esta garantizado, solo el divisor es dinamico) y el canal de
+    // error (NativeValue::Tag::Error / lumen_native_fail) debe convertir el
+    // fallo en el mismo VM::Status::Error que daria el bytecode -- nunca en
+    // un proceso muerto.
+    {
+        const std::string src = "fn int f(int a, int b):\n    return a % b\n";
+        SourceFile file; DiagnosticBag diag; Program prog;
+        if (!parse_program(src, file, diag, prog)) { std::printf("FALLA (modulo cero): no parsea\n"); return false; }
+        FunctionSigs sigs = firmar(prog);
+        FunctionTable tabla_vm;
+        std::unique_ptr<NativeModule> nativo;
+        auto cache = std::filesystem::temp_directory_path() / "lumen_native_build_check_modcero";
+        if (!compilar_las_dos_vias(prog, sigs, tabla_vm, nativo, cache)) return false;
+        std::error_code ec;
+        std::filesystem::remove_all(cache, ec);
+
+        if (!nativo || nativo->compiladas() != 1) {
+            std::printf("  FALLA modulo cero: se esperaba que 'f' compilase a nativo (es "
+                        "segura), hay %zu\n", nativo ? nativo->compiladas() : 0);
+            ok = false;
+        } else {
+            const Chunk& chunk = *tabla_vm[sigs.at("f").index];
+            VM::Result sin_n = ejecutar_result(chunk, {Value::integer(10), Value::integer(0)},
+                                              &tabla_vm, nullptr);
+            VM::Result con_n = ejecutar_result(chunk, {Value::integer(10), Value::integer(0)},
+                                              &tabla_vm, nativo.get());
+            if (sin_n.status != VM::Status::Error || con_n.status != VM::Status::Error) {
+                std::printf("  FALLA modulo cero: se esperaba Status::Error en las dos vias "
+                            "(bytecode=%d nativo=%d)\n",
+                            static_cast<int>(sin_n.status), static_cast<int>(con_n.status));
+                ok = false;
+            } else if (sin_n.error != con_n.error) {
+                std::printf("  FALLA modulo cero: mensajes distintos -- bytecode='%s' "
+                            "nativo='%s'\n", sin_n.error.c_str(), con_n.error.c_str());
+                ok = false;
+            } else {
+                std::printf("  ok    modulo por cero: las dos vias dan Status::Error con el "
+                            "mismo mensaje ('%s'), el proceso sigue vivo\n", con_n.error.c_str());
+            }
+        }
+    }
+
+    return ok;
+}
+
 int main() {
     const std::string src =
         "fn int fib(int n):\n"
@@ -314,6 +464,7 @@ int main() {
 
     if (!prueba_strings()) ++fallos;
     if (!prueba_metodos_string()) ++fallos;
+    if (!prueba_tipos_dinamicos()) ++fallos;
 
     if (fallos == 0) {
         std::printf("native_build_shadow: la VM con --native conectado coincide en todos los "
