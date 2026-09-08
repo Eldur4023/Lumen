@@ -285,6 +285,13 @@ private:
     bool check_campo(const Expr& objeto, const std::string& campo, SourceLoc loc,
                      DiagnosticBag& shadow) const;
     bool check_metodo_builtin(const Expr& e, DiagnosticBag& shadow) const;
+
+    // El desazucarado comun a `require X else Y` (StmtKind::Require) y a una
+    // guarda de grupo (Guard): las dos son "si no X, devuelve Y", mismo
+    // bytecode (ver emit_stmt/emit_route). Compartir esta funcion evita
+    // construir el IrStmt::Require dos veces con logica ligeramente distinta.
+    IrStmtPtr check_require_like(SourceLoc loc, const Expr& cond, const Expr& otherwise,
+                                 DiagnosticBag& shadow) const;
 };
 
 } // namespace lumen_script

@@ -190,6 +190,18 @@ int main() {
         "duplica",
         {Value::list({Value::integer(1), Value::integer(2), Value::integer(3)})});
 
+    caso("require (mismo desazucarado que una guarda de grupo)",
+        "fn int limite(int n):\n"
+        "    require n >= 0 else 0 - 1\n"
+        "    return n * 2\n",
+        "limite", {Value::integer(5)});
+
+    caso("require que dispara el else",
+        "fn int limite2(int n):\n"
+        "    require n >= 0 else 0 - 1\n"
+        "    return n * 2\n",
+        "limite2", {Value::integer(-3)});
+
     caso("metodos de string",
         "fn string grita(string s):\n"
         "    return s.upper() + \"!\"\n",

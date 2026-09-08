@@ -222,14 +222,23 @@ bool Emitter::check_route(const RouteDecl& route, Chunk& out, DiagnosticBag& sha
 
     for (const auto& p : route.params) declare_local(p.name, p.loc, Type::from_declared(p.type));
 
+    // Las guardas son "si no X, devuelve Y" -- el mismo IrStmtKind::Require
+    // que ya usa `require`, y se ejecutan antes que el cuerpo (de fuera hacia
+    // dentro), asi que van primero en el IrBlock que se devuelve.
+    IrBlock guardas;
     for (const auto& g : route.guards) {
         if (!g.condition || !g.otherwise) continue;
-        check_expr(*g.condition, shadow);
-        check_expr(*g.otherwise, shadow);
+        if (IrStmtPtr r = check_require_like(g.loc, *g.condition, *g.otherwise, shadow))
+            guardas.push_back(std::move(r));
     }
 
     IrBlock body = check_block(route.body, shadow);
-    if (out_body) *out_body = std::move(body);
+    if (out_body) {
+        out_body->clear();
+        out_body->reserve(guardas.size() + body.size());
+        for (auto& g : guardas) out_body->push_back(std::move(g));
+        for (auto& s : body)    out_body->push_back(std::move(s));
+    }
     return shadow.size() == antes;
 }
 
@@ -554,6 +563,21 @@ static IrStmtKind ir_stmt_kind_de(StmtKind k) {
     return IrStmtKind::Return; // inalcanzable si el switch de arriba es exhaustivo
 }
 
+// Compartido por check_stmt (Require) y check_route (guardas de grupo): las
+// dos son "si no `cond`, devuelve `otherwise`", el mismo IrStmtKind::Require.
+IrStmtPtr Emitter::check_require_like(SourceLoc loc, const Expr& cond, const Expr& otherwise,
+                                      DiagnosticBag& shadow) const {
+    IrExprPtr c = check_expr(cond, shadow);
+    IrExprPtr e = check_expr(otherwise, shadow);
+    if (!c || !e) return nullptr;
+    auto r = std::make_unique<IrStmt>();
+    r->kind   = IrStmtKind::Require;
+    r->loc    = loc;
+    r->value  = std::move(c);
+    r->target = std::move(e);
+    return r;
+}
+
 // Shadow de emit_block/emit_stmt (fase 1, checker en paralelo -- ver
 // emitter.hpp). Mismo orden de comprobaciones, mismo texto, sin tocar chunk_.
 // A diferencia de check_expr, SI llama a declare_local/begin_scope/end_scope:
@@ -709,15 +733,8 @@ IrStmtPtr Emitter::check_stmt(const Stmt& s, DiagnosticBag& shadow) {
             return r;
         }
 
-        case StmtKind::Require: {
-            IrExprPtr cond = check_expr(*s.value, shadow);
-            IrExprPtr els  = check_expr(*s.target, shadow);
-            if (!cond || !els) return nullptr;
-            auto r = nodo();
-            r->value  = std::move(cond);
-            r->target = std::move(els);
-            return r;
-        }
+        case StmtKind::Require:
+            return check_require_like(s.loc, *s.value, *s.target, shadow);
 
         case StmtKind::Break:
             if (loops_.empty()) { shadow.error(s.loc, "'break' fuera de un bucle"); return nullptr; }
