@@ -1371,6 +1371,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
             lumen::App::WSOptions opts;
             opts.allowed_origins = r.origins;
 
+            mod.rutas_informe.push_back({r.method, r.pattern, "ws"});
             mod.router.add_internal("GET", r.pattern,
                 lumen::App::make_ws_handler(
                     [ws_chunk, ws_binds, ws_where, auth, fn_table, native_table, tpl_table]
@@ -1455,6 +1456,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
 
             ++mod.vm_routes;
             std::string sse_where = "SSE " + r.pattern;
+            mod.rutas_informe.push_back({r.method, r.pattern, "sse"});
             mod.router.add_internal("GET", r.pattern,
                 [sse_chunk, sse_binds, sse_where, auth, fn_table, native_table, tpl_table](lumen::Request& req,
                                                         lumen::Response& res)
@@ -1519,6 +1521,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
         // Nivel 1: ruta declarativa → accion nativa, cero bytecode.
         if (Action a = try_declarative(r, mod.program.app.templates_dir)) {
             ++mod.declarative_routes;
+            mod.rutas_informe.push_back({r.method, r.pattern, "declarativa"});
             mod.router.add_internal(r.method, r.pattern,
                 [a](lumen::Request& req, lumen::Response& res) -> lumen::Task<void> {
                     a(req, res);
@@ -1560,6 +1563,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
         if (mod.native && ridx < mod.native->rutas_async_por_indice.size() &&
             mod.native->rutas_async_por_indice[ridx]) {
             ++mod.vm_routes;
+            mod.rutas_informe.push_back({r.method, r.pattern, "nativa (async)"});
             mod.router.add_internal(r.method, r.pattern, mod.native->rutas_async_por_indice[ridx]);
             continue;
         }
@@ -1567,6 +1571,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
             mod.native->rutas_por_indice[ridx]) {
             auto fn = mod.native->rutas_por_indice[ridx];
             ++mod.vm_routes; // cuenta como ruta con logica, aunque no pase por el VM
+            mod.rutas_informe.push_back({r.method, r.pattern, "nativa"});
             mod.router.add_internal(r.method, r.pattern,
                 [fn](lumen::Request& req, lumen::Response& res) -> lumen::Task<void> {
                     fn(req, res);
@@ -1593,6 +1598,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
                 needs_upload = true;
 
         std::string where = r.method + " " + r.pattern;
+        mod.rutas_informe.push_back({r.method, r.pattern, "bytecode"});
         mod.router.add_internal(r.method, r.pattern,
             [chunk, binds, where, auth, needs_upload, fn_table, native_table, tpl_table](lumen::Request& req, lumen::Response& res)
                 -> lumen::Task<void> {

@@ -167,6 +167,17 @@ int main(int argc, char** argv) {
         std::cout << "lumen: --native: " << (mod->native ? mod->native->compiladas() : 0)
                   << " funcion(es), " << (mod->native ? mod->native->rutas_compiladas() : 0)
                   << " ruta(s) compiladas a codigo nativo\n";
+        // Fase 6 (COMPILACION-NATIVA.md): diagnostico explicito de que via
+        // sirve CADA ruta con logica -- el conteo agregado de arriba no
+        // dice cuales cayeron a bytecode, y --native es precisamente el
+        // modo donde eso importa. Las declarativas/ws/sse no se listan:
+        // nunca dependen de --native (una declarativa ya evita el bytecode
+        // por su cuenta; ws/sse no compilan a nativo todavia, asi que
+        // "bytecode" en ellas no dice nada nuevo).
+        for (const auto& r : mod->rutas_informe) {
+            if (r.via == "declarativa" || r.via == "ws" || r.via == "sse") continue;
+            std::cout << "lumen:   " << r.metodo << " " << r.patron << " -> " << r.via << "\n";
+        }
         // Una degradacion parcial (o total) a bytecode nunca es un error de
         // compilacion -- ver el comentario en Module::native_aviso -- pero
         // tampoco debe pasar en silencio.

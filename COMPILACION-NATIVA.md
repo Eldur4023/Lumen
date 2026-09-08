@@ -1378,11 +1378,61 @@ arriba, contra el binario real). `bench/lumen/app.lum` pasa de 3 a 4 rutas nativ
 (`/slow/:ms` se suma a `/health`, `/compute/fib/:n`, `/compute/primes/:n`). 79/79 del corpus y las 8
 suites de `ctest` en verde.
 
+**Por qué `await sqlite.query(...)`/`exec(...)` NO son el siguiente paso natural — un límite
+arquitectónico real, no falta de tiempo.** La tentación es tratar una consulta como "`sleep()` pero
+con un valor de retorno". No lo es. `run_db()` (project.cpp) devuelve SIEMPRE un `Value` dinámico —
+pero cuál exactamente depende de si el driver tuvo éxito: `List<Json>` para `query()`, `int` para
+`exec()`/`last_id()`... salvo que el driver falle, en cuyo caso CUALQUIERA de ellos devuelve
+`db_error(msg)`, un `Dict` con `{"error": msg}` — **sin pasar por el canal de error de la VM**: "un
+fallo del motor no revienta el handler; llega como un valor con `error`, que el `.lum` puede mirar o
+dejar pasar" (comentario original de `run_db`). Es decir: `List<Json> filas = await
+sqlite.query(...)` puede legítimamente, en tiempo de ejecución, dejar en `filas` un `Dict`, no una
+`List` — el propio lenguaje lo permite (dinámicamente tipado) y el framework lo usa a propósito (para
+que el `.lum` decida qué hacer con el fallo, en vez de que decida el runtime). `tipo_provable()`
+exige exactamente lo contrario: que el tipo de una expresión sea el MISMO siempre, demostrado, no
+"normalmente, salvo fallo de I/O" — es el invariante que motivó las dos correcciones críticas de más
+arriba, y una consulta de base de datos lo rompe por diseño, no por descuido.
+
+La única forma honesta de representar esto sería un slot nativo `Value` de verdad — no `LList<T>`/
+`LDict<V>` tipados, sino el mismo tipo dinámico que ya usa el puente de retorno de una ruta
+(`Generador::valor_json`) — y hacer que TODA operación sobre él (indexado, iteración, lectura de
+campo) sea dinámica, con la misma semántica exacta que `vm.cpp` (incluida su gestión de errores en
+tiempo de ejecución: indexar un campo que no existe, o tratar un `Dict` como si fuera una `List`).
+Eso no es "añadir un caso más" a `Comprobador`/`Generador` — es una segunda vía de ejecución dentro de
+la vía nativa, con su propio conjunto de reglas, del tamaño de la Fase 2 entera. Fuera de proporción
+para lo que este incremento puede permitirse sin arriesgar la misma clase de fallo silencioso que ya
+se pagó dos veces. **Decisión: `await` sobre un módulo de base de datos (`query`/`exec`/`last_id`/
+`begin`/`commit`/`rollback`) queda fuera de esta fase — una ruta que lo use sigue cayendo entera a
+bytecode, exactamente como hoy.** No es una limitación temporal a resolver "cuando haya tiempo": es
+un límite del modelo de tipos nativos tal como existe, y cualquier intento de saltárselo reproduciría
+el mismo patrón de fallo que motivó las correcciones críticas anteriores. Si en el futuro hace falta
+de verdad, el camino es diseñar ese slot `Value` dinámico como su propio incremento deliberado — con
+la misma disciplina de esta fase (probar el caso incómodo, verificar contra HTTP real) — no
+improvisarlo dentro de esta.
+
 ### Fase 6 — Empaquetado y modo mixto
 - `--native` de punta a punta: caché, `.so`, `dlopen`, informe de arranque, diagnóstico
   explícito de rutas no compilables, respaldo por bytecode ruta a ruta.
 - **Aceptación:** una aplicación que use `ws`/`sse` (todavía no soportados nativamente) arranca
   con `--native`, sirve esas rutas por bytecode y el resto nativas, y lo dice al arrancar.
+
+**El "respaldo por bytecode ruta a ruta" ya existía desde la Fase 4 — lo que faltaba era decirlo.**
+El modo mixto en sí no es un mecanismo nuevo que construir: cada nivel (declarativo, nativo, VM) ya
+se decide ruta por ruta, de forma independiente, desde que `build_routes()` ganó su "Nivel 1.5" — una
+ruta que no compila a nativo simplemente no aparece en `NativeModule::rutas_por_indice`/
+`rutas_async_por_indice`, y cae al `Nivel 2` (VM) con exactamente el mismo camino que tenía antes de
+que `--native` existiera. Lo que sí faltaba era el **diagnóstico explícito**: el arranque solo daba
+un conteo agregado ("2 función(es), 4 ruta(s) compiladas"), sin decir CUÁLES de las 16 rutas con
+lógica son esas 4. Añadido con `Module::rutas_informe` (`RutaInforme{metodo, patron, via}`,
+`via ∈ {declarativa, nativa, nativa (async), bytecode, ws, sse}`), rellenado en cada uno de los seis
+puntos donde `build_routes()` ya decide/registra un handler — no una comprobación nueva, solo anotar
+la decisión que cada rama ya toma. `main.cpp`, con `--native`, imprime una línea por ruta con
+lógica (omite declarativas/`ws`/`sse`: esas nunca dependen de si `--native` compiló algo). Contra
+`bench/lumen/app.lum` esto hace evidente, sin adivinar ni leer el código fuente, exactamente el
+límite documentado arriba: las diez rutas que tocan `sqlite` (`/users`, `/products`, `/orders`,
+`/stats/sales`, `/counter`, `/payload/:n`) se listan `bytecode`, las tres puras (`/compute/fib/:n`,
+`/compute/primes/:n`) `nativa`, y `/slow/:ms` (el único `await` que compila) `nativa (async)`. 79/79
+del corpus y las 8 suites de `ctest` en verde.
 
 ### Fase 7 — Optimización
 - Análisis de escape para elidir refcounting y heap (§8).

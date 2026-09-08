@@ -58,6 +58,19 @@ struct Module {
     int declarative_routes = 0;
     int vm_routes          = 0;
 
+    // Fase 6 de --native (COMPILACION-NATIVA.md): que via sirve CADA ruta,
+    // en el mismo orden que Program::routes -- "diagnostico explicito de
+    // rutas no compilables" en vez de solo el conteo agregado que ya daba
+    // el arranque. Se rellena siempre (con --native o sin el), aunque solo
+    // main.cpp la imprime cuando --native esta activo: sin --native todas
+    // las rutas con logica llevan "bytecode" y el conteo agregado ya basta.
+    struct RutaInforme {
+        std::string metodo;
+        std::string patron;
+        std::string via; // "declarativa" | "nativa" | "nativa (async)" | "bytecode" | "ws" | "sse"
+    };
+    std::vector<RutaInforme> rutas_informe;
+
     // mtimes de los ficheros compilados, para detectar cambios.
     std::vector<std::pair<std::filesystem::path,
                           std::filesystem::file_time_type>> stamps;
