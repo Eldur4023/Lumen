@@ -443,6 +443,14 @@ Value db_error(const std::string& msg) {
 // El primer argumento es siempre el nombre del modulo, que apila el emisor.
 // Un fallo del motor no revienta el handler: llega como un valor con `error`,
 // que el .lum puede mirar o dejar pasar.
+//
+// Adaptador delgado sobre lumen_script::await_db() (db.hpp/db.cpp) -- la
+// logica de verdad (resolver el driver/pool, decidir el worker fijado,
+// invocar DbAwaitable, actualizar pinned_workers/last_exec_workers) vive
+// ahi, compartida con el codigo que genera una ruta --native para lo mismo:
+// las dos vias corren EXACTAMENTE el mismo camino, no una reproduccion
+// aparte que pudiera divergir en silencio (la misma clase de fallo que ya
+// motivo dos correcciones criticas en esta fase).
 lumen::Task<Value> run_db(const VM::Result& r, int op, lumen::Request& req,
                            NativeCtx& ctx) {
     if (r.await_args.empty() || !r.await_args[0].is_str())
@@ -450,76 +458,25 @@ lumen::Task<Value> run_db(const VM::Result& r, int op, lumen::Request& req,
 
     const std::string mod = r.await_args[0].as_str();
 
-    auto& reg    = DbRegistry::instance();
-    auto* driver = reg.active(mod);
-    auto* pool   = reg.pool(mod);
-    if (!driver || !pool)
-        co_return db_error("el modulo '" + mod + "' no esta configurado: "
-                           "falta su bloque en app:");
+    DbOp dbop = DbOp::Rollback;
+    if      (op == async_db_query_id())  dbop = DbOp::Query;
+    else if (op == async_db_exec_id())   dbop = DbOp::Exec;
+    else if (op == async_db_last_id())   dbop = DbOp::LastId;
+    else if (op == async_db_begin_id())  dbop = DbOp::Begin;
+    else if (op == async_db_commit_id()) dbop = DbOp::Commit;
 
-    bool needs_sql = (op == async_db_query_id() || op == async_db_exec_id());
     std::string sql;
     std::vector<Value> params;
-    if (needs_sql) {
+    if (dbop == DbOp::Query || dbop == DbOp::Exec) {
         if (r.await_args.size() < 2 || !r.await_args[1].is_str())
             co_return db_error("falta la consulta SQL");
         sql    = r.await_args[1].as_str();
         params = std::vector<Value>(r.await_args.begin() + 2, r.await_args.end());
     }
 
-    // Dentro de una transaccion, todo va por la conexion que la abrio.
-    int  pin   = -1;
-    auto pinit = ctx.pinned_workers.find(mod);
-    if (pinit != ctx.pinned_workers.end()) pin = pinit->second;
-
-    // last_id() se encamina a la conexion del ultimo exec: el identificador
-    // generado no existe en las demas.
-    if (pin < 0 && op == async_db_last_id()) {
-        auto le = ctx.last_exec_workers.find(mod);
-        if (le != ctx.last_exec_workers.end()) pin = le->second;
-    }
-
-    auto result   = std::make_shared<Value>(Value::null());
-    auto errmsg   = std::make_shared<std::string>();
-    auto used     = std::make_shared<int>(-1);
-
-    co_await DbAwaitable{pool, req.loop,
-        [driver, sql, params, op, result, errmsg, used](size_t worker) {
-            *used = static_cast<int>(worker);
-            std::string err;
-            if (!driver->open(worker, err)) { *errmsg = err; return; }
-
-            long long n = 0;
-            if (op == async_db_query_id()) {
-                Value rows;
-                if (!driver->query(worker, sql, params, rows, err)) { *errmsg = err; return; }
-                *result = std::move(rows);
-            } else if (op == async_db_exec_id()) {
-                if (!driver->exec(worker, sql, params, n, err)) { *errmsg = err; return; }
-                *result = Value::integer(n);
-            } else if (op == async_db_last_id()) {
-                if (!driver->last_insert_id(worker, n, err)) { *errmsg = err; return; }
-                *result = Value::integer(n);
-            } else {
-                const char* stmt = (op == async_db_begin_id())    ? "BEGIN"
-                                 : (op == async_db_commit_id())   ? "COMMIT"
-                                                                  : "ROLLBACK";
-                if (!driver->exec(worker, stmt, {}, n, err)) { *errmsg = err; return; }
-                *result = Value::boolean(true);
-            }
-        },
-        pin};
-
-    if (!errmsg->empty()) co_return db_error(*errmsg);
-
-    if (op == async_db_exec_id()) ctx.last_exec_workers[mod] = *used;
-
-    // La transaccion fija su conexion al abrirse y la suelta al cerrarse.
-    if (op == async_db_begin_id())       ctx.pinned_workers[mod] = *used;
-    else if (op == async_db_commit_id() ||
-             op == async_db_rollback_id()) ctx.pinned_workers.erase(mod);
-
-    co_return std::move(*result);
+    Value v = co_await await_db(dbop, mod, req.loop, sql, std::move(params),
+                                ctx.pinned_workers, ctx.last_exec_workers);
+    co_return v;
 }
 
 // Cierra las transacciones que el handler dejo abiertas.

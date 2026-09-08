@@ -150,4 +150,78 @@ void DbRegistry::shutdown() {
         if (slot.pool) slot.pool->stop();
 }
 
+// ─── Puente compartido bytecode/--native ─────────────────────────────────────
+
+namespace {
+Value db_error(const std::string& msg) {
+    Value::Dict d;
+    d["error"] = Value::str(msg);
+    return Value::dict(std::move(d));
+}
+} // namespace
+
+lumen::Task<Value> await_db(DbOp op, const std::string& module, lumen::core::EventLoop* loop,
+                            const std::string& sql, std::vector<Value> params,
+                            std::map<std::string, int>& pinned_workers,
+                            std::map<std::string, int>& last_exec_workers) {
+    auto& reg    = DbRegistry::instance();
+    auto* driver = reg.active(module);
+    auto* pool   = reg.pool(module);
+    if (!driver || !pool)
+        co_return db_error("el modulo '" + module + "' no esta configurado: "
+                           "falta su bloque en app:");
+
+    // Dentro de una transaccion, todo va por la conexion que la abrio.
+    int  pin   = -1;
+    auto pinit = pinned_workers.find(module);
+    if (pinit != pinned_workers.end()) pin = pinit->second;
+
+    // last_id() se encamina a la conexion del ultimo exec: el identificador
+    // generado no existe en las demas.
+    if (pin < 0 && op == DbOp::LastId) {
+        auto le = last_exec_workers.find(module);
+        if (le != last_exec_workers.end()) pin = le->second;
+    }
+
+    auto result = std::make_shared<Value>(Value::null());
+    auto errmsg = std::make_shared<std::string>();
+    auto used   = std::make_shared<int>(-1);
+
+    co_await DbAwaitable{pool, loop,
+        [driver, sql, params, op, result, errmsg, used](size_t worker) {
+            *used = static_cast<int>(worker);
+            std::string err;
+            if (!driver->open(worker, err)) { *errmsg = err; return; }
+
+            long long n = 0;
+            if (op == DbOp::Query) {
+                Value rows;
+                if (!driver->query(worker, sql, params, rows, err)) { *errmsg = err; return; }
+                *result = std::move(rows);
+            } else if (op == DbOp::Exec) {
+                if (!driver->exec(worker, sql, params, n, err)) { *errmsg = err; return; }
+                *result = Value::integer(n);
+            } else if (op == DbOp::LastId) {
+                if (!driver->last_insert_id(worker, n, err)) { *errmsg = err; return; }
+                *result = Value::integer(n);
+            } else {
+                const char* stmt = (op == DbOp::Begin)  ? "BEGIN"
+                                  : (op == DbOp::Commit) ? "COMMIT" : "ROLLBACK";
+                if (!driver->exec(worker, stmt, {}, n, err)) { *errmsg = err; return; }
+                *result = Value::boolean(true);
+            }
+        },
+        pin};
+
+    if (!errmsg->empty()) co_return db_error(*errmsg);
+
+    if (op == DbOp::Exec) last_exec_workers[module] = *used;
+
+    // La transaccion fija su conexion al abrirse y la suelta al cerrarse.
+    if (op == DbOp::Begin) pinned_workers[module] = *used;
+    else if (op == DbOp::Commit || op == DbOp::Rollback) pinned_workers.erase(module);
+
+    co_return std::move(*result);
+}
+
 } // namespace lumen_script

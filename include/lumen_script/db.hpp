@@ -12,6 +12,7 @@
 #include <coroutine>
 
 #include <lumen/core/event_loop.hpp>
+#include <lumen/task.hpp>
 #include "value.hpp"
 
 namespace lumen_script {
@@ -163,5 +164,33 @@ struct DbAwaitable {
 
     void await_resume() const noexcept {}
 };
+
+// ─── Puente compartido bytecode/--native ─────────────────────────────────────
+//
+// Fase 5.5 de --native (COMPILACION-NATIVA.md): la logica de una suspension
+// de base de datos vivia solo dentro de run_db() (project.cpp), atada a
+// VM::Result/NativeCtx. Extraida aqui, parametrizada por DbOp en vez del
+// native_id de turno, para que el codigo generado por una ruta nativa
+// pueda invocar EXACTAMENTE el mismo camino que ya usa bytecode -- no una
+// reimplementacion "casi igual" (la misma clase de divergencia silenciosa
+// que ya motivo dos correcciones criticas en esta fase). run_db() ahora es
+// un adaptador delgado sobre esto.
+enum class DbOp { Query, Exec, LastId, Begin, Commit, Rollback };
+
+// `pinned_workers`/`last_exec_workers`: mismo mapa (module -> worker) que
+// NativeCtx lleva hoy para una peticion bytecode -- el llamante (run_db(),
+// o el codigo nativo de una ruta) es dueño de estos mapas y los pasa por
+// referencia, vivos mientras dure la peticion completa. `sql`/`params` se
+// ignoran para LastId/Begin/Commit/Rollback (no los necesitan).
+//
+// Nunca lanza ni marca un error mas alla de esta funcion: un fallo del
+// motor (modulo no configurado, SQL invalida, fallo del driver) da un
+// Value::Dict {"error": mensaje} como resultado normal, exactamente igual
+// que antes -- el `.lum` (o el codigo nativo generado) decide que hacer con
+// el, la funcion nunca revienta el handler.
+lumen::Task<Value> await_db(DbOp op, const std::string& module, lumen::core::EventLoop* loop,
+                            const std::string& sql, std::vector<Value> params,
+                            std::map<std::string, int>& pinned_workers,
+                            std::map<std::string, int>& last_exec_workers);
 
 } // namespace lumen_script
