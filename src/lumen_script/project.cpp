@@ -1320,8 +1320,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
     // --native (Fase 2): resuelto una sola vez, como fn_table -- valido
     // porque compile() ya termino de compilar nativo antes de llamar aqui
     // (ver el comentario en Module::native, project.hpp).
-    const std::vector<CompiledFn>* native_table =
-        mod.native ? &mod.native->por_indice : nullptr;
+    const NativeDispatch native_table = mod.native ? mod.native->dispatch() : NativeDispatch{};
     // Las plantillas viven en el modulo, como las funciones: el puntero es
     // estable mientras el modulo lo este, y el swap de recarga cambia los dos
     // a la vez.
@@ -1389,7 +1388,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
                         if (!prepare_args(ws_binds, fn_table, req, res, ctx, args)) co_return;
 
                         VM         vm;
-                        VM::Result result = vm.start(*ws_chunk, std::move(args), ctx, fn_table, native_table);
+                        VM::Result result = vm.start(*ws_chunk, std::move(args), ctx, fn_table, &native_table);
 
                         while (result.status == VM::Status::Suspended) {
                             Value produced = Value::null();
@@ -1476,7 +1475,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
                     ctx.response_written = true;
 
                     VM         vm;
-                    VM::Result result = vm.start(*sse_chunk, std::move(args), ctx, fn_table, native_table);
+                    VM::Result result = vm.start(*sse_chunk, std::move(args), ctx, fn_table, &native_table);
 
                     while (result.status == VM::Status::Suspended) {
                         Value produced = Value::null();
@@ -1579,7 +1578,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
                 VM  own_vm;
                 VM& vm = chunk->has_await ? own_vm : shared_vm;
 
-                VM::Result result = vm.start(*chunk, std::move(args), ctx, fn_table, native_table);
+                VM::Result result = vm.start(*chunk, std::move(args), ctx, fn_table, &native_table);
 
                 // El VM no sabe esperar: cada vez que se detiene, el co_await
                 // de verdad ocurre aqui, sobre el motor, y se le devuelve el

@@ -94,6 +94,14 @@ int main() {
     std::vector<std::string> por_indice(prog.functions.size());
     for (const auto& [name, sig] : sigs) por_indice[sig.index] = name;
 
+    TablaFirmas firmas;
+    for (const auto& f : prog.functions) {
+        FirmaNativa firma;
+        firma.retorno = Type::from_declared(f.return_type).kind();
+        for (const auto& p : f.params) firma.params.push_back(Type::from_declared(p.type).kind());
+        firmas[f.name] = std::move(firma);
+    }
+
     // 1) VM real: emit_function tal cual lo llama project.cpp.
     FunctionTable tabla_vm(prog.functions.size());
     DiagnosticBag diags_vm;
@@ -121,9 +129,9 @@ int main() {
     // fase exige que fib/cuenta_primos SI se puedan generar -- si alguna no
     // se pudiera, seria una regresion del generador, no un resultado
     // aceptable que silenciar.
-    std::string codigo = "#include <cstdint>\n\n";
+    std::string codigo = "#include <cstdint>\n#include <string>\n\n" + error_runtime_prelude() + "\n";
     for (size_t i = 0; i < prog.functions.size(); ++i) {
-        auto f = generar_funcion_nativa(prog.functions[i], cuerpos[i], por_indice);
+        auto f = generar_funcion_nativa(prog.functions[i], cuerpos[i], por_indice, firmas);
         if (!f) {
             std::printf("FALLA: '%s' no se pudo generar a C++ (deberia, para el criterio de "
                         "esta fase)\n", prog.functions[i].name.c_str());

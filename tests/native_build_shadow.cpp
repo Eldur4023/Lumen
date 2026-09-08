@@ -38,12 +38,13 @@ static bool parse_program(const std::string& src, SourceFile& file, DiagnosticBa
 }
 
 static long long ejecutar(const Chunk& chunk, long long arg, const FunctionTable* fns,
-                          const std::vector<CompiledFn>* native) {
+                          const NativeModule* nativo) {
     lumen::Request  req;
     lumen::Response res;
     NativeCtx       ctx{req, res};
     VM              vm;
-    VM::Result      r = vm.start(chunk, {Value::integer(arg)}, ctx, fns, native);
+    NativeDispatch  nd = nativo ? nativo->dispatch() : NativeDispatch{};
+    VM::Result      r  = vm.start(chunk, {Value::integer(arg)}, ctx, fns, &nd);
     if (r.status != VM::Status::Done) {
         std::printf("  FALLA: la VM no termino (status=%d, error=%s)\n",
                     static_cast<int>(r.status), r.error.c_str());
@@ -144,7 +145,7 @@ static bool prueba_strings() {
 
     const Chunk& chunk       = *tabla_vm[sigs.at("usa_saluda").index];
     long long    sin_nativo  = ejecutar(chunk, 7, &tabla_vm, nullptr);
-    long long    con_nativo  = ejecutar(chunk, 7, &tabla_vm, &nativo->por_indice);
+    long long    con_nativo  = ejecutar(chunk, 7, &tabla_vm, nativo.get());
     if (sin_nativo != con_nativo || sin_nativo != 7) {
         std::printf("  FALLA usa_saluda(7): bytecode=%lld nativo=%lld (se esperaba 7)\n",
                     sin_nativo, con_nativo);
@@ -199,7 +200,7 @@ static bool prueba_metodos_string() {
 
     const Chunk& chunk      = *tabla_vm[sigs.at("usa").index];
     long long    sin_nativo = ejecutar(chunk, 42, &tabla_vm, nullptr);
-    long long    con_nativo = ejecutar(chunk, 42, &tabla_vm, &nativo->por_indice);
+    long long    con_nativo = ejecutar(chunk, 42, &tabla_vm, nativo.get());
     if (sin_nativo != con_nativo || sin_nativo != 42) {
         std::printf("  FALLA usa(42): bytecode=%lld nativo=%lld (se esperaba 42)\n", sin_nativo,
                     con_nativo);
@@ -291,7 +292,7 @@ int main() {
     auto comparar = [&](const char* nombre, long long arg) {
         const Chunk& chunk = *tabla_vm[sigs.at(nombre).index];
         long long sin_nativo = ejecutar(chunk, arg, &tabla_vm, nullptr);
-        long long con_nativo = ejecutar(chunk, arg, &tabla_vm, &nativo->por_indice);
+        long long con_nativo = ejecutar(chunk, arg, &tabla_vm, nativo.get());
 
         if (sin_nativo != con_nativo) {
             ++fallos;

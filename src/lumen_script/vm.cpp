@@ -75,7 +75,7 @@ Value de_nativevalue(const NativeValue& n) {
 } // namespace
 
 VM::Result VM::start(const Chunk& chunk, std::vector<Value> params, NativeCtx& ctx,
-                     const FunctionTable* functions, const std::vector<CompiledFn>* native) {
+                     const FunctionTable* functions, const NativeDispatch* native) {
     functions_ = functions;
     native_    = native;
     frames_.clear();
@@ -544,12 +544,20 @@ VM::Result VM::run_until_error(NativeCtx& ctx) {
                 // de interprete ninguno -- el resultado acaba en la pila
                 // exactamente igual que tras un Op::Return normal, asi que el
                 // resto del bytecode que la invoco no distingue una cosa de
-                // la otra.
-                if (native_ && index < native_->size() && (*native_)[index]) {
+                // la otra. Un NativeValue::Tag::Error (division/modulo por
+                // cero, ver native_gen.cpp::lumen_native_fail) se convierte
+                // en el mismo fail() que ya usaria el bytecode equivalente.
+                if (native_ && native_->funcs && index < native_->funcs->size() &&
+                    (*native_->funcs)[index]) {
                     std::vector<NativeValue> nargs(args.size());
                     for (size_t i = 0; i < args.size(); ++i) nargs[i] = a_nativevalue(args[i]);
-                    NativeValue r = (*native_)[index](nargs.data(),
-                                                       static_cast<int32_t>(nargs.size()));
+                    NativeValue r = (*native_->funcs)[index](nargs.data(),
+                                                             static_cast<int32_t>(nargs.size()));
+                    if (r.tag == NativeValue::Tag::Error) {
+                        std::string msg = native_->error_message ? native_->error_message()
+                                                                  : "error nativo";
+                        return fail(std::move(msg), in.loc);
+                    }
                     push(de_nativevalue(r));
                     break;
                 }

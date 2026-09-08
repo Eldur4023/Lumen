@@ -252,8 +252,9 @@ int main(int argc, char** argv) {
         ctx.error_messages = &lumen_script::last_validation_messages();
 
         lumen_script::VM  vm;
-        auto result = vm.start(*it->second, {}, ctx, &mod->functions,
-                               mod->native ? &mod->native->por_indice : nullptr);
+        const lumen_script::NativeDispatch native =
+            mod->native ? mod->native->dispatch() : lumen_script::NativeDispatch{};
+        auto result = vm.start(*it->second, {}, ctx, &mod->functions, &native);
         if (result.status == lumen_script::VM::Status::Error) {
             lumen::log().error("on error " + std::to_string(code) + ": " + result.error);
             return;

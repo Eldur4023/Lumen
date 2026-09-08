@@ -34,6 +34,8 @@ bool tipo_soportado(const Type& t) {
     }
 }
 
+bool es_numerico(Type::Kind k) { return k == Type::Kind::Int || k == Type::Kind::Float; }
+
 // Subconjunto de tipo_soportado() que puede cruzar la ABI fija de
 // native_abi.hpp (NativeValue solo tiene un int64_t/double/bool en su
 // union): una funcion cuyos parametros y retorno caen todos aqui puede
@@ -111,127 +113,272 @@ std::string etiqueta_abi(Type::Kind k) {
 
 // Los 6 metodos de string que reconoce metodos_de()/call_method()
 // (natives.cpp) -- misma lista, vista desde este lado. Cada uno tiene su
-// funcion equivalente en runtime_prelude(), con la misma semantica exacta.
+// funcion equivalente en string_runtime_prelude(), con la misma semantica
+// exacta, y un tipo de retorno FIJO (nunca ambiguo): bool para los tres
+// primeros, string para los otros tres.
 bool metodo_string_soportado(const std::string& nombre) {
     return nombre == "starts_with" || nombre == "ends_with" || nombre == "contains" ||
            nombre == "upper" || nombre == "lower" || nombre == "trim";
 }
 
-// ── Comprobacion: ¿esta esto enteramente dentro de lo que compila esta fase? ──
+bool metodo_string_devuelve_bool(const std::string& nombre) {
+    return nombre == "starts_with" || nombre == "ends_with" || nombre == "contains";
+}
 
-bool expr_compilable(const IrExpr& e);
+// ── Comprobacion de tipos y compilabilidad ──────────────────────────────────
+//
+// Lumen Script no comprueba en ningun sitio -- ni el checker (check_expr/
+// check_stmt), ni el VM en tiempo de ejecucion -- que una variable, un
+// argumento o un valor de retorno mantengan el tipo con el que se
+// declararon: es un lenguaje dinamicamente tipado por debajo de la
+// anotacion. `int x = 1; x = "otro tipo"` compila y corre sin aviso; una
+// funcion declarada `fn int f(): return "hola"` tambien. Y `a / b` entre
+// dos `int` da Int si la division es exacta y Float si no -- una decision
+// que solo se puede tomar en tiempo de ejecucion.
+//
+// La primera version de esta fase confiaba en el tipo DECLARADO (el de
+// IrExpr::type / IrStmt::decl_type) para elegir la representacion C++, sin
+// verificar que fuera a coincidir con el tipo REAL en tiempo de ejecucion.
+// El resultado: programas legales, ya validados por el corpus, que --native
+// compilaba sin error y ejecutaba dando una respuesta HTTP DISTINTA a la
+// del bytecode -- una violacion directa del invariante de la seccion 3
+// ("mismo fuente, mismo comportamiento"), descubierta manualmente al probar
+// una reasignacion de tipo y un `and`/`or` con operandos no booleanos.
+//
+// tipo_provable() reemplaza esa confianza ciega: para cada forma de
+// expresion, aplica LAS MISMAS reglas dinamicas que usa el VM (vm.cpp) para
+// decidir si el tipo del resultado esta garantizado, y con cual. Cuando no
+// puede demostrarlo -- una division entre dos int, un `and`/`or` con
+// operandos no booleanos, una variable cuyo tipo no se pudo demostrar mas
+// arriba -- devuelve nullopt, y la expresion (o la funcion entera) se queda
+// sin compilar a nativo. No es una traduccion de "es compilable" a
+// "tipo_de() en emitter.cpp": tipo_de() es deliberadamente debil (Unknown
+// para casi todo) porque solo necesita servir a un puñado de comprobaciones
+// puntuales del checker; esta funcion necesita ser SOLIDA, asi que es un
+// analisis propio, mas estricto y mas completo, solo para esta fase.
+class Comprobador {
+public:
+    explicit Comprobador(const std::vector<std::string>& nombre_por_indice,
+                        const TablaFirmas& firmas)
+        : nombre_por_indice_(nombre_por_indice), firmas_(firmas) {}
 
-bool expr_compilable_ptr(const IrExpr* e) { return e && expr_compilable(*e); }
+    // Ranura -> tipo declarado, en el orden en que VarDecl/parametros los
+    // van presentando -- igual que Generador::ranura_a_nombre_, pero de
+    // tipo en vez de nombre. Una vez registrada, una ranura mantiene ESE
+    // tipo durante toda la funcion: es la CONSECUENCIA (no la causa) de que
+    // stmt_compilable() exija que cualquier Assign(Local) sobre esa ranura
+    // demuestre el mismo tipo -- por induccion, un Ident que resuelve aqui
+    // tiene garantizado que su valor real coincide siempre.
+    void registrar(int slot, Type::Kind k) { ranura_tipos_[slot] = k; }
 
-bool expr_compilable(const IrExpr& e) {
-    switch (e.kind) {
-        case IrExprKind::IntLit:
-        case IrExprKind::FloatLit:
-        case IrExprKind::BoolLit:
-        case IrExprKind::StringLit:
-            return true;
+    // Nullopt si no se puede demostrar; si no, el Type::Kind exacto que el
+    // VM SIEMPRE produciria para esta expresion, con los mismos valores.
+    std::optional<Type::Kind> tipo_provable(const IrExpr& e) const {
+        switch (e.kind) {
+            case IrExprKind::IntLit:    return Type::Kind::Int;
+            case IrExprKind::FloatLit:  return Type::Kind::Float;
+            case IrExprKind::BoolLit:   return Type::Kind::Bool;
+            case IrExprKind::StringLit: return Type::Kind::String;
 
-        // Sin representacion en esta fase (contenedores, Json) o sin sentido
-        // fuera de una ruta/clase (this, un miembro, await).
-        case IrExprKind::NullLit:
-        case IrExprKind::ListLit:
-        case IrExprKind::DictLit:
-        case IrExprKind::Member:
-        case IrExprKind::Index:
-        case IrExprKind::Await:
-        case IrExprKind::This:
-            return false;
+            // Sin representacion en esta fase, o sin sentido fuera de una
+            // ruta/clase.
+            case IrExprKind::NullLit:
+            case IrExprKind::ListLit:
+            case IrExprKind::DictLit:
+            case IrExprKind::Member:
+            case IrExprKind::Index:
+            case IrExprKind::Await:
+            case IrExprKind::This:
+                return std::nullopt;
 
-        case IrExprKind::Ident:
-            return tipo_soportado(e.type);
+            case IrExprKind::Ident: {
+                auto it = ranura_tipos_.find(e.slot);
+                return it == ranura_tipos_.end() ? std::nullopt
+                                                 : std::optional<Type::Kind>(it->second);
+            }
 
-        case IrExprKind::Unary:
-            return expr_compilable_ptr(e.lhs.get());
+            case IrExprKind::Unary: {
+                if (!e.lhs) return std::nullopt;
+                auto t = tipo_provable(*e.lhs);
+                if (!t) return std::nullopt;
+                if (e.text == "not") return Type::Kind::Bool; // Op::Not: siempre bool
+                return es_numerico(*t) ? t : std::nullopt;    // '-': solo sobre numeros
+            }
 
-        case IrExprKind::Binary:
-            return expr_compilable_ptr(e.lhs.get()) && expr_compilable_ptr(e.rhs.get());
+            case IrExprKind::Binary: {
+                if (!e.lhs || !e.rhs) return std::nullopt;
+                auto tl = tipo_provable(*e.lhs);
+                auto tr = tipo_provable(*e.rhs);
+                if (!tl || !tr) return std::nullopt;
 
-        case IrExprKind::Ternary:
-            return expr_compilable_ptr(e.object.get()) && expr_compilable_ptr(e.lhs.get()) &&
-                   expr_compilable_ptr(e.rhs.get());
+                // and/or (vm.cpp: JumpIfFalsePeek/JumpIfTruePeek) devuelven
+                // el VALOR del operando que gana, al estilo Python -- NO un
+                // booleano forzado. Traducirlo a &&/|| (lo que hace
+                // Generador::expr) solo coincide, observablemente, cuando
+                // los dos lados YA son bool: alli "el operando que gana" y
+                // "el resultado de &&/||" son el mismo valor. Para
+                // cualquier otro tipo (`5 and 10` -> 10, no `true`) no
+                // coinciden, y esta fase no genera la logica de verdad
+                // (evaluar una vez, devolver el operando) -- se queda sin
+                // compilar.
+                if (e.text == "and" || e.text == "or")
+                    return (*tl == Type::Kind::Bool && *tr == Type::Kind::Bool)
+                               ? std::optional<Type::Kind>(Type::Kind::Bool) : std::nullopt;
 
-        // Solo sobre una variable: un Member/Index como objetivo ya implica
-        // una clase o un contenedor, fuera de esta fase.
-        case IrExprKind::PreStep:
-        case IrExprKind::PostStep:
-            return e.lhs && e.lhs->kind == IrExprKind::Ident;
+                if (e.text == "==" || e.text == "!=" || e.text == "<" || e.text == "<=" ||
+                    e.text == ">" || e.text == ">=") {
+                    bool numericos = es_numerico(*tl) && es_numerico(*tr);
+                    bool strings   = *tl == Type::Kind::String && *tr == Type::Kind::String;
+                    return (numericos || strings) ? std::optional<Type::Kind>(Type::Kind::Bool)
+                                                  : std::nullopt;
+                }
 
-        // Una funcion de usuario, o uno de los 6 metodos de string que
-        // metodos_de()/call_method() reconocen (natives.cpp) -- ver
-        // metodo_string_soportado() mas abajo. Las otras formas de
-        // IrCallShape (builtins globales, metodos de List/Dict, BD, objetos
-        // reservados) no tienen contrapartida nativa todavia.
-        case IrExprKind::Call:
-            if (e.call_shape == IrCallShape::UserFunctionCall) {
-                for (const auto& a : e.args)
-                    if (!expr_compilable_ptr(a.value.get())) return false;
+                if (e.text == "+" && *tl == Type::Kind::String && *tr == Type::Kind::String)
+                    return Type::Kind::String;
+
+                if (!es_numerico(*tl) || !es_numerico(*tr)) return std::nullopt;
+
+                if (e.text == "%") // vm.cpp: '%' exige enteros a los dos lados
+                    return (*tl == Type::Kind::Int && *tr == Type::Kind::Int)
+                               ? std::optional<Type::Kind>(Type::Kind::Int) : std::nullopt;
+
+                if (e.text == "/")
+                    // vm.cpp: entre dos int, Int si la division es EXACTA y
+                    // Float si no -- una rama que solo el valor en tiempo de
+                    // ejecucion decide. No demostrable estaticamente.
+                    return (*tl == Type::Kind::Int && *tr == Type::Kind::Int)
+                               ? std::nullopt : std::optional<Type::Kind>(Type::Kind::Float);
+
+                // +, -, *: Int si los dos son Int, Float en cualquier otra
+                // combinacion numerica (vm.cpp: `ints ? integer : real`).
+                return (*tl == Type::Kind::Int && *tr == Type::Kind::Int)
+                           ? std::optional<Type::Kind>(Type::Kind::Int)
+                           : std::optional<Type::Kind>(Type::Kind::Float);
+            }
+
+            case IrExprKind::Ternary: {
+                // La condicion solo necesita ser demostrable en algun tipo
+                // (Int/Float/Bool convierten a bool en C++ identico a
+                // truthy(); string no convierte -- g++ lo rechaza solo).
+                if (!e.object || !tipo_provable(*e.object)) return std::nullopt;
+                if (!e.lhs || !e.rhs) return std::nullopt;
+                auto ts = tipo_provable(*e.lhs);
+                auto tn = tipo_provable(*e.rhs);
+                if (ts && tn && *ts == *tn) return ts;
+                return std::nullopt;
+            }
+
+            case IrExprKind::PreStep:
+            case IrExprKind::PostStep: {
+                if (!e.lhs || e.lhs->kind != IrExprKind::Ident) return std::nullopt;
+                auto t = tipo_provable(*e.lhs);
+                return (t && es_numerico(*t)) ? t : std::nullopt;
+            }
+
+            case IrExprKind::Call: {
+                if (e.call_shape == IrCallShape::BuiltinMethodCall) {
+                    if (!e.object || e.object->type.kind() != Type::Kind::String ||
+                        !metodo_string_soportado(e.call_name) || !tipo_provable(*e.object))
+                        return std::nullopt;
+                    for (const auto& a : e.args)
+                        if (!a.value || !tipo_provable(*a.value)) return std::nullopt;
+                    return metodo_string_devuelve_bool(e.call_name)
+                               ? Type::Kind::Bool : Type::Kind::String;
+                }
+                if (e.call_shape == IrCallShape::UserFunctionCall) {
+                    if (e.call_index < 0 ||
+                        static_cast<size_t>(e.call_index) >= nombre_por_indice_.size())
+                        return std::nullopt;
+                    auto fit = firmas_.find(nombre_por_indice_[static_cast<size_t>(e.call_index)]);
+                    if (fit == firmas_.end() || fit->second.params.size() != e.args.size())
+                        return std::nullopt;
+                    for (size_t i = 0; i < e.args.size(); ++i) {
+                        if (!e.args[i].value) return std::nullopt;
+                        auto ta = tipo_provable(*e.args[i].value);
+                        if (!ta || *ta != fit->second.params[i]) return std::nullopt;
+                    }
+                    return fit->second.retorno;
+                }
+                return std::nullopt;
+            }
+        }
+        return std::nullopt;
+    }
+
+    bool block_compilable(const IrBlock& b, Type::Kind retorno_fn) {
+        for (const auto& s : b)
+            if (!s || !stmt_compilable(*s, retorno_fn)) return false;
+        return true;
+    }
+
+    bool stmt_compilable(const IrStmt& s, Type::Kind retorno_fn) {
+        switch (s.kind) {
+            case IrStmtKind::Return: {
+                if (!s.value) return retorno_fn == Type::Kind::Void;
+                auto t = tipo_provable(*s.value);
+                return t && *t == retorno_fn;
+            }
+
+            case IrStmtKind::ExprStmt:
+                return s.value && tipo_provable(*s.value).has_value();
+
+            case IrStmtKind::VarDecl: {
+                if (!tipo_soportado(s.decl_type)) return false;
+                if (s.value) {
+                    auto t = tipo_provable(*s.value);
+                    if (!t || *t != s.decl_type.kind()) return false;
+                }
+                // Registrar DESPUES de comprobar el valor: una redeclaracion
+                // (mismo nombre, ranura nueva) no debe validarse contra si
+                // misma.
+                registrar(s.slot, s.decl_type.kind());
                 return true;
             }
-            if (e.call_shape == IrCallShape::BuiltinMethodCall &&
-                e.object && e.object->type.kind() == Type::Kind::String &&
-                metodo_string_soportado(e.call_name)) {
-                if (!expr_compilable(*e.object)) return false;
-                for (const auto& a : e.args)
-                    if (!expr_compilable_ptr(a.value.get())) return false;
-                return true;
+
+            // Solo la forma Local: Session/Index/Member implican sesion, un
+            // contenedor o una clase. El nuevo valor tiene que demostrar
+            // EXACTAMENTE el tipo con el que esa ranura se declaro -- es la
+            // regla que mantiene solido tipo_provable(Ident) durante el
+            // resto de la funcion (ver el comentario de registrar()).
+            case IrStmtKind::Assign: {
+                if (s.assign_target != IrAssignTarget::Local || !s.value) return false;
+                auto original = ranura_tipos_.find(s.assign_slot);
+                if (original == ranura_tipos_.end()) return false;
+                auto t = tipo_provable(*s.value);
+                return t && *t == original->second;
             }
-            return false;
+
+            case IrStmtKind::If:
+                return s.value && tipo_provable(*s.value).has_value() &&
+                       block_compilable(s.body, retorno_fn) &&
+                       block_compilable(s.orelse, retorno_fn);
+
+            case IrStmtKind::While:
+                return s.value && tipo_provable(*s.value).has_value() &&
+                       block_compilable(s.body, retorno_fn);
+
+            case IrStmtKind::Break:
+            case IrStmtKind::Continue:
+                return true;
+
+            // For itera una List (contenedor). Require y Try no son
+            // "primitivos y control de flujo" en el sentido estrecho de
+            // esta fase todavia -- Try en concreto necesita decidir como se
+            // representa un error nativo, que es una decision de la fase 5
+            // (asincronia y errores).
+            case IrStmtKind::For:
+            case IrStmtKind::Require:
+            case IrStmtKind::Try:
+                return false;
+        }
+        return false;
     }
-    return false;
-}
 
-bool stmt_compilable(const IrStmt& s);
-
-bool block_compilable(const IrBlock& b) {
-    for (const auto& s : b)
-        if (!s || !stmt_compilable(*s)) return false;
-    return true;
-}
-
-bool stmt_compilable(const IrStmt& s) {
-    switch (s.kind) {
-        case IrStmtKind::Return:
-            return !s.value || expr_compilable(*s.value);
-
-        case IrStmtKind::ExprStmt:
-            return s.value && expr_compilable(*s.value);
-
-        case IrStmtKind::VarDecl:
-            return tipo_soportado(s.decl_type) && (!s.value || expr_compilable(*s.value));
-
-        // Solo la forma Local: Session/Index/Member implican sesion, un
-        // contenedor o una clase.
-        case IrStmtKind::Assign:
-            return s.assign_target == IrAssignTarget::Local &&
-                   s.value && expr_compilable(*s.value);
-
-        case IrStmtKind::If:
-            return s.value && expr_compilable(*s.value) &&
-                   block_compilable(s.body) && block_compilable(s.orelse);
-
-        case IrStmtKind::While:
-            return s.value && expr_compilable(*s.value) && block_compilable(s.body);
-
-        case IrStmtKind::Break:
-        case IrStmtKind::Continue:
-            return true;
-
-        // For itera una List (contenedor). Require y Try no son "primitivos
-        // y control de flujo" en el sentido estrecho de esta fase todavia
-        // -- Try en concreto necesita decidir como se representa un error
-        // nativo, que es una decision de la fase 5 (asincronia y errores).
-        case IrStmtKind::For:
-        case IrStmtKind::Require:
-        case IrStmtKind::Try:
-            return false;
-    }
-    return false;
-}
+private:
+    const std::vector<std::string>& nombre_por_indice_;
+    const TablaFirmas&               firmas_;
+    std::map<int, Type::Kind>        ranura_tipos_;
+};
 
 // ── Generacion ────────────────────────────────────────────────────────────
 
@@ -251,7 +398,7 @@ std::string literal_float(double d) {
 
 const std::map<std::string, std::string>& operadores_binarios() {
     static const std::map<std::string, std::string> ops = {
-        {"+", "+"}, {"-", "-"}, {"*", "*"}, {"/", "/"}, {"%", "%"},
+        {"+", "+"}, {"-", "-"}, {"*", "*"},
         {"==", "=="}, {"!=", "!="}, {"<", "<"}, {"<=", "<="}, {">", ">"}, {">=", ">="},
         {"and", "&&"}, {"or", "||"},
     };
@@ -282,7 +429,16 @@ public:
             case IrExprKind::Unary:
                 return std::string("(") + (e.text == "not" ? "!" : "-") + expr(*e.lhs) + ")";
 
+            // '/' y '%' con un ayudante que comprueba el divisor antes de
+            // dividir (ver error_runtime_prelude): el resto de operadores
+            // no tiene ningun caso de fallo en tiempo de ejecucion que el
+            // VM trate como error controlado, asi que van directos al
+            // operador de C++ equivalente.
             case IrExprKind::Binary:
+                if (e.text == "/")
+                    return "lumen_div_check(" + expr(*e.lhs) + ", " + expr(*e.rhs) + ")";
+                if (e.text == "%")
+                    return "lumen_mod_check(" + expr(*e.lhs) + ", " + expr(*e.rhs) + ")";
                 return "(" + expr(*e.lhs) + " " + operadores_binarios().at(e.text) + " " +
                        expr(*e.rhs) + ")";
 
@@ -299,7 +455,7 @@ public:
             case IrExprKind::Call: {
                 // BuiltinMethodCall (solo metodos de string, ver
                 // metodo_string_soportado): funcion libre de
-                // runtime_prelude(), receptor primero, luego los
+                // string_runtime_prelude(), receptor primero, luego los
                 // argumentos -- mismo orden que call_method(recv, args) en
                 // natives.cpp, solo que en tiempo de compilacion en vez de
                 // por nombre en tiempo de ejecucion.
@@ -317,7 +473,7 @@ public:
             }
 
             default:
-                return ""; // inalcanzable: expr_compilable() ya lo descarto antes de llegar aqui
+                return ""; // inalcanzable: Comprobador ya lo descarto antes de llegar aqui
         }
     }
 
@@ -365,7 +521,7 @@ public:
             case IrStmtKind::Continue: return "continue;";
 
             default:
-                return ""; // inalcanzable: stmt_compilable() ya lo descarto antes de llegar aqui
+                return ""; // inalcanzable: Comprobador ya lo descarto antes de llegar aqui
         }
     }
 
@@ -388,11 +544,21 @@ private:
 } // namespace
 
 std::optional<FuncionNativa> generar_funcion_nativa(const FnDecl& fn, const IrBlock& body,
-                                                     const std::vector<std::string>& nombre_por_indice) {
-    if (!tipo_soportado(Type::from_declared(fn.return_type))) return std::nullopt;
+                                                     const std::vector<std::string>& nombre_por_indice,
+                                                     const TablaFirmas& firmas) {
+    const Type retorno_decl = Type::from_declared(fn.return_type);
+    if (!tipo_soportado(retorno_decl)) return std::nullopt;
     for (const auto& p : fn.params)
         if (!tipo_soportado(Type::from_declared(p.type))) return std::nullopt;
-    if (!block_compilable(body)) return std::nullopt;
+
+    Comprobador comprobador(nombre_por_indice, firmas);
+    // check_function declara los parametros, en orden, antes que nada mas
+    // (ver Emitter::check_function): la ranura i-esima es siempre el
+    // parametro i-esimo -- mismo orden que Generador::registrar() mas abajo.
+    for (size_t i = 0; i < fn.params.size(); ++i)
+        comprobador.registrar(static_cast<int>(i),
+                              Type::from_declared(fn.params[i].type).kind());
+    if (!comprobador.block_compilable(body, retorno_decl.kind())) return std::nullopt;
 
     FuncionNativa out;
     out.nombre_lumen = fn.name;
@@ -403,13 +569,9 @@ std::optional<FuncionNativa> generar_funcion_nativa(const FnDecl& fn, const IrBl
         params += tipo_cpp(Type::from_declared(fn.params[i].type)) + " " +
                   nombre_cpp(fn.params[i].name);
     }
-    out.firma_cpp = tipo_cpp(Type::from_declared(fn.return_type)) + " " + nombre_cpp(fn.name) +
-                    "(" + params + ")";
+    out.firma_cpp = tipo_cpp(retorno_decl) + " " + nombre_cpp(fn.name) + "(" + params + ")";
 
     Generador gen(nombre_por_indice);
-    // check_function declara los parametros, en orden, antes que nada mas
-    // (ver Emitter::check_function): la ranura i-esima es siempre el
-    // parametro i-esimo.
     for (size_t i = 0; i < fn.params.size(); ++i)
         gen.registrar(static_cast<int>(i), fn.params[i].name);
     out.cuerpo_cpp = "{\n" + gen.block(body, 1) + "}";
@@ -419,24 +581,27 @@ std::optional<FuncionNativa> generar_funcion_nativa(const FnDecl& fn, const IrBl
     // el resultado -- o, si la funcion es void, un NativeValue::Tag::Int a 0
     // que nadie mira (el llamante conoce el tipo de retorno declarado, igual
     // que ya conoce la aridad, asi que un valor void nunca se desempaqueta).
+    // El try/catch alrededor de todo es el otro lado del canal de error
+    // (ver error_runtime_prelude): una funcion nativa que se ejecuta hasta
+    // el final sin invocar lumen_native_fail() nunca lo atraviesa, asi que
+    // no cuesta nada en el camino normal.
     //
     // Si la frontera de la funcion usa `string`, la ABI fija de hoy no la
     // representa (ver tipo_abi_soportado): el cuerpo de arriba se genera
     // igual -- otra funcion nativa que la llame directamente se beneficia --
     // pero sin wrapper, se queda fuera del despacho desde la VM.
-    bool frontera_cruza_abi = tipo_abi_soportado(Type::from_declared(fn.return_type));
+    bool frontera_cruza_abi = tipo_abi_soportado(retorno_decl);
     for (const auto& p : fn.params)
         frontera_cruza_abi = frontera_cruza_abi && tipo_abi_soportado(Type::from_declared(p.type));
     if (!frontera_cruza_abi) return out;
 
     out.simbolo_abi = "lumen_native_" + fn.name;
-    std::string cuerpo_wrapper = "    (void)argc;\n";
+    std::string cuerpo_wrapper = "    (void)argc;\n    try {\n";
     for (size_t i = 0; i < fn.params.size(); ++i) {
         const Type t = Type::from_declared(fn.params[i].type);
-        cuerpo_wrapper += "    " + tipo_cpp(t) + " " + nombre_cpp(fn.params[i].name) +
+        cuerpo_wrapper += "        " + tipo_cpp(t) + " " + nombre_cpp(fn.params[i].name) +
                           " = args[" + std::to_string(i) + "]." + campo_abi(t.kind()) + ";\n";
     }
-    const Type ret = Type::from_declared(fn.return_type);
     const std::string llamada = nombre_cpp(fn.name) + "(" + [&] {
         std::string s;
         for (size_t i = 0; i < fn.params.size(); ++i) {
@@ -445,15 +610,22 @@ std::optional<FuncionNativa> generar_funcion_nativa(const FnDecl& fn, const IrBl
         }
         return s;
     }() + ")";
-    if (ret.kind() == Type::Kind::Void) {
-        cuerpo_wrapper += "    " + llamada + ";\n"
-                          "    NativeValue salida; salida.tag = NativeValue::Tag::Int; salida.i = 0;\n"
-                          "    return salida;\n}";
+    if (retorno_decl.kind() == Type::Kind::Void) {
+        cuerpo_wrapper += "        " + llamada + ";\n"
+                          "        NativeValue salida; salida.tag = NativeValue::Tag::Int; "
+                          "salida.i = 0;\n"
+                          "        return salida;\n";
     } else {
-        cuerpo_wrapper += "    NativeValue salida; salida.tag = " + etiqueta_abi(ret.kind()) +
-                          "; salida." + campo_abi(ret.kind()) + " = " + llamada + ";\n"
-                          "    return salida;\n}";
+        cuerpo_wrapper += "        NativeValue salida; salida.tag = " +
+                          etiqueta_abi(retorno_decl.kind()) + "; salida." +
+                          campo_abi(retorno_decl.kind()) + " = " + llamada + ";\n"
+                          "        return salida;\n";
     }
+    cuerpo_wrapper += "    } catch (const LumenNativeError&) {\n"
+                      "        NativeValue error; error.tag = NativeValue::Tag::Error; "
+                      "error.i = 0;\n"
+                      "        return error;\n"
+                      "    }\n}";
     out.wrapper_cpp = "extern \"C\" NativeValue " + out.simbolo_abi +
                       "(const NativeValue* args, int32_t argc) {\n" +
                       cuerpo_wrapper;
@@ -464,10 +636,10 @@ std::string abi_prelude() {
     // Identico, campo a campo, a la definicion de include/lumen_script/native_abi.hpp.
     return
         "struct NativeValue {\n"
-        "    enum class Tag : int32_t { Int, Float, Bool } tag = Tag::Int;\n"
+        "    enum class Tag : int32_t { Int, Float, Bool, Error } tag = Tag::Int;\n"
         "    union { int64_t i; double d; bool b; };\n"
         "};\n"
-        "using NativeFn = NativeValue (*)(const NativeValue*, int32_t);\n";
+        "using CompiledFn = NativeValue (*)(const NativeValue*, int32_t);\n";
 }
 
 std::string string_runtime_prelude() {
@@ -496,6 +668,41 @@ std::string string_runtime_prelude() {
         "    if (a == std::string::npos) return \"\";\n"
         "    size_t b = s.find_last_not_of(\" \\t\\r\\n\");\n"
         "    return s.substr(a, b - a + 1);\n"
+        "}\n";
+}
+
+std::string error_runtime_prelude() {
+    // g_lumen_native_error: por hilo, porque varias peticiones concurrentes
+    // pueden estar cada una a mitad de una llamada nativa a la vez. El
+    // mensaje es valido hasta la SIGUIENTE llamada nativa en el mismo hilo
+    // -- quien lo lee (vm.cpp) lo copia a su propio std::string antes de
+    // hacer cualquier otra cosa.
+    //
+    // lumen_div_check/lumen_mod_check son los unicos puntos de fallo que
+    // introduce esta fase (division y modulo por cero, vm.cpp: "division
+    // por cero" / "modulo por cero") -- plantillas porque el generador los
+    // usa tanto para int64_t/int64_t (modulo) como para cualquier mezcla de
+    // int64_t/double (division; ver tipo_provable(), que ya garantiza que
+    // una division entre dos int nunca llega aqui).
+    return
+        "static thread_local std::string g_lumen_native_error;\n"
+        "struct LumenNativeError {};\n"
+        "[[noreturn]] static void lumen_native_fail(std::string msg) {\n"
+        "    g_lumen_native_error = std::move(msg);\n"
+        "    throw LumenNativeError{};\n"
+        "}\n"
+        "extern \"C\" const char* lumen_native_error_message() {\n"
+        "    return g_lumen_native_error.c_str();\n"
+        "}\n"
+        "template <class T, class U>\n"
+        "static auto lumen_div_check(T a, U b) {\n"
+        "    if (b == 0) lumen_native_fail(\"division por cero\");\n"
+        "    return a / b;\n"
+        "}\n"
+        "template <class T, class U>\n"
+        "static auto lumen_mod_check(T a, U b) {\n"
+        "    if (b == 0) lumen_native_fail(\"modulo por cero\");\n"
+        "    return a % b;\n"
         "}\n";
 }
 

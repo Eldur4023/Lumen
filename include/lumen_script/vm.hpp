@@ -39,15 +39,15 @@ public:
     // Arranca `chunk` con `params` en las primeras ranuras.  `functions` es la
     // tabla de funciones de usuario del modulo; puede ser nula si no hay.
     //
-    // `native`, indexado igual que `functions` (por FnSig::index), es la
-    // tabla opcional de --native (ver native_build.hpp): un hueco distinto de
-    // nullptr desvia esa llamada entera a codigo nativo compilado, sin pasar
-    // por bytecode. Puede ser nula (el caso normal, sin --native) o mas corta
-    // que `functions` (las funciones sin entrada nunca se compilaron a
-    // nativo): un indice fuera de rango se trata igual que un hueco vacio.
+    // `native` (ver native_abi.hpp), indexado igual que `functions` (por
+    // FnSig::index): un hueco distinto de nullptr en `native->funcs` desvia
+    // esa llamada entera a codigo nativo compilado, sin pasar por bytecode.
+    // Puede ser nulo (el caso normal, sin --native) o mas corto que
+    // `functions` (las funciones sin entrada nunca se compilaron a nativo):
+    // un indice fuera de rango se trata igual que un hueco vacio.
     Result start(const Chunk& chunk, std::vector<Value> params, NativeCtx& ctx,
                  const FunctionTable* functions = nullptr,
-                 const std::vector<CompiledFn>* native = nullptr);
+                 const NativeDispatch* native = nullptr);
 
     // Continua tras una suspension, dejando `awaited` como valor de la
     // expresion `await`.
@@ -77,8 +77,8 @@ private:
     std::vector<Frame> frames_;
     std::vector<Value> stack_;
     std::vector<Value> locals_;
-    const FunctionTable*          functions_ = nullptr;
-    const std::vector<CompiledFn>*  native_    = nullptr;
+    const FunctionTable*  functions_ = nullptr;
+    const NativeDispatch* native_    = nullptr;
 
     Result execute(NativeCtx& ctx);
     Result run_until_error(NativeCtx& ctx);

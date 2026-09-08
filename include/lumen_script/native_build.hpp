@@ -37,7 +37,16 @@ public:
     // significa "esta funcion se sigue sirviendo con bytecode".
     std::vector<CompiledFn> por_indice;
 
+    // Simbolo fijo "lumen_native_error_message" (ver native_abi.hpp): nulo
+    // solo si por_indice esta vacio de verdad (no deberia pasar en un
+    // NativeModule ya construido, pero por si acaso).
+    ErrorMessageFn error_message = nullptr;
+
     size_t compiladas() const;
+
+    // Vista liviana para VM::start() -- ver el comentario de NativeDispatch
+    // en native_abi.hpp.
+    NativeDispatch dispatch() const { return {&por_indice, error_message}; }
 
 private:
     friend std::unique_ptr<NativeModule> compilar_nativo(const Program&, const FunctionSigs&,

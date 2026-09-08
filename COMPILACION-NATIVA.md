@@ -764,6 +764,95 @@ y si coincide llama a `valida(string) -> bool` (que usa `contains`/`starts_with`
 *después* de `usa` en el código fuente, ejercitando también la corrección del orden. Bytecode y
 `--native` coinciden.
 
+**Corrección crítica: el lenguaje es dinámico por debajo, y `--native` no lo sabía.**
+Investigando cómo extender el generador a `string` de verdad (no solo probar con casos de mano),
+apareció una pregunta incómoda: ¿comprueba el checker que una reasignación (`x = ...`) conserva el
+tipo con el que `x` se declaró? Se probó contra el compilador real, no se asumió — y la respuesta es
+**no, en ningún sitio**:
+
+```lum
+fn int riesgo(int a):
+    int x = a
+    x = "no soy un int"
+    return x
+```
+
+Esto compila sin ni un aviso, y en tiempo de ejecución la ruta que lo llama devuelve
+`{"r":"no soy un int"}` sin queja: Lumen Script es dinámicamente tipado por debajo de la anotación,
+igual que Python — el tipo declarado es una ayuda para el checker en unos pocos sitios puntuales
+(campos de clase, parámetros de ruta), no una garantía que se sostenga dentro del cuerpo de una
+función. Tampoco se comprueba el tipo de un `return` contra el tipo declarado de la función, ni el
+de un argumento contra el parámetro del destino.
+
+El generador de esta fase, hasta este punto, confiaba ciegamente en el tipo *declarado*
+(`IrExpr::type` / `IrStmt::decl_type`) para elegir la representación C++ de cada ranura — exactamente
+la costumbre que el párrafo de arriba delata como insegura. Probado a propósito, se confirmaron dos
+divergencias reales, silenciosas, ya en producción en los commits anteriores de esta misma fase:
+
+1. **Reasignación con cambio de tipo numérico.** `int x = a; x = 3.5; return x` da `3.5` en
+   bytecode (el `Value` es dinámico, sin problema) y daba **`3`** en `--native` — el `int64_t`
+   generado para `x` trunca en silencio la asignación de un `double`, porque C++ permite esa
+   conversión implícita sin ni un aviso. Confirmado con el binario real: mismo `.lum`, dos
+   respuestas HTTP distintas para `/x?a=7` (`{"r":3.5}` contra `{"r":3}`).
+2. **`and`/`or` no son `&&`/`||`.** `a and b` en Lumen Script devuelve el **valor** del operando que
+   gana —igual que Python (`5 and 10` da `10`, no `true`)—, no un booleano forzado (`vm.cpp`:
+   `JumpIfFalsePeek`/`JumpIfTruePeek`, que dejan el operando en la pila, nunca lo convierten). El
+   generador traducía `and`/`or` directo a `&&`/`||`, que SIEMPRE da `bool`. Confirmado: `f(5, 10)`
+   con `return a and b` daba `10` en bytecode y **`1`** en `--native`.
+
+Y una tercera, de otra naturaleza — no una respuesta *distinta*, un **proceso muerto**: `a % b`/
+`a / b` con `b == 0` es un error controlado en el VM ("`modulo por cero`" / "`division por cero`",
+la petición responde 500 y el servidor sigue vivo), pero en C++ un `%`/`/` entero por cero es
+comportamiento indefinido — en la práctica, `SIGFPE`, que **tumba el proceso entero**, con todas las
+peticiones en vuelo. `cuenta_primos` usa `%` pero nunca con divisor cero, así que el banco de
+pruebas de esta fase jamás lo había disparado.
+
+**La corrección, no un parche puntual.** Las tres son la misma familia de fallo bajo superficies
+distintas: el generador asumía que un tipo estático "obvio" en el código fuente coincide con el tipo
+real en tiempo de ejecución, y en un lenguaje sin esa garantía, no siempre es así. Parchear cada caso
+por separado habría dejado la puerta abierta a la próxima variante no probada. En su lugar,
+`native_gen.cpp` gana un análisis propio, `Comprobador::tipo_provable()` — deliberadamente distinto
+y más estricto que el `tipo_de()` del checker (que es débil a propósito, solo sirve a un puñado de
+comprobaciones puntuales) — que recorre cada expresión aplicando **las mismas reglas dinámicas que
+usa el VM** para decidir si su tipo está garantizado, y cuál:
+
+- Un `Ident` solo es de tipo demostrado si la ranura se registró con ESE tipo y nunca se reasignó a
+  otro — `stmt_compilable()` ahora exige que todo `Assign(Local)` demuestre exactamente el tipo
+  original de la ranura, o la función entera se descarta. Por inducción, un `Ident` que resuelve
+  aquí tiene garantizado que su valor real coincide siempre.
+- `a / b` entre dos `int` no es demostrable (Int si es exacta, Float si no, decidido en tiempo de
+  ejecución) — se descarta sin más, cae a bytecode. Entre otras combinaciones numéricas SÍ es
+  demostrable (siempre Float), y ahí queda un `lumen_div_check` con comprobación de cero.
+- `a % b` exige los dos lados demostrablemente `int` — demostrable, pero con
+  `lumen_mod_check` de por medio para el divisor cero.
+- `and`/`or` solo son demostrables (como `bool`) cuando los dos operandos YA son `bool` — el único
+  caso en el que `&&`/`||` observablemente coinciden con "el operando que gana".
+- Un `return`, una declaración `VarDecl` con inicializador, y cada argumento de una llamada a otra
+  función, exigen que el tipo demostrado de la expresión coincida EXACTAMENTE con lo que la
+  frontera declara — no solo que la expresión "se pueda generar".
+
+El canal de error que introduce el `%`/`/` seguro (`error_runtime_prelude()`, `native_abi.hpp`) es
+la primera pieza de infraestructura de errores de todo el backend nativo: `NativeValue` gana un tag
+`Error`; `lumen_native_fail(msg)` dentro de una función nativa deja el mensaje en un buffer por hilo
+y lanza una excepción vacía (`LumenNativeError`) que solo el wrapper `extern "C"` más externo atrapa
+— una llamada nativa anidada (una función nativa llamando a otra directamente en C++, sin wrapper de
+por medio) deja que la excepción se propague sola por la pila de C++ hasta ahí, igual que un error
+Lumen sin `try` sube hasta quien llama. La VM, del lado de la ABI, lee `NativeDispatch::error_message`
+justo cuando ve `NativeValue::Tag::Error` y lo convierte en el mismo `fail()` que usaría el bytecode
+equivalente. Es infraestructura general, no un parche para `%`: la Fase 3 la reusará para "índice
+fuera de rango" en cuanto llegue a `List`.
+
+**Validado con el binario real, no solo con las pruebas.** Los tres casos de arriba se reprodujeron
+primero con el `lumen` de verdad sirviendo HTTP (`--native` contra bytecode, mismo `.lum`, respuestas
+distintas) y se volvieron a probar tras la corrección: las tres funciones ahora se quedan sin
+compilar a nativo (`0 funcion(es) compilada(s)`, caída completa a bytecode) y dan la respuesta
+correcta en los dos modos. El caso de división/módulo por cero se probó con la función SÍ compilada
+a nativo (es segura: solo el divisor es dinámico, no el tipo) — la petición con divisor cero
+responde 500 con el mensaje correcto, y el proceso sigue vivo y sirviendo para la siguiente
+petición. `fib`/`cuenta_primos` y los casos de `string` de más arriba se re-verificaron sin cambios
+(mismo número de funciones compiladas, mismo rendimiento) — la corrección es más estricta, no
+distinta, para el código que ya era seguro.
+
 ### Fase 4 — Rutas HTTP síncronas
 - Handler generado como `Task<void>` (o función síncrona si no hay `await`, §9), registrado en
   el router igual que hoy.
@@ -812,6 +901,20 @@ añade `lumen --native` como séptimo contendiente. Los objetivos concretos:
 ---
 
 ## 14. Riesgos, y lo que esto no arregla
+
+**El riesgo que ya se materializó una vez, y que hay que seguir vigilando en cada fase nueva.**
+Lumen Script es dinámicamente tipado por debajo de la anotación: nada comprueba que una
+reasignación, un `return`, o un argumento de llamada conserven el tipo con el que algo se declaró
+(§Fase 3, "Corrección crítica"). El generador nativo, al confiar en el tipo declarado sin más,
+produjo dos veces C++ que compilaba limpio y daba una respuesta HTTP *distinta* a la del bytecode
+(una reasignación con cambio de tipo numérico, y `and`/`or` traducidos a `&&`/`||`) y una vez un
+proceso que se moría (`%`/`/` por cero, indefinido en C++, controlado en el VM) — las tres en
+código que el corpus de pruebas de la fase ya daba por bueno. La corrección (`tipo_provable()`,
+un análisis de solidez separado del checker débil a propósito) es la regla a aplicar en **cada**
+construcción nueva que toquen las fases siguientes, no solo en la que la disparó: antes de generar
+C++ para algo, demostrar —con las mismas reglas dinámicas que aplica el VM, no con lo que el tipo
+declarado sugiere— que el tipo del resultado no puede ser otro. Cuando no se pueda demostrar, cae a
+bytecode; nunca generar en base a una suposición sin verificar.
 
 **Lo que no arregla, para que no haya sorpresas.** El perfil de `POST /orders` bajo carga
 concurrente dice que el 28.4% del tiempo de hilo está en

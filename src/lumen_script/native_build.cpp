@@ -16,16 +16,17 @@ NativeModule::~NativeModule() {
 }
 
 NativeModule::NativeModule(NativeModule&& o) noexcept
-    : por_indice(std::move(o.por_indice)), handle_(o.handle_) {
+    : por_indice(std::move(o.por_indice)), error_message(o.error_message), handle_(o.handle_) {
     o.handle_ = nullptr;
 }
 
 NativeModule& NativeModule::operator=(NativeModule&& o) noexcept {
     if (this != &o) {
         if (handle_) dlclose(handle_);
-        por_indice = std::move(o.por_indice);
-        handle_    = o.handle_;
-        o.handle_  = nullptr;
+        por_indice    = std::move(o.por_indice);
+        error_message = o.error_message;
+        handle_       = o.handle_;
+        o.handle_     = nullptr;
     }
     return *this;
 }
@@ -47,6 +48,23 @@ const FnDecl* buscar_fn(const Program& prog, const std::string& nombre) {
     return nullptr;
 }
 
+// La firma (tipos de parametros y retorno) de cada funcion de `prog`, para
+// que tipo_provable() (native_gen.cpp) pueda comprobar una llamada contra
+// el destino sin volver a mirar el AST. Se construye para TODAS las
+// funciones, no solo las que van a terminar compilando: una funcion nativa
+// puede llamar a otra que el mapa (alfabetico, por FunctionSigs) todavia no
+// proceso.
+TablaFirmas construir_firmas(const Program& prog) {
+    TablaFirmas firmas;
+    for (const auto& f : prog.functions) {
+        FirmaNativa firma;
+        firma.retorno = Type::from_declared(f.return_type).kind();
+        for (const auto& p : f.params) firma.params.push_back(Type::from_declared(p.type).kind());
+        firmas[f.name] = std::move(firma);
+    }
+    return firmas;
+}
+
 } // namespace
 
 std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const FunctionSigs& sigs,
@@ -57,6 +75,8 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
     std::vector<std::string> nombre_por_indice(sigs.size());
     for (const auto& [nombre, sig] : sigs)
         if (sig.index < nombre_por_indice.size()) nombre_por_indice[sig.index] = nombre;
+
+    const TablaFirmas firmas = construir_firmas(prog);
 
     struct Generada {
         size_t      indice;
@@ -82,7 +102,7 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
         IrBlock       body;
         if (!emitter.check_function(*fn, descartable, diags_ir, &body)) continue;
 
-        auto generada = generar_funcion_nativa(*fn, body, nombre_por_indice);
+        auto generada = generar_funcion_nativa(*fn, body, nombre_por_indice, firmas);
         if (!generada) continue;
 
         prototipos += generada->firma_cpp + ";\n";
@@ -101,8 +121,8 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
     if (generadas.empty()) return nullptr; // nada que ofrecer nativo: no es un error
 
     std::string codigo = "#include <cctype>\n#include <cstdint>\n#include <string>\n\n" +
-                         abi_prelude() + "\n" + string_runtime_prelude() + "\n" +
-                         prototipos + "\n" + cuerpos;
+                         abi_prelude() + "\n" + error_runtime_prelude() + "\n" +
+                         string_runtime_prelude() + "\n" + prototipos + "\n" + cuerpos;
 
     std::error_code ec;
     std::filesystem::create_directories(cache_dir, ec);
@@ -143,12 +163,16 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
     out->handle_ = handle;
     out->por_indice.assign(nombre_por_indice.size(), nullptr);
 
+    out->error_message =
+        reinterpret_cast<ErrorMessageFn>(dlsym(handle, "lumen_native_error_message"));
+
     std::string simbolos_sin_resolver;
     for (const auto& g : generadas) {
         void* sym = dlsym(handle, g.simbolo_abi.c_str());
         if (!sym) { simbolos_sin_resolver += " " + g.simbolo_abi; continue; }
         out->por_indice[g.indice] = reinterpret_cast<CompiledFn>(sym);
     }
+    if (!out->error_message) simbolos_sin_resolver += " lumen_native_error_message";
     if (!simbolos_sin_resolver.empty())
         aviso = "--native: simbolo(s) no resueltos tras compilar (se sirven con bytecode):" +
                 simbolos_sin_resolver;
