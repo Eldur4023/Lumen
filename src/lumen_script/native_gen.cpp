@@ -632,10 +632,6 @@ public:
             // tipo_provable(*s.target) para declarar la variable C++
             // correspondiente (ver Generador::stmt, mismo caso).
             //
-            // Require y Try no son "primitivos y control de flujo" en el
-            // sentido estrecho de esta fase todavia -- Try en concreto
-            // necesita decidir como se representa un error nativo, que es
-            // una decision de la fase 5 (asincronia y errores).
             case IrStmtKind::For: {
                 if (!s.target) return false;
                 auto titer = tipo_provable(*s.target);
@@ -644,7 +640,23 @@ public:
                 return block_compilable(s.body, retorno_fn);
             }
 
-            case IrStmtKind::Require:
+            // `require cond else otherwise`: "si no cond, devuelve
+            // otherwise" -- el mismo IrStmtKind que las guardas de grupo de
+            // una ruta (Emitter::check_require_like, compartido). La
+            // condicion solo necesita ser demostrable en algun tipo (igual
+            // que If/While); `otherwise` tiene que demostrar EXACTAMENTE el
+            // tipo de retorno de la funcion/ruta, igual que un Return.
+            case IrStmtKind::Require: {
+                if (!s.value || !tipo_provable(*s.value).has_value()) return false;
+                if (!s.target) return false;
+                auto t = tipo_provable(*s.target);
+                return t && *t == retorno_fn;
+            }
+
+            // Try no es "primitivos y control de flujo" en el sentido
+            // estrecho de esta fase todavia -- necesita decidir como se
+            // representa un error nativo, que es una decision de la fase 5
+            // (asincronia y errores).
             case IrStmtKind::Try:
                 return false;
         }
@@ -936,6 +948,9 @@ public:
                 r += pad(indent) + "}";
                 return r;
             }
+
+            case IrStmtKind::Require:
+                return "if (!(" + expr(*s.value) + ")) { return " + expr(*s.target) + "; }";
 
             default:
                 return ""; // inalcanzable: Comprobador ya lo descarto antes de llegar aqui

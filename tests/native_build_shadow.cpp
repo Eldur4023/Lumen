@@ -409,6 +409,52 @@ static bool prueba_diccionarios() {
     return ok;
 }
 
+// `require cond else otherwise`: el mismo IrStmtKind que las guardas de
+// grupo de una ruta (Emitter::check_require_like) -- probado aqui sobre una
+// funcion suelta, que ya lo puede usar sin necesitar ninguna pieza de rutas
+// todavia.
+static bool prueba_require() {
+    const std::string src =
+        "fn int limitado(int n):\n"
+        "    require n >= 1 and n <= 10 else -1\n"
+        "    return n * n\n";
+
+    SourceFile    file;
+    DiagnosticBag diag_parse;
+    Program       prog;
+    if (!parse_program(src, file, diag_parse, prog)) {
+        std::printf("FALLA (require): no parsea (%s)\n",
+                    diag_parse.items().empty() ? "?" : diag_parse.items().front().message.c_str());
+        return false;
+    }
+
+    FunctionSigs                  sigs = firmar(prog);
+    FunctionTable                 tabla_vm;
+    std::unique_ptr<NativeModule> nativo;
+    const auto cache_dir = std::filesystem::temp_directory_path() / "lumen_native_build_check_require";
+    if (!compilar_las_dos_vias(prog, sigs, tabla_vm, nativo, cache_dir)) return false;
+
+    if (!nativo || nativo->compiladas() != 1) {
+        std::printf("FALLA (require): se esperaba 1 funcion compilada, hay %zu\n",
+                    nativo ? nativo->compiladas() : 0);
+        return false;
+    }
+
+    bool ok = true;
+    for (long long n : {5LL, 20LL}) {
+        const Chunk& chunk = *tabla_vm[sigs.at("limitado").index];
+        long long sin_n = ejecutar(chunk, n, &tabla_vm, nullptr);
+        long long con_n = ejecutar(chunk, n, &tabla_vm, nativo.get());
+        if (sin_n != con_n) {
+            std::printf("  FALLA limitado(%lld): bytecode=%lld nativo=%lld\n", n, sin_n, con_n);
+            ok = false;
+        } else {
+            std::printf("  ok    limitado(%lld) = %lld (bytecode y VM+nativo coinciden)\n", n, sin_n);
+        }
+    }
+    return ok;
+}
+
 static bool prueba_tipos_dinamicos() {
     bool ok = true;
 
@@ -650,6 +696,7 @@ int main() {
     if (!prueba_metodos_string()) ++fallos;
     if (!prueba_listas()) ++fallos;
     if (!prueba_diccionarios()) ++fallos;
+    if (!prueba_require()) ++fallos;
     if (!prueba_tipos_dinamicos()) ++fallos;
 
     if (fallos == 0) {

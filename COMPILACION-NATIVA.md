@@ -1026,6 +1026,64 @@ cambio. Coincide con la VM en todos los casos. 79/79 del corpus real y el canari
   devuelven respuestas idénticas en los dos modos, incluidos los casos de error (404 sin
   cuerpo, 422 con la lista de mensajes, 400 fuera de rango).
 
+**Lo que la investigación destapó antes de escribir nada — cuatro decisiones que corrigen la
+sección 9/11 de más arriba, no solo detalles de esta fase:**
+
+1. **El ABI POD (`NativeValue`) no alcanza.** Una ruta necesita `lumen::Request&`/`lumen::Response&`
+   de verdad — con `shared_ptr`, `std::function`, `unordered_map` por dentro — para leer parámetros
+   y escribir la respuesta. No hay forma honesta de empaquetar eso en una unión de 8 bytes. Esta
+   fase abandona, a propósito y solo para rutas, la pureza "el `.so` es autocontenido, ni cabeceras
+   ni enlazado real" que Fase 2/3 mantuvieron — el `.cpp` generado para una ruta incluye
+   `<lumen/request.hpp>`/`<lumen/response.hpp>` de verdad y el `.so` enlaza contra el runtime real
+   (`liblumen`/`liblumen_script`). Es una decisión consciente, consultada antes de tomarla: el
+   backend nativo deja de ser un artefacto que solo necesita el mismo compilador para su propio
+   POD, y pasa a necesitar el mismo compilador **y la misma libstdc++** que el binario `lumen` —
+   coste real de despliegue, aceptado porque sin él no hay sesión, ni JWT, ni *binding* de cuerpo,
+   ni plantillas posibles nunca, en ninguna fase futura.
+2. **No existe un camino síncrono en el router hoy.** El párrafo de §9 que dice que un handler sin
+   `await` "se registra por el camino síncrono que `HandlerTraits` ya sabe manejar" describe una
+   capacidad que hay que **construir**, no una que exista: `HandlerTraits::invoke` es ella misma una
+   corrutina en las dos ramas (`handler_traits.hpp`), y `Router::add`/`add_internal` solo admiten
+   `Task<void>`. La vía elegida —sin tocar el motor `lumen`— es la que ya usan las rutas
+   **declarativas** (`project.cpp:1521-1525`): envolver el puntero de función nativo en una
+   corrutina trivial, `[fn](Request& req, Response& res) -> Task<void> { fn(req, res); co_return; }`,
+   en el propio `build_routes`. El ahorro real no es "sin frame de corrutina" (sigue habiendo uno,
+   igual que en el camino declarativo) sino sin VM: nada de pila de operandos, sin recorrer bytecode.
+3. **`on error` no es un `catch` alrededor del handler.** Al contrario de lo que sugiere §10, hoy se
+   dispara **después** de que el handler termine, a nivel de motor (`App::handle_request`,
+   `status_code() >= 400`) — y también para errores que ni siquiera llegan a ejecutar el cuerpo
+   (404 del router, 422 de `bind_body`, 400 de `prepare_args`). Esto simplifica Fase 4 en vez de
+   complicarla: un handler nativo no necesita ningún mecanismo de manejo de errores propio para que
+   `on error` funcione — basta con que ponga el código de estado correcto vía `res.status(...)`, y
+   el motor (sin cambios) hace el resto, exactamente igual que con un handler de bytecode.
+4. **Una ruta produce el mismo `IrBlock` que una función.** `check_route` antepone las guardas de
+   grupo al cuerpo como `IrStmtKind::Require` normales (`emitter.cpp:186-202`, compartiendo
+   `check_require_like` con el `require` del cuerpo) — no hay ningún nodo de IR específico de rutas
+   que tratar aparte. Consecuencia práctica: dar soporte a `IrStmtKind::Require` beneficia a la vez
+   a las guardas de una ruta y a un `require` dentro de una función suelta.
+
+**Primer paso: `require`.** `Comprobador::tipo_provable`/`stmt_compilable` ganan el caso que
+faltaba: la condición solo necesita ser demostrable en algún tipo (igual que `If`/`While`), y
+`otherwise` tiene que demostrar EXACTAMENTE el tipo de retorno de la función — la misma regla que ya
+exige un `Return`, porque `require cond else otherwise` es, literalmente, "si no `cond`, `return
+otherwise`" (`emitter.cpp:1750-1759`, el mismo patrón que genera `Generador::stmt`: `if (!(cond)) {
+return otherwise; }`). Validado en `tests/native_build_shadow.cpp` (`prueba_require()`) y contra el
+binario real sirviendo HTTP: `require n >= 1 and n <= 10 else -1` da la misma respuesta en las dos
+vías, dentro y fuera de rango. 79/79 del corpus real y el canario `LUMEN_SHADOW_CHECK` siguen en
+verde.
+
+**Pendiente, y no trivial: el valor de retorno de una ruta necesita una representación distinta a
+la de una función.** `Dict<K,V>` (Fase 3) exige un valor `V` homogéneo — pero el cuerpo JSON de una
+respuesta real casi nunca lo es (`{"id": i, "name": "item-"+str(i), "value": valor, "active":
+activo}`, de `bench/lumen/app.lum`, mezcla `int`/`string`/`double`/`bool` en un solo dict). La
+representación tipada que ya paga por sí sola dentro del cuerpo de una ruta (variables locales,
+cómputo) no sirve para la expresión final que se serializa a JSON — esa necesita construirse como
+`Value` (el tipo dinámico que ya usa el VM, con `to_json_text()`), no como un contenedor nativo
+homogéneo. Es la pieza que falta antes de generar el resto del *driver* de una ruta (ligado de
+parámetros, guardas, serialización) — el orden de las claves del dict tiene que coincidir con el
+orden de inserción del `.lum` (`Value::Dict` es un vector, no un `map`, ver `value.hpp:35-42`), así
+que no es una conversión mecánica cualquiera.
+
 ### Fase 5 — Asincronía y base de datos
 - `await` → `co_await` sobre los awaitables existentes; transacciones, pool, `last_id`.
 - **Aceptación:** el banco de pruebas completo (`bench/run_all.sh`) corre en modo `--native`
