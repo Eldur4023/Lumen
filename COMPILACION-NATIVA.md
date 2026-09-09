@@ -1608,14 +1608,15 @@ paso, hizo falta añadir `#include <lumen_script/natives.hpp>` a las cabeceras q
 `compilar_nativo()` antepone siempre que hay rutas — no estaba, porque hasta ahora ninguna ruta
 nativa necesitaba nada de ese fichero.
 
-*Por qué una clase con `validate:` sigue fuera.* Ejecutar una regla `validate:` significaría, hoy,
-correr su `Chunk` bytecode dentro de una ruta por lo demás compilada — mezclando VM y código
-nativo en el mismo *request*, o reimplementar la condición aparte con el mismo riesgo de
-divergencia silenciosa que este documento entero existe para evitar. La vía correcta (compilar la
-condición a IR, igual que el cuerpo de una ruta/función/método, y dejar que `Comprobador`/
-`Generador` la traten como cualquier otra expresión booleana) es un incremento aparte —
-`ClaseNativa::tiene_validate` deja la puerta marcada para cuando llegue, rechazando limpiamente
-mientras tanto en vez de fingir que compila.
+*Por qué una clase con `validate:` sigue fuera, en ESTA fase.* Ejecutar una regla `validate:`
+significaría, con lo que hay hasta aquí, correr su `Chunk` bytecode dentro de una ruta por lo demás
+compilada — mezclando VM y código nativo en el mismo *request*, o reimplementar la condición aparte
+con el mismo riesgo de divergencia silenciosa que este documento entero existe para evitar. La vía
+correcta (compilar la condición a IR, igual que el cuerpo de una ruta/función/método, y dejar que
+`Comprobador`/`Generador` la traten como cualquier otra expresión booleana) es exactamente lo que
+hace la Fase 5.8, justo a continuación — `ClaseNativa::tiene_validate` (renombrado ahí a
+`reglas_ok`) deja la puerta marcada mientras tanto, rechazando limpiamente en vez de fingir que
+compila.
 
 *Verificación.* `bench/lumen-native/app.lum` gana `PUT /products/:id` en el informe de arranque
 (11 rutas nativas, antes 10). Contra HTTP real, con las dos vías compitiendo lado a lado sobre el
@@ -1631,6 +1632,92 @@ campo obligatorio ausente, campo obligatorio de tipo inválido, campo opcional d
 JSON inválido, cuerpo que no es un objeto — bytecode y `--native` coinciden byte a byte en los
 ocho. `pedir()` (el despachador de la prueba) gana un parámetro `body` opcional para poder
 ejercitar esto. 79/79 del corpus y las 8 suites de `ctest` en verde.
+
+### Fase 5.8 — `validate:` compilado a C++, y el modificador `.status(código)`
+
+El incremento que la propia Fase 5.7 dejó marcado: una clase con `validate:` (`UserIn`/`ProductIn`/
+`OrderIn` del banco de pruebas) seguía cayendo entera a bytecode. Con esto, `POST /users`/
+`POST /products`/`POST /orders` pasan a compilar nativos — 14 de las 17 rutas del contrato, antes
+11 (solo `/counter/*`/`/payload/:n` quedan fuera, por `SharedState`, sin relación con nada de esto).
+
+*El canario que nadie usaba: `Emitter::check_condition()` ya devolvía el IR.* La Fase 1
+("checker en paralelo") construyó `check_condition()` como contrapartida de `emit_condition()`
+— cada regla de `validate:` ya se comprobaba DOS veces al compilar (una vez de verdad, con
+`emit_condition()`, hacia el `Chunk` que ejecuta bytecode; otra en sombra, con `check_condition()`,
+solo para comparar diagnósticos) — pero el `IrExprPtr` que la segunda pasada construye se
+descartaba entero, `build_classes()` (`project.cpp`) solo lo usaba para el canario. Esta fase lo
+captura de verdad: `construir_clases()` (`native_gen.cpp`) llama a `check_condition()` con los
+campos de la clase como `names` (mismo orden que `emit_condition()`), y si no hay errores de sombra,
+tiene un IR de la condición para compilar.
+
+*Tener el IR no basta: hay que reprobarlo con el Comprobador de --native, no fiarse del checker de
+bytecode.* `check_condition()` demuestra que la regla es válida para la VM — pero su noción de tipo
+(`NombreTipado.tipo`, un string plano) no distingue un campo opcional de uno obligatorio, porque a
+la VM no le hace falta: un `Value::null()` fluye igual de bien por cualquier ranura dinámica. Para
+--native SÍ importa: un campo `?` es `Type::json()` (Fase 5.7), uno normal es su tipo escalar
+exacto, y una regla que compare `precio >= 0` con `precio` opcional necesita el camino Json-dinámico
+(Fase 5.5), no el numérico directo. Por eso cada clase con reglas arma su propio `Comprobador`
+—registrado con `CampoNativo::tipo` de cada campo, consciente de Json donde toque— y vuelve a probar
+el IR de `check_condition()` como `Type::Kind::Bool` con él. Sin funciones de usuario ni otras clases
+visibles (`firmas_vacias`/`clases_vacias`): una regla real nunca las necesita (comparaciones,
+aritmética, métodos de string como `.contains()`, ya soportados desde la Fase 2) — si alguna algún
+día lo intentara, faltaría ahí y esta rama la rechazaría limpio, no a medias.
+
+*Todo o nada, otra vez.* Si **cualquier** regla de una clase no demuestra `Bool` con este segundo
+Comprobador, la clase ENTERA queda fuera como parámetro de cuerpo (`ClaseNativa::reglas_ok`) — nunca
+"esta regla sí, esa no": ejecutar solo una parte de las reglas dejaría pasar datos que deberían haber
+fallado una validación que `--native` se saltó en silencio, la misma familia de divergencia que este
+documento entera existe para no permitir.
+
+*El C++ se genera una sola vez, en `construir_clases()`, no en cada ruta que use la clase.* Cada
+regla se traduce a texto C++ con `Generador::expr()` (un `Generador`/`Comprobador` dedicados a la
+clase, sin ningún `Comprobador` de ruta de por medio) y se guarda ya lista
+(`ReglaNativa::condicion_cpp`) — si dos rutas distintas tomaran la misma clase como cuerpo, las dos
+reusarían el mismo texto sin recompilarlo. `Generador::expr()` traduce un `Ident` por NOMBRE
+(`nombre_cpp(e.text)`, no por ranura — ver su propio comentario), así que el C++ resultante espera
+encontrar una variable `l_<campo>` en el momento en que se evalúe: `codigo_bind_cuerpo()`
+(Fase 5.7) las provee como **alias por referencia**, en un bloque propio, justo antes de evaluar las
+reglas —solo si ningún campo dio mensaje ya, igual que `bind_body()`— y solo entonces construye la
+instancia. El bloque propio no es cosmético: si la ruta tuviera OTRO parámetro con el mismo nombre
+que un campo de la clase (`:precio` en el patrón y un campo `precio` en el cuerpo, por ejemplo), el
+alias, con su propio *scope*, resuelve al campo correcto sin pisar nada de fuera.
+
+*Lo que casi bloquea esto por completo: `.status(código)` encadenado sobre un valor.* Al verificar
+`POST /orders`/`POST /users` contra el binario real (no solo la clase con `validate:` en sí, sino la
+ruta ENTERA), las tres seguían en bytecode por una razón completamente distinta: `return { "error":
+"stock insuficiente" }.status(409)` — un `DictLit` con un "modificador de respuesta" encadenado
+(`natives.cpp`, `call_method()`: `status`/`header`/`cookie` fijan algo sobre `res` como efecto
+lateral y devuelven el receptor SIN TOCARLO, para no reintroducir un objeto `response` mutable en el
+lenguaje) — y esta fase no tenía ninguna representación para ese patrón, distinto de `es_llamada_respuesta()`
+(que solo reconoce `status(N)` como llamada GLOBAL suelta, no un método encadenado sobre un valor).
+Sin él, ninguna de las tres rutas de escritura del banco de pruebas llegaba a compilar, con o sin
+`validate:`. Corregido extendiendo el mismo par que ya trata `DictLit`/`ListLit` en ambos lados
+—`Comprobador::es_valor_json()` (comprobación: el argumento es `Int`, el receptor es
+`es_valor_json()`) y `Generador::valor_json()` (generación: `(res.status(<código>), <valor_json del
+receptor>)`, con el operador coma) — el orden de evaluación del operador coma, garantizado desde
+C++17, asegura que el efecto lateral de fijar el código pasa ANTES de que el valor completo de la
+expresión (el del receptor) se evalúe, así que es válido tanto en la posición más común (`return
+X.status(N)`) como anidado dentro de un `DictLit`/`ListLit` más grande. Solo `.status()` está
+cubierto — `.header()`/`.cookie()` son la misma idea, pero nada que este documento necesite compilar
+todavía los usa; añadirlos, si hiciera falta, es el mismo patrón.
+
+*Verificación.* `bench/lumen-native/app.lum` pasa de 11 a 14 rutas nativas en el informe de arranque:
+`POST /users`/`POST /products`/`POST /orders` se suman. Contra HTTP real, con las dos vías
+compitiendo lado a lado sobre el mismo `seed.db`: alta válida, regla de `validate:` incumplida (una
+sola, las dos a la vez, con `.contains("@")` y con `and` entre dos comparaciones numéricas), campo
+obligatorio ausente (nunca llega a evaluar las reglas), email duplicado (`.status(409)` sobre un
+`DictLit` de error), producto con precio negativo, pedido con `quantity <= 0`, pedido a un producto
+inexistente (404), pedido con stock insuficiente (`.status(409)` de nuevo, esta vez tras una
+`sqlite.query()` real) y JSON malformado — respuesta IDÉNTICA byte a byte en cada caso. Cinco
+peticiones concurrentes de `POST /orders` sobre el mismo producto dieron cinco `id` consecutivos sin
+ninguno perdido, confirmando que la transacción (Fase 5.6) sigue serializando correctamente con
+`validate:`/`.status()` de por medio. `tests/native_route_shadow.cpp` gana una clase (`Registro`: un
+campo de tipo string y otro numérico, dos reglas —una con `.contains()` de tipo string, otra
+numérica con `and`—) y una ruta (`POST /registro`, con `.status()` usado dos veces, en la rama de
+éxito y en la de error) que se EJECUTA de verdad (sin `await`, igual que `/ajuste`) en seis casos:
+camino feliz, una rama de negocio que no es un fallo de `validate:` (menor de edad, `.status(403)`),
+cada regla fallando por separado, las dos a la vez, y un campo obligatorio ausente. 79/79 del corpus
+y las 8 suites de `ctest` en verde.
 
 ### Fase 6 — Empaquetado y modo mixto
 - `--native` de punta a punta: caché, `.so`, `dlopen`, informe de arranque, diagnóstico

@@ -92,7 +92,7 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
 
     TablaClases clases;
     TablaRoles  roles;
-    construir_clases(prog, clases_sig, clases, roles);
+    construir_clases(prog, clases_sig, sigs, &prog.imports, clases, roles);
 
     // El texto de cada clase representable va ANTES que ningun prototipo/
     // cuerpo: un LPunto usado como parametro/retorno necesita el tipo

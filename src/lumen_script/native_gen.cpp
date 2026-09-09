@@ -338,6 +338,24 @@ public:
                 if (!item || !es_valor_json(*item)) return false;
             return true;
         }
+        // Fase 5.8: `<valor>.status(codigo)`, el "modificador de respuesta"
+        // que natives.cpp (call_method(), grupo "Modificadores de
+        // respuesta") deja encadenar sobre CUALQUIER valor -- fija
+        // res.status(codigo) como efecto lateral y devuelve el receptor
+        // SIN TOCARLO (`return recv;`), para no reintroducir un objeto
+        // `response` mutable en el lenguaje. El unico que aparece en el
+        // banco de pruebas (`return {...}.status(409)`, POST /orders) --
+        // header()/cookie() son la misma idea pero no los usa nada que
+        // esta fase necesite compilar todavia, asi que quedan fuera a
+        // proposito (nunca generacion parcial: si hiciera falta, se anade
+        // igual que este).
+        if (e.kind == IrExprKind::Call && e.call_shape == IrCallShape::BuiltinMethodCall &&
+            e.call_name == "status" && e.object) {
+            if (e.args.size() != 1 || !e.args[0].value) return false;
+            auto tc = tipo_provable(*e.args[0].value);
+            if (!tc || tc->kind() != Type::Kind::Int) return false;
+            return es_valor_json(*e.object);
+        }
         auto t = tipo_provable(e);
         return t && (es_escalar_json(t->kind()) || t->kind() == Type::Kind::List ||
                     t->kind() == Type::Kind::Dict || t->kind() == Type::Kind::Json);
@@ -1530,6 +1548,17 @@ public:
             s += "return Value::list(std::move(l)); }())";
             return s;
         }
+        // Fase 5.8: `<valor>.status(codigo)` -- ver el comentario de
+        // Comprobador::es_valor_json, mismo caso. El operador coma
+        // secuencia los dos lados (garantizado desde C++17: el efecto
+        // lateral de fijar el codigo pasa ANTES de que el valor completo
+        // de la expresion -- el del receptor -- se evalue), asi que esto
+        // es valido tanto en la posicion mas comun (`return X.status(N)`,
+        // valor de retorno directo) como anidado dentro de un
+        // DictLit/ListLit mas grande.
+        if (e.kind == IrExprKind::Call && e.call_shape == IrCallShape::BuiltinMethodCall &&
+            e.call_name == "status")
+            return "(res.status(" + expr(*e.args[0].value) + "), " + valor_json(*e.object) + ")";
         auto t = comprobador_.tipo_provable(e);
         // Json (Fase 5.5), o un List<Json>/Dict<string,Json> (mismo
         // tipo_cpp() que Json, ver native_gen.cpp): la expresion YA es un
@@ -1864,17 +1893,18 @@ std::optional<FuncionNativa> generar_metodo_nativo(const std::string& clase, con
     return out;
 }
 
-// Fase 5.7: enlaza el cuerpo JSON de la peticion a una instancia de
+// Fase 5.7/5.8: enlaza el cuerpo JSON de la peticion a una instancia de
 // `clase`, reproduciendo EXACTAMENTE bind_body() (project.cpp) -- mismos
 // mensajes, mismo orden de comprobacion, mismo formato de error -- pero
 // como C++ generado en vez de una funcion compartida: a diferencia de
 // await_db()/rollback_pendientes_db() (Fase 5.5/5.6), bind_body() depende
 // de tipos (ClassInfo, el `Chunk` de una regla validate:, VM) que viven
-// dentro de project.cpp y no se exponen -- y las clases que SI llegan aqui
-// (ver ClaseNativa::tiene_validate) nunca tienen reglas que ejecutar, asi
-// que no hay VM que invocar: el binding entero -- parseo JSON, campo por
-// campo, obligatorio/opcional, tipo -- es codigo C++ directo sobre `Value`,
-// nada que reproduzca una tabla en tiempo de ejecucion.
+// dentro de project.cpp y no se exponen. Las reglas validate: de `clase`
+// (si tiene, ver ClaseNativa::reglas/reglas_ok) SI se evaluan aqui, pero
+// como C++ generado a partir de su IR (construir_clases()), nunca
+// invocando una VM: el binding entero -- parseo JSON, campo por campo,
+// obligatorio/opcional, tipo, reglas -- es codigo C++ directo sobre
+// `Value`, nada que reproduzca una tabla en tiempo de ejecucion.
 //
 // Un campo `?` ausente o `null` no es error: la variable que lo recibe
 // (Value, ver CampoNativo) se queda en Value::null(), y el cuerpo de la
@@ -1959,6 +1989,32 @@ std::string codigo_bind_cuerpo(const std::string& nombre_param, const std::strin
         s += "    }\n";
     }
 
+    // Fase 5.8: las reglas de validate: (si las hay -- ver ClaseNativa::
+    // reglas) solo se evaluan si NINGUN campo dio mensaje, exactamente
+    // igual que bind_body() ("evaluarlas sobre valores ausentes daria
+    // errores de tipo en vez del mensaje util"). Cada condicion, generada
+    // por construir_clases() con Generador::expr(), espera encontrar una
+    // variable "l_<campo>" -- los alias de abajo son EXACTAMENTE eso,
+    // referencias a las variables de campo ya rellenas (__c_<param>_<campo>),
+    // en un bloque propio para no filtrar esos nombres fuera (una regla
+    // podria compartir nombre con un parametro de ruta distinto, p.ej.
+    // ":price" en el patron Y un campo "price" en la clase del cuerpo --
+    // el alias, con su propio scope, resuelve al campo aqui sin pisar
+    // nada de fuera).
+    if (!clase.reglas.empty()) {
+        s += "    if (" + msgs_var + ".empty()) {\n";
+        s += "        {\n";
+        for (const auto& c : clase.campos)
+            s += "            auto& " + nombre_cpp(c.nombre) + " = __c_" + nombre_param + "_" +
+                 c.nombre + ";\n";
+        for (const auto& r : clase.reglas) {
+            s += "            if (!(" + r.condicion_cpp + ")) " + msgs_var + ".push_back(" +
+                 literal_string(r.mensaje) + ");\n";
+        }
+        s += "        }\n";
+        s += "    }\n";
+    }
+
     s += "    if (!" + msgs_var + ".empty()) {\n";
     // bind_body() (project.cpp) hace exactamente esto antes de responder:
     // deja los mensajes en el thread_local que lee `on error 422:` (ver
@@ -2034,7 +2090,7 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
             if (en_path_cuerpo) return std::nullopt;
             if (route.method == "GET" || route.method == "DELETE") return std::nullopt;
             if (cuerpo_visto) return std::nullopt;
-            if (cit->second.tiene_validate) return std::nullopt; // ver el comentario de ClaseNativa
+            if (!cit->second.reglas_ok) return std::nullopt; // ver el comentario de ClaseNativa
             cuerpo_visto = true;
             ParamRuta pr;
             pr.nombre    = p.name;
@@ -2291,8 +2347,9 @@ std::string generar_clase_runtime(const std::string& nombre_clase, const ClaseNa
     return s;
 }
 
-void construir_clases(const Program& prog, const ClassSigs& clases_sig, TablaClases& clases,
-                      TablaRoles& roles) {
+void construir_clases(const Program& prog, const ClassSigs& clases_sig,
+                      const FunctionSigs& fns, const std::set<std::string>* imports,
+                      TablaClases& clases, TablaRoles& roles) {
     for (const auto& c : prog.classes) {
         // Solo entra si TODOS los campos son representables -- el lenguaje ya
         // restringe los campos de clase a los cuatro escalares
@@ -2320,7 +2377,55 @@ void construir_clases(const Program& prog, const ClassSigs& clases_sig, TablaCla
             cn.campos.push_back(std::move(cf));
         }
         if (!todos_soportados) continue;
-        cn.tiene_validate = !c.rules.empty();
+
+        // Fase 5.8: cada `validate:` se compila a IR (Emitter::
+        // check_condition, el mismo canario que build_classes() -- project.cpp
+        // -- ya usaba para comparar bytecode/IR y descartaba) y se reprueba
+        // como Type::Kind::Bool contra los campos, con un Comprobador propio
+        // (registrado con clase.campos[i].tipo -- consciente de Json para un
+        // campo opcional, a diferencia del tipo que ve el emisor de
+        // bytecode, que no distingue "puede ser null"). Sin funciones ni
+        // otras clases visibles (una regla de validate: nunca las necesita
+        // en la practica: comparaciones, aritmetica, metodos de string) --
+        // si alguna algun dia lo intenta, faltara en firmas_vacias/
+        // clases_vacias y esta rama la rechazara limpio, no con un fallo a
+        // medias.
+        if (!c.rules.empty()) {
+            std::vector<NombreTipado> field_names;
+            for (const auto& f : c.fields) field_names.push_back({f.name, f.type.name});
+
+            static const std::vector<std::string> nombre_por_indice_vacio;
+            static const TablaFirmas               firmas_vacias;
+            static const TablaClases               clases_vacias;
+            static const TablaRoles                roles_vacios;
+            Comprobador comprobador_regla(nombre_por_indice_vacio, firmas_vacias, clases_vacias,
+                                          roles_vacios);
+            for (size_t i = 0; i < cn.campos.size(); ++i)
+                comprobador_regla.registrar(static_cast<int>(i), cn.campos[i].tipo);
+            // Generador::expr() traduce Ident por NOMBRE (nombre_cpp(e.text),
+            // no por slot -- ver el comentario de Generador::expr, caso
+            // Ident): el C++ generado aqui espera encontrar una variable
+            // "l_<campo>" en el momento en que se evalue -- codigo_bind_cuerpo()
+            // las provee como alias con ESE nombre exacto, en un bloque
+            // propio, justo antes de evaluar las reglas.
+            Generador gen_regla(nombre_por_indice_vacio, comprobador_regla);
+
+            bool todas_ok = true;
+            std::vector<ReglaNativa> reglas;
+            for (const auto& r : c.rules) {
+                DiagnosticBag diags_desechados, shadow_desechado;
+                Chunk         chunk_desechado;
+                Emitter       emitter(diags_desechados, &fns, &clases_sig, imports);
+                IrExprPtr     ir = emitter.check_condition(*r.condition, field_names,
+                                                           chunk_desechado, shadow_desechado);
+                if (!ir || !shadow_desechado.empty()) { todas_ok = false; break; }
+                auto tipo = comprobador_regla.tipo_provable(*ir);
+                if (!tipo || tipo->kind() != Type::Kind::Bool) { todas_ok = false; break; }
+                reglas.push_back({gen_regla.expr(*ir), r.message});
+            }
+            if (todas_ok) cn.reglas = std::move(reglas);
+            else          cn.reglas_ok = false;
+        }
 
         auto sig_it = clases_sig.find(c.name);
         if (sig_it == clases_sig.end()) continue; // no deberia pasar: viene del mismo prog

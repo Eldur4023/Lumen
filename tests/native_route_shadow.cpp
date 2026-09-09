@@ -98,6 +98,14 @@ int main() {
         "    string nombre\n"
         "    int?   extra\n"
         "\n"
+        "class Registro:\n"
+        "    string nombre\n"
+        "    int    edad\n"
+        "\n"
+        "    validate:\n"
+        "        nombre != \"\"          \"nombre: obligatorio\"\n"
+        "        edad >= 0 and edad < 150 \"edad: fuera de rango\"\n"
+        "\n"
         "fn int fib(int n):\n"
         "    if n < 2:\n"
         "        return n\n"
@@ -168,7 +176,12 @@ int main() {
         "put endpoint(\"/ajuste\", Ajuste datos):\n"
         "    if datos.extra != null:\n"
         "        return { \"nombre\": datos.nombre, \"extra\": datos.extra }\n"
-        "    return { \"nombre\": datos.nombre, \"extra\": 0 }\n";
+        "    return { \"nombre\": datos.nombre, \"extra\": 0 }\n"
+        "\n"
+        "post endpoint(\"/registro\", Registro datos):\n"
+        "    if datos.edad < 18:\n"
+        "        return { \"error\": \"menor de edad\" }.status(403)\n"
+        "    return { \"nombre\": datos.nombre, \"edad\": datos.edad }.status(201)\n";
 
     const auto dir  = std::filesystem::temp_directory_path() / "lumen_native_route_check";
     std::error_code ec;
@@ -320,6 +333,62 @@ int main() {
     comparar_cuerpo("JSON invalido", R"({"nombre":)");
     // Cuerpo bien formado pero no es un objeto.
     comparar_cuerpo("cuerpo no es objeto", R"([1,2,3])");
+
+    // Fase 5.8: `/registro` (POST endpoint("/registro", Registro datos),
+    // una clase CON `validate:` -- dos reglas, una de string y una
+    // numerica con `and`) y `.status(codigo)` encadenado sobre un DictLit
+    // de retorno (el "modificador de respuesta" de natives.cpp,
+    // call_method() -- usado DOS veces aqui, en la rama de error y en la
+    // de exito, igual que `POST /orders` en el banco de pruebas real).
+    // Tampoco usa `await`: se ejecuta de verdad, no solo se comprueba que
+    // compila.
+    {
+        std::string via;
+        for (const auto& r : mod_nat->rutas_informe)
+            if (r.patron == "/registro") { via = r.via; break; }
+        if (via != "nativa") {
+            std::printf("  FALLA /registro: se esperaba 'nativa', rutas_informe dice '%s'\n",
+                        via.empty() ? "(no aparece)" : via.c_str());
+            ok = false;
+        } else {
+            std::printf("  ok    /registro compila como ruta sincrona (clase con validate:, "
+                        "'.status(codigo)' encadenado sobre un dict)\n");
+        }
+    }
+    auto comparar_registro = [&](const char* etiqueta, const std::string& body) {
+        Resultado bc  = pedir(*mod_bc, "POST", "/registro", body);
+        Resultado nat = pedir(*mod_nat, "POST", "/registro", body);
+        if (!bc.encontrada || !nat.encontrada) {
+            std::printf("  FALLA %s: la ruta no aparece en el router (bytecode=%d nativo=%d)\n",
+                        etiqueta, bc.encontrada, nat.encontrada);
+            ok = false;
+            return;
+        }
+        if (bc.status != nat.status || bc.body != nat.body) {
+            std::printf("  FALLA %s: bytecode(%d, '%s') != nativo(%d, '%s')\n", etiqueta,
+                        bc.status, bc.body.c_str(), nat.status, nat.body.c_str());
+            ok = false;
+        } else {
+            std::printf("  ok    %s: bytecode y --native dan (%d, '%s') en las dos vias\n",
+                        etiqueta, bc.status, bc.body.c_str());
+        }
+    };
+    // Camino feliz: las dos reglas pasan, mayor de edad -- `.status(201)`.
+    comparar_registro("registro valido, mayor de edad", R"({"nombre":"Ana","edad":30})");
+    // Mayor de edad segun la regla `edad >= 0 and edad < 150`, pero
+    // `datos.edad < 18` en el CUERPO de la ruta la manda por la rama de
+    // error -- `.status(403)`, no un fallo de validate:.
+    comparar_registro("registro valido, menor de edad", R"({"nombre":"Ana","edad":10})");
+    // Falla la primera regla (`nombre != ""`).
+    comparar_registro("nombre vacio", R"({"nombre":"","edad":30})");
+    // Falla la segunda regla (`edad >= 0 and edad < 150`).
+    comparar_registro("edad fuera de rango", R"({"nombre":"Ana","edad":200})");
+    // Fallan las dos reglas a la vez -- mensajes en orden.
+    comparar_registro("las dos reglas fallan", R"({"nombre":"","edad":-5})");
+    // Campo obligatorio ausente: ni siquiera llega a evaluar las reglas
+    // (bind_body()/codigo_bind_cuerpo() solo las corre si los campos ya
+    // encajan).
+    comparar_registro("campo obligatorio ausente", R"({"nombre":"Ana"})");
 
     auto comparar = [&](const char* etiqueta, const std::string& path) {
         Resultado bc  = pedir(*mod_bc, "GET", path);

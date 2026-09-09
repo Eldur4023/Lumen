@@ -109,10 +109,10 @@ static bool compilar_clases_bytecode(const Program& prog, FunctionSigs& fns, Cla
 // con `driver` como main(), lo compila y lo ejecuta -- devuelve su salida
 // completa (stdout), o cadena vacia si algo fallo (con el motivo impreso).
 static std::string compilar_y_correr(const Program& prog, const ClassSigs& classes,
-                                     const std::string& driver) {
+                                     const FunctionSigs& fns, const std::string& driver) {
     TablaClases clases_n;
     TablaRoles  roles_n;
-    construir_clases(prog, classes, clases_n, roles_n);
+    construir_clases(prog, classes, fns, &prog.imports, clases_n, roles_n);
     if (prog.classes.empty() || !clases_n.count(prog.classes[0].name)) {
         std::printf("  FALLA: la clase no es representable\n");
         return "";
@@ -227,7 +227,7 @@ static bool prueba_campos_y_metodo() {
     }
     const long long esperado = r_m.value.as_int();
 
-    std::string salida = compilar_y_correr(prog, classes,
+    std::string salida = compilar_y_correr(prog, classes, fns,
         "    LPunto p(3, 4);\n"
         "    printf(\"%lld\\n\", (long long)l_Punto_cuadrado(p));\n");
     long long nativo = salida.empty() ? -1 : std::atoll(salida.c_str());
@@ -280,7 +280,7 @@ static bool prueba_ctor_y_referencia() {
         return false;
     }
 
-    std::string salida = compilar_y_correr(prog, classes,
+    std::string salida = compilar_y_correr(prog, classes, fns,
         "    LPunto p(3, 4);\n"
         "    LPunto q = l_Punto_desplazado(p, 1, 1);\n"
         "    printf(\"%lld %lld\\n\", (long long)q.campo_x(), (long long)q.campo_y());\n"

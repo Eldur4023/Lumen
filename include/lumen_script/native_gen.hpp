@@ -1,5 +1,6 @@
 #pragma once
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -111,16 +112,29 @@ struct CampoNativo {
 // algun campo no representable (List/Dict -- una clase como campo de otra
 // clase no existe en el lenguaje) sencillamente no tiene entrada aqui:
 // cualquier uso suyo (This/Member/ConstructorCall/ClassMethodCall) se
-// queda sin poder demostrar su tipo. `tiene_validate`: si la clase declara
-// algun `validate:`, generar_ruta_nativa() la rechaza como parametro de
-// cuerpo (Fase 5.7 no compila reglas de validacion a C++ todavia -- serian
-// bytecode ejecutandose dentro de una ruta nativa, o reimplementarlas
-// aparte con el mismo riesgo de divergencia silenciosa que este documento
-// evita en todo lo demas; queda como incremento futuro).
+// queda sin poder demostrar su tipo.
+//
+// Fase 5.8: `reglas` es cada `validate:` ya compilada a IR y reprobada
+// como Type::Kind::Bool contra los CAMPOS de la clase (0..N-1, mismo
+// orden que `campos` -- ver construir_clases()) -- generar_ruta_nativa()
+// las evalua, en orden, justo antes de construir la instancia, igual que
+// bind_body() (project.cpp). `reglas_ok`: si la clase declara ALGUN
+// `validate:` y CUALQUIER regla no demuestra Bool, esta en false y
+// `reglas` queda VACIO a proposito -- la clase entera se rechaza como
+// parametro de cuerpo (generar_ruta_nativa) en vez de compilar solo una
+// parte: ejecutar unas reglas si y otras no dejaria pasar datos que
+// deberian haber fallado una validacion que --native se salto en
+// silencio, la misma clase de divergencia que este documento existe para
+// evitar en todo lo demas.
+struct ReglaNativa {
+    std::string condicion_cpp; // ya generado (Generador::expr), listo para pegar en un `if`
+    std::string mensaje;
+};
 struct ClaseNativa {
     std::vector<CampoNativo>                     campos;
     std::unordered_map<std::string, FirmaNativa> metodos;
-    bool                                          tiene_validate = false;
+    std::vector<ReglaNativa>                      reglas;
+    bool                                          reglas_ok = true;
 };
 // Por nombre de clase Lumen.
 using TablaClases = std::unordered_map<std::string, ClaseNativa>;
@@ -147,8 +161,12 @@ using TablaRoles = std::unordered_map<int, RolFuncion>;
 // clase no declara ninguno: ese constructor NO vive en el AST
 // (Program::classes[i].ctors), asi que esta funcion repite, a proposito,
 // la misma regla de sintesis ("un parametro por campo, en orden") que ya
-// aplica project.cpp.
+// aplica project.cpp. `fns`/`imports`: solo para poder construir un
+// Emitter y obtener el IR de cada `validate:` (Emitter::check_condition)
+// -- el mismo camino que ya usa build_classes() (project.cpp) para su
+// canario de sombra, aqui capturado de verdad en vez de descartado.
 void construir_clases(const Program& prog, const ClassSigs& clases_sig,
+                      const FunctionSigs& fns, const std::set<std::string>* imports,
                       TablaClases& clases, TablaRoles& roles);
 
 // `nombre_por_indice[i]` es el nombre Lumen de la funcion de indice `i` en
