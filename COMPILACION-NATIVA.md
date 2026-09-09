@@ -1543,6 +1543,95 @@ documentada (el cuerpo es una clase, ver Fase 3), no por `begin()`/`commit()` �
 comprobando a mano que, quitando el parámetro de cuerpo de una copia de esa ruta, sí compila nativa.
 79/79 del corpus y las 8 suites de `ctest` en verde.
 
+### Fase 5.7 — Parámetro de cuerpo: una clase, sin `validate:`
+
+El otro hueco señalado en la Fase 4 ("un parámetro de tipo clase... deja la ruta entera sin
+compilar") y confirmado con el benchmark real: `PUT /products/:id` (`ProductUpdate`, dos campos
+`?`, sin `validate:`) seguía en bytecode pese a que el resto de la ruta —dos consultas SQL, una
+comparación con `null`, un `update`— ya era representable desde la Fase 5.5/5.6. Alcance
+deliberadamente acotado: una clase con **algún** `validate:` sigue cayendo a bytecode (ver más
+abajo por qué), así que `UserIn`/`ProductIn`/`OrderIn` del banco de pruebas no se benefician
+todavía — solo `ProductUpdate`.
+
+*Campo `?` como tipo dinámico, no como hueco.* Hasta ahora `construir_clases()` excluía la clase
+ENTERA si algún campo llevaba `?` — el layout de struct fijo (§7) no tenía dónde meter "puede ser
+null". La solución reutiliza la Fase 5.5 en vez de inventar `std::optional<T>`: un campo `?`
+almacena su valor como `Value` (igual que el resultado de una consulta), y `Comprobador` lo
+expone con `Type::json()` en vez de su tipo escalar declarado — `datos.price` (`double? price`)
+tiene, para el resto del compilador, EXACTAMENTE la misma pinta que `fila["price"]`. Un campo
+NO opcional sigue siendo su tipo concreto tal cual, sin ningún cambio. `CampoNativo` guarda el
+`Kind` escalar y la ortografía originales (`"int"`/`"long"`/`"float"`/`"double"`) aparte de esto,
+solo para el mensaje de error del *binding* del cuerpo (ver más abajo) — un campo opcional sigue
+siendo, de cara al usuario, un `double`, no un `Json`.
+
+*`x == null`/`x != null`, la pieza que faltaba para poder USAR un campo opcional.* `datos.price
+!= null` es la forma en que el `.lum` de verdad distingue "no vino" de "vino con valor" (ver
+`PUT /products/:id` en `bench/lumen/app.lum`) — sin esto, un campo `?` recién representable no
+serviría de nada. `NullLit` en sí mismo sigue sin ninguna representación fuera de este contexto
+(`tipo_provable`, caso `NullLit`, sigue devolviendo `std::nullopt`); `Comprobador::tipo_provable`
+mira el patrón `==`/`!=` contra un `NullLit` ANTES de pedir el tipo de los dos lados (pedírselo a
+un `NullLit` directamente daría `std::nullopt` y tumbaría la rama entera) y solo lo admite si el
+otro lado es Json-dinámico — un escalar nativo nunca es `null` en tiempo de ejecución, así que la
+comparación, aunque compilase, sería siempre el mismo booleano constante: no vale la pena
+representarla, mejor que se quede sin demostrar y avise con el resto de la ruta cayendo a
+bytecode. El código generado es directo: `Value::is_null()`, sin pasar por `valor_json()` (el
+lado `null` no tiene nada que convertir).
+
+*El* binding *del cuerpo: reproducido a mano, no compartido con bytecode.* A diferencia de
+`await_db()`/`rollback_pendientes_db()` (Fase 5.5/5.6), `bind_body()` (`project.cpp`) depende de
+tipos que viven dentro de ese fichero y no se exponen (`ClassInfo`, el `Chunk` bytecode de una
+regla `validate:`, la `VM` para ejecutarlo) — y las clases que SÍ llegan aquí (sin `validate:`,
+ver el punto siguiente) nunca tienen ninguna regla que ejecutar, así que no hace falta ninguna de
+esas piezas: el *binding* entero —parsear el JSON, campo por campo, obligatorio/opcional, tipo— es
+C++ generado directo sobre `Value` (`codigo_bind_cuerpo()`), reproduciendo `bind_body()` mensaje a
+mensaje, sin ninguna tabla en tiempo de ejecución de por medio. `L<Clase>` (Fase 3) no tiene
+constructor por defecto —el único que genera `generar_clase_runtime()` toma TODOS los campos—, así
+que cada campo vive en su propia variable C++ hasta que se sabe que ningún mensaje de error hizo
+falta; solo entonces se construye la instancia, con los campos en el mismo orden que
+`generar_clase_runtime()` ya fija.
+
+*Encontrado verificando esto contra HTTP real, no en la prueba aislada: `on error 422:` leía un
+hilo vacío.* La app puede declarar `on error 422:` (`bench/lumen/app.lum` lo hace, para dar
+`{"error": "validacion", "detalles": error.messages}` en vez del cuerpo genérico) — ese manejador
+lee `error.messages` de un `thread_local` (`lumen_script::last_validation_messages()`,
+`natives.cpp`) que `bind_body()` rellena antes de responder 422. El primer intento de esta fase no
+lo tocaba: el propio cuerpo 422 de la ruta nativa ya llevaba los mensajes correctos, pero SI la app
+declaraba `on error 422:`, ese manejador sustituye la respuesta entera y leía lo que quedara de
+una petición ANTERIOR en el mismo hilo (o nada). Confirmado comparando `PUT /products/:id` con un
+campo de tipo equivocado contra las dos vías reales: bytecode daba `"detalles":["price: se esperaba
+double"]`, `--native` daba `"detalles":[]`. Corregido en dos sitios, calcando exactamente lo que ya
+hace `prepare_args()` (bytecode) para CUALQUIER ruta: `last_validation_messages().clear()` al
+principio de TODA ruta nativa (no solo una con parámetro de cuerpo — una ruta que responda 422 a
+mano sin pasar por aquí tampoco debe heredar mensajes de una petición ajena en el mismo hilo) y
+`last_validation_messages() = mensajes` justo antes del 422 que sí lleva mensajes de campo. De
+paso, hizo falta añadir `#include <lumen_script/natives.hpp>` a las cabeceras que
+`compilar_nativo()` antepone siempre que hay rutas — no estaba, porque hasta ahora ninguna ruta
+nativa necesitaba nada de ese fichero.
+
+*Por qué una clase con `validate:` sigue fuera.* Ejecutar una regla `validate:` significaría, hoy,
+correr su `Chunk` bytecode dentro de una ruta por lo demás compilada — mezclando VM y código
+nativo en el mismo *request*, o reimplementar la condición aparte con el mismo riesgo de
+divergencia silenciosa que este documento entero existe para evitar. La vía correcta (compilar la
+condición a IR, igual que el cuerpo de una ruta/función/método, y dejar que `Comprobador`/
+`Generador` la traten como cualquier otra expresión booleana) es un incremento aparte —
+`ClaseNativa::tiene_validate` deja la puerta marcada para cuando llegue, rechazando limpiamente
+mientras tanto en vez de fingir que compila.
+
+*Verificación.* `bench/lumen-native/app.lum` gana `PUT /products/:id` en el informe de arranque
+(11 rutas nativas, antes 10). Contra HTTP real, con las dos vías compitiendo lado a lado sobre el
+mismo `seed.db`: actualización completa, solo `price`, solo `stock` (`price: null` explícito),
+cuerpo vacío `{}`, JSON mal formado, cuerpo que no es un objeto, `price`/`stock` de tipo
+equivocado (uno y los dos a la vez) y un id inexistente — respuesta IDÉNTICA byte a byte en los
+nueve casos, incluida la lista de `"detalles"` del `on error 422:` de la aplicación.
+`tests/native_route_shadow.cpp` gana una clase (`Ajuste`: un campo obligatorio, uno `?`, sin
+`validate:`) y una ruta (`PUT /ajuste`) — a diferencia de `/db/:id`/`/db/tx/:id`, esta ruta no usa
+`await` (compila SÍNCRONA), así que la prueba la EJECUTA de verdad (no solo comprueba que
+compila) en ocho casos: cuerpo completo, campo opcional ausente, campo opcional `null` explícito,
+campo obligatorio ausente, campo obligatorio de tipo inválido, campo opcional de tipo inválido,
+JSON inválido, cuerpo que no es un objeto — bytecode y `--native` coinciden byte a byte en los
+ocho. `pedir()` (el despachador de la prueba) gana un parámetro `body` opcional para poder
+ejercitar esto. 79/79 del corpus y las 8 suites de `ctest` en verde.
+
 ### Fase 6 — Empaquetado y modo mixto
 - `--native` de punta a punta: caché, `.so`, `dlopen`, informe de arranque, diagnóstico
   explícito de rutas no compilables, respaldo por bytecode ruta a ruta.

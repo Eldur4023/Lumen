@@ -82,9 +82,25 @@ using TablaFirmas = std::unordered_map<std::string, FirmaNativa>;
 // mismo subconjunto que un elemento de List o un valor de Dict, porque el
 // lenguaje ya restringe los campos de clase a escalares (project.cpp). El
 // ORDEN de esta lista fija el layout del struct C++ generado.
+//
+// Fase 5.7 (COMPILACION-NATIVA.md): un campo `?` (opcional) SI tiene
+// entrada aqui, a diferencia del resto de sitios donde `?` deja algo fuera
+// -- necesario porque un parametro de cuerpo de peticion (la unica via
+// real de construir una instancia con datos externos) puede traer
+// cualquier subconjunto de sus campos opcionales ausente. `tipo` es el
+// ALMACENAMIENTO real: Type::json() si `opcional` (un campo que puede ser
+// null en tiempo de ejecucion es, por definicion, un valor dinamico -- se
+// trata exactamente como el resultado de una consulta, ver
+// es_json_dinamico()), o el tipo escalar declarado tal cual si no.
+// `kind_escalar`/`ortografia` conservan el tipo ORIGINAL (antes de
+// envolverlo en Json) para cuando el binding del cuerpo de la peticion
+// necesite el nombre exacto ("se esperaba double", no "se esperaba Json").
 struct CampoNativo {
     std::string nombre;
-    Type        tipo;
+    Type        tipo = Type::unknown();
+    bool        opcional      = false;
+    Type::Kind  kind_escalar  = Type::Kind::Void; // Int/Float/Bool/String, SIEMPRE poblado
+    std::string ortografia;                       // "int"/"long"/"float"/"double"/"bool"/"string"
 };
 
 // Lo que native_gen.cpp necesita saber de una clase para representarla de
@@ -92,13 +108,19 @@ struct CampoNativo {
 // cada metodo (para comprobar una llamada, igual que TablaFirmas para
 // funciones sueltas -- pero por metodo, no globalmente, porque dos clases
 // distintas pueden tener un metodo con el mismo nombre). Una clase con
-// algun campo no representable (List/Dict, opcional -- una clase como
-// campo de otra clase no existe en el lenguaje) sencillamente no tiene
-// entrada aqui: cualquier uso suyo (This/Member/ConstructorCall/
-// ClassMethodCall) se queda sin poder demostrar su tipo.
+// algun campo no representable (List/Dict -- una clase como campo de otra
+// clase no existe en el lenguaje) sencillamente no tiene entrada aqui:
+// cualquier uso suyo (This/Member/ConstructorCall/ClassMethodCall) se
+// queda sin poder demostrar su tipo. `tiene_validate`: si la clase declara
+// algun `validate:`, generar_ruta_nativa() la rechaza como parametro de
+// cuerpo (Fase 5.7 no compila reglas de validacion a C++ todavia -- serian
+// bytecode ejecutandose dentro de una ruta nativa, o reimplementarlas
+// aparte con el mismo riesgo de divergencia silenciosa que este documento
+// evita en todo lo demas; queda como incremento futuro).
 struct ClaseNativa {
     std::vector<CampoNativo>                     campos;
     std::unordered_map<std::string, FirmaNativa> metodos;
+    bool                                          tiene_validate = false;
 };
 // Por nombre de clase Lumen.
 using TablaClases = std::unordered_map<std::string, ClaseNativa>;

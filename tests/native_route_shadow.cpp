@@ -43,7 +43,8 @@ struct Resultado {
     std::string location; // header "Location" (redirect()), vacio si no hay
 };
 
-static Resultado pedir(Module& mod, const std::string& metodo, const std::string& path) {
+static Resultado pedir(Module& mod, const std::string& metodo, const std::string& path,
+                       const std::string& body = {}) {
     // Query string: match() (igual que HttpConnection, que la separa ANTES
     // de llamar a match()) solo entiende el patron -- un '?' colado en el
     // path que se le pasa nunca encontraria la ruta.
@@ -58,6 +59,7 @@ static Resultado pedir(Module& mod, const std::string& metodo, const std::string
     req.method = metodo;
     req.path   = solo_ruta;
     req.params = m.params;
+    req.body   = body;
 
     if (qpos != std::string::npos) {
         std::string qs = path.substr(qpos + 1);
@@ -91,6 +93,10 @@ int main() {
         "app:\n"
         "    sqlite:\n"
         "        file \"" + archivo_db.string() + "\"\n"
+        "\n"
+        "class Ajuste:\n"
+        "    string nombre\n"
+        "    int?   extra\n"
         "\n"
         "fn int fib(int n):\n"
         "    if n < 2:\n"
@@ -157,7 +163,12 @@ int main() {
         "    if id == 0:\n"
         "        return status(400)\n"
         "    await sqlite.commit()\n"
-        "    return status(204)\n";
+        "    return status(204)\n"
+        "\n"
+        "put endpoint(\"/ajuste\", Ajuste datos):\n"
+        "    if datos.extra != null:\n"
+        "        return { \"nombre\": datos.nombre, \"extra\": datos.extra }\n"
+        "    return { \"nombre\": datos.nombre, \"extra\": 0 }\n";
 
     const auto dir  = std::filesystem::temp_directory_path() / "lumen_native_route_check";
     std::error_code ec;
@@ -253,6 +264,63 @@ int main() {
                         "exec/commit(), con un return anticipado antes del commit)\n");
         }
     }
+
+    // Fase 5.7: `/ajuste` (PUT endpoint("/ajuste", Ajuste datos), un
+    // parametro de tipo clase enlazado al cuerpo JSON, con un campo
+    // obligatorio (`string nombre`) y uno opcional (`int? extra`), SIN
+    // `validate:`) -- a diferencia de /db/:id y /db/tx/:id, esta ruta no
+    // usa `await`: compila SINCRONA, asi que se puede EJECUTAR de verdad
+    // aqui (sin EventLoop) y comparar bytecode contra --native byte a
+    // byte, no solo comprobar que compila.
+    {
+        std::string via;
+        for (const auto& r : mod_nat->rutas_informe)
+            if (r.patron == "/ajuste") { via = r.via; break; }
+        if (via != "nativa") {
+            std::printf("  FALLA /ajuste: se esperaba 'nativa', rutas_informe dice '%s'\n",
+                        via.empty() ? "(no aparece)" : via.c_str());
+            ok = false;
+        } else {
+            std::printf("  ok    /ajuste compila como ruta sincrona (parametro de cuerpo, "
+                        "campo obligatorio + campo `?`, sin validate:)\n");
+        }
+    }
+    auto comparar_cuerpo = [&](const char* etiqueta, const std::string& body) {
+        Resultado bc  = pedir(*mod_bc, "PUT", "/ajuste", body);
+        Resultado nat = pedir(*mod_nat, "PUT", "/ajuste", body);
+        if (!bc.encontrada || !nat.encontrada) {
+            std::printf("  FALLA %s: la ruta no aparece en el router (bytecode=%d nativo=%d)\n",
+                        etiqueta, bc.encontrada, nat.encontrada);
+            ok = false;
+            return;
+        }
+        if (bc.status != nat.status || bc.body != nat.body) {
+            std::printf("  FALLA %s: bytecode(%d, '%s') != nativo(%d, '%s')\n", etiqueta,
+                        bc.status, bc.body.c_str(), nat.status, nat.body.c_str());
+            ok = false;
+        } else {
+            std::printf("  ok    %s: bytecode y --native dan (%d, '%s') en las dos vias\n",
+                        etiqueta, bc.status, bc.body.c_str());
+        }
+    };
+    // Campo opcional presente.
+    comparar_cuerpo("cuerpo completo", R"({"nombre":"a","extra":7})");
+    // Campo opcional ausente: no es error, `datos.extra != null` da falso.
+    comparar_cuerpo("campo opcional ausente", R"({"nombre":"a"})");
+    // Campo opcional explicitamente null: mismo caso que ausente.
+    comparar_cuerpo("campo opcional null", R"({"nombre":"a","extra":null})");
+    // Campo obligatorio ausente: 422 con el mensaje "nombre: obligatorio".
+    comparar_cuerpo("campo obligatorio ausente", R"({"extra":3})");
+    // Campo obligatorio de tipo equivocado.
+    comparar_cuerpo("campo obligatorio tipo invalido", R"({"nombre":5})");
+    // Campo opcional de tipo equivocado (SI presente, tiene que ser el tipo
+    // correcto -- opcional no es "cualquier cosa vale").
+    comparar_cuerpo("campo opcional tipo invalido", R"({"nombre":"a","extra":"x"})");
+    // JSON mal formado.
+    comparar_cuerpo("JSON invalido", R"({"nombre":)");
+    // Cuerpo bien formado pero no es un objeto.
+    comparar_cuerpo("cuerpo no es objeto", R"([1,2,3])");
+
     auto comparar = [&](const char* etiqueta, const std::string& path) {
         Resultado bc  = pedir(*mod_bc, "GET", path);
         Resultado nat = pedir(*mod_nat, "GET", path);

@@ -249,9 +249,15 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
     // <modulo>.query/exec/last_id(...)` -- mismo criterio que Task/sleep:
     // siempre que haya rutas, no solo las que de verdad usan una base de
     // datos.
+    // <lumen_script/natives.hpp>: last_validation_messages() -- Fase 5.7,
+    // limpiada al principio de CUALQUIER ruta (no solo una con parametro
+    // de cuerpo, ver el comentario en generar_ruta_nativa) para que un
+    // `on error <code>:` que la app declare no herede mensajes de una
+    // peticion anterior en el mismo hilo.
     if (con_rutas)
         codigo += "#include <lumen/request.hpp>\n#include <lumen/response.hpp>\n"
-                  "#include <lumen/task.hpp>\n#include <lumen_script/db.hpp>\n\n" +
+                  "#include <lumen/task.hpp>\n#include <lumen_script/db.hpp>\n"
+                  "#include <lumen_script/natives.hpp>\n\n" +
                   route_runtime_prelude() + "\n";
     codigo += clases_texto + "\n" + prototipos + "\n" + cuerpos;
     if (con_rutas) codigo += rutas_cuerpos;

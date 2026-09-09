@@ -583,6 +583,29 @@ public:
 
             case IrExprKind::Binary: {
                 if (!e.lhs || !e.rhs) return std::nullopt;
+
+                // Fase 5.7: `x == null`/`x != null`. Solo tiene sentido
+                // contra un valor dinamico (Json, o un campo `?` de clase
+                // -- ver CampoNativo, se representa igual): un escalar
+                // nativo (int/float/bool/string) nunca es null en tiempo
+                // de ejecucion, asi que la comparacion, aunque compilase,
+                // seria siempre el mismo booleano constante -- no vale la
+                // pena representarla, mejor que se quede sin demostrar.
+                // NullLit en si mismo NUNCA es demostrable (tipo_provable,
+                // caso NullLit) fuera de este contexto, asi que se mira
+                // ANTES de pedir el tipo de los dos lados: pedirselo a un
+                // NullLit directamente siempre daria nullopt y tumbaria
+                // esta rama entera.
+                bool lhs_null = e.lhs->kind == IrExprKind::NullLit;
+                bool rhs_null = e.rhs->kind == IrExprKind::NullLit;
+                if (lhs_null || rhs_null) {
+                    if (e.text != "==" && e.text != "!=") return std::nullopt;
+                    const IrExpr& otro = lhs_null ? *e.rhs : *e.lhs;
+                    auto to = tipo_provable(otro);
+                    if (!to || !es_json_dinamico(*to)) return std::nullopt;
+                    return Type::primitive(Type::Kind::Bool);
+                }
+
                 auto tl = tipo_provable(*e.lhs);
                 auto tr = tipo_provable(*e.rhs);
                 if (!tl || !tr) return std::nullopt;
@@ -1163,6 +1186,15 @@ public:
             // VM trate como error controlado, asi que van directos al
             // operador de C++ equivalente.
             case IrExprKind::Binary: {
+                // Fase 5.7: `x == null`/`x != null` -- ver el comentario
+                // de Comprobador::tipo_provable, mismo caso. `Value` ya
+                // sabe responder si es null; no hace falta pasar por
+                // valor_json() (el lado null no tiene NADA que convertir).
+                if (e.lhs->kind == IrExprKind::NullLit || e.rhs->kind == IrExprKind::NullLit) {
+                    const IrExpr& otro = e.lhs->kind == IrExprKind::NullLit ? *e.rhs : *e.lhs;
+                    std::string chequeo = expr(otro) + ".is_null()";
+                    return e.text == "==" ? chequeo : ("!" + chequeo);
+                }
                 auto tl = comprobador_.tipo_provable(*e.lhs);
                 auto tr = comprobador_.tipo_provable(*e.rhs);
                 if (es_json_dinamico(*tl) || es_json_dinamico(*tr)) {
@@ -1832,6 +1864,131 @@ std::optional<FuncionNativa> generar_metodo_nativo(const std::string& clase, con
     return out;
 }
 
+// Fase 5.7: enlaza el cuerpo JSON de la peticion a una instancia de
+// `clase`, reproduciendo EXACTAMENTE bind_body() (project.cpp) -- mismos
+// mensajes, mismo orden de comprobacion, mismo formato de error -- pero
+// como C++ generado en vez de una funcion compartida: a diferencia de
+// await_db()/rollback_pendientes_db() (Fase 5.5/5.6), bind_body() depende
+// de tipos (ClassInfo, el `Chunk` de una regla validate:, VM) que viven
+// dentro de project.cpp y no se exponen -- y las clases que SI llegan aqui
+// (ver ClaseNativa::tiene_validate) nunca tienen reglas que ejecutar, asi
+// que no hay VM que invocar: el binding entero -- parseo JSON, campo por
+// campo, obligatorio/opcional, tipo -- es codigo C++ directo sobre `Value`,
+// nada que reproduzca una tabla en tiempo de ejecucion.
+//
+// Un campo `?` ausente o `null` no es error: la variable que lo recibe
+// (Value, ver CampoNativo) se queda en Value::null(), y el cuerpo de la
+// ruta lo comprueba con `campo != null` (Comprobador::tipo_provable/
+// Generador::expr, caso Binary contra NullLit). Un campo NO opcional
+// ausente/null, o de tipo equivocado, se acumula en `__msgs`; solo cuando
+// TODOS los campos comprobaron sin mensajes se construye la instancia --
+// `L<Clase>` no tiene constructor por defecto (generar_clase_runtime), asi
+// que no hay forma de "construirla primero y corregirla despues": los
+// valores de cada campo viven en variables locales C++ propias hasta que
+// se sabe que no hara falta el 422.
+std::string codigo_bind_cuerpo(const std::string& nombre_param, const std::string& nombre_clase,
+                               const ClaseNativa& clase, const Generador& gen) {
+    const std::string cuerpo_var = "__cuerpo_" + nombre_param;
+    const std::string msgs_var   = "__msgs_" + nombre_param;
+    std::string s;
+
+    s += "    Value " + cuerpo_var + ";\n";
+    s += "    if (!Value::parse_json(req.body, " + cuerpo_var + ")) {\n";
+    s += "        Value::Dict __d;\n";
+    s += "        __d[\"error\"] = Value::str(\"JSON invalido\");\n";
+    s += "        res.status(400).header(\"Content-Type\", \"application/json; charset=utf-8\")"
+         ".send(Value::dict(std::move(__d)).to_json_text());\n";
+    s += "        " + gen.ret_vacio() + "\n";
+    s += "    }\n";
+    s += "    if (!" + cuerpo_var + ".is_dict()) {\n";
+    s += "        Value::Dict __d;\n";
+    s += "        __d[\"error\"] = Value::str(\"Validacion fallida\");\n";
+    s += "        Value::List __l;\n";
+    s += "        __l.push_back(Value::str(\"el cuerpo tiene que ser un objeto JSON\"));\n";
+    s += "        __d[\"mensajes\"] = Value::list(std::move(__l));\n";
+    s += "        res.status(422).header(\"Content-Type\", \"application/json; charset=utf-8\")"
+         ".send(Value::dict(std::move(__d)).to_json_text());\n";
+    s += "        " + gen.ret_vacio() + "\n";
+    s += "    }\n";
+    s += "    std::vector<std::string> " + msgs_var + ";\n";
+
+    // Nombres de las variables C++ de cada campo, en el orden EXACTO de
+    // clase.campos -- el mismo orden que espera el (unico) constructor de
+    // L<Clase> (generar_clase_runtime).
+    std::vector<std::string> campo_vars;
+    for (const auto& c : clase.campos) {
+        const std::string var = "__c_" + nombre_param + "_" + c.nombre;
+        campo_vars.push_back(var);
+
+        const std::string chequeo = c.kind_escalar == Type::Kind::Int    ? "is_int"
+                                   : c.kind_escalar == Type::Kind::Float ? "is_num"
+                                   : c.kind_escalar == Type::Kind::Bool  ? "is_bool"
+                                                                          : "is_str";
+        s += "    " + tipo_cpp(c.tipo) + " " + var +
+             (c.opcional ? std::string() :
+              " = " + std::string(c.kind_escalar == Type::Kind::String ? "std::string()"
+                                  : c.kind_escalar == Type::Kind::Bool   ? "false"
+                                  : c.kind_escalar == Type::Kind::Float  ? "0.0" : "0")) +
+             ";\n";
+        s += "    {\n";
+        s += "        auto it = " + cuerpo_var + ".as_dict().find(" + literal_string(c.nombre) + ");\n";
+        s += "        if (it == " + cuerpo_var + ".as_dict().end() || it->second.is_null()) {\n";
+        if (!c.opcional)
+            s += "            " + msgs_var + ".push_back(" +
+                 literal_string(c.nombre + ": obligatorio") + ");\n";
+        s += "        } else if (!it->second." + chequeo + "()) {\n";
+        s += "            " + msgs_var + ".push_back(" +
+             literal_string(c.nombre + ": se esperaba " + c.ortografia) + ");\n";
+        s += "        } else {\n";
+        if (c.opcional) {
+            // valor_encaja() (project.cpp): float/double SIEMPRE se
+            // normaliza con Value::real(as_float()) -- un entero JSON en
+            // un campo double? tiene que guardarse como Value::Float, no
+            // como el Value::Int que trajo el body.
+            s += "            " + var + " = " +
+                 (c.kind_escalar == Type::Kind::Float ? "Value::real(it->second.as_float());\n"
+                                                       : "it->second;\n");
+        } else {
+            const std::string accesor = c.kind_escalar == Type::Kind::Int    ? "as_int"
+                                       : c.kind_escalar == Type::Kind::Float ? "as_float"
+                                       : c.kind_escalar == Type::Kind::Bool  ? "as_bool"
+                                                                              : "as_str";
+            s += "            " + var + " = it->second." + accesor + "();\n";
+        }
+        s += "        }\n";
+        s += "    }\n";
+    }
+
+    s += "    if (!" + msgs_var + ".empty()) {\n";
+    // bind_body() (project.cpp) hace exactamente esto antes de responder:
+    // deja los mensajes en el thread_local que lee `on error 422:` (ver
+    // app.on_error() en main.cpp) -- sin esto, un `on error 422:` que la
+    // aplicacion declare veria `error.messages` vacio para una ruta
+    // nativa, aunque el cuerpo de ESTA respuesta (por si la app no declara
+    // ese manejador y deja pasar la de aqui) ya los lleve bien.
+    s += "        lumen_script::last_validation_messages() = " + msgs_var + ";\n";
+    s += "        Value::Dict __d;\n";
+    s += "        __d[\"error\"] = Value::str(\"Validacion fallida\");\n";
+    s += "        Value::List __l;\n";
+    s += "        for (const auto& __m : " + msgs_var + ") __l.push_back(Value::str(__m));\n";
+    s += "        __d[\"mensajes\"] = Value::list(std::move(__l));\n";
+    s += "        res.status(422).header(\"Content-Type\", \"application/json; charset=utf-8\")"
+         ".send(Value::dict(std::move(__d)).to_json_text());\n";
+    s += "        " + gen.ret_vacio() + "\n";
+    s += "    }\n";
+
+    // Construido SOLO llegados aqui: L<Clase> no tiene constructor por
+    // defecto, asi que hasta este punto ningun campo se ha podido asignar
+    // a una instancia real -- cada uno vivio en su propia variable local.
+    s += "    L" + nombre_clase + " " + nombre_cpp(nombre_param) + "(";
+    for (size_t i = 0; i < campo_vars.size(); ++i) {
+        if (i) s += ", ";
+        s += campo_vars[i];
+    }
+    s += ");\n";
+    return s;
+}
+
 std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBlock& body,
                                               int indice,
                                               const std::vector<std::string>& nombre_por_indice,
@@ -1845,19 +2002,54 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
 
     struct ParamRuta {
         std::string nombre;
-        Type        tipo;
-        bool        en_path;
-        bool        con_defecto;
+        Type        tipo = Type::unknown();
+        bool        en_path = false;
+        bool        con_defecto = false;
         std::string texto_defecto; // solo si con_defecto
+        bool        es_cuerpo = false;         // Fase 5.7: parametro de tipo clase
+        const ClaseNativa* clase = nullptr;     // solo si es_cuerpo
     };
     const auto en_patron = pattern_params(route.pattern);
     std::vector<ParamRuta> params;
+    bool cuerpo_visto = false;
     for (const auto& p : route.params) {
+        // Fase 5.7: un parametro cuyo tipo es una clase representable
+        // (TablaClases) y SIN validate: se enlaza al cuerpo de la
+        // peticion -- misma idea que bind_params() (project.cpp), pero
+        // reproducida a mano aqui por el mismo motivo que el resto de esta
+        // funcion: bind_params todavia no ha corrido cuando
+        // compilar_nativo() llama a esto (ver el comentario grande sobre
+        // el orden en compile(), project.cpp), asi que las reglas
+        // estructurales ("un unico parametro de cuerpo", "GET/DELETE no
+        // llevan cuerpo", "no puede estar en el patron") se repiten aqui.
+        // Si algo no encaja, esta ruta cae a bytecode y bind_params dara
+        // el error real (o la aceptara, si el problema era solo que esta
+        // fase no llega) -- nunca un handler nativo silenciando un caso
+        // que bind_params habria rechazado.
+        auto cit = clases.find(p.type.name);
+        if (cit != clases.end()) {
+            if (p.type.optional) return std::nullopt; // "Clase?" como cuerpo: fuera de alcance
+            bool en_path_cuerpo = std::find(en_patron.begin(), en_patron.end(), p.name) !=
+                                  en_patron.end();
+            if (en_path_cuerpo) return std::nullopt;
+            if (route.method == "GET" || route.method == "DELETE") return std::nullopt;
+            if (cuerpo_visto) return std::nullopt;
+            if (cit->second.tiene_validate) return std::nullopt; // ver el comentario de ClaseNativa
+            cuerpo_visto = true;
+            ParamRuta pr;
+            pr.nombre    = p.name;
+            pr.tipo      = Type::class_ref(p.type.name);
+            pr.en_path   = false;
+            pr.es_cuerpo = true;
+            pr.clase     = &cit->second;
+            params.push_back(std::move(pr));
+            continue;
+        }
+
         // Alcance de este primer corte (ver el comentario de RutaNativa en
         // el header): sin `?`, y solo los cuatro escalares -- un
-        // File/List<File>/clase (cuerpo de peticion) nunca produce ninguno
-        // de esos Type::Kind, asi que ya quedan excluidos por la misma
-        // comprobacion.
+        // File/List<File> nunca produce ninguno de esos Type::Kind, asi
+        // que ya queda excluido por la misma comprobacion.
         if (p.type.optional) return std::nullopt;
         Type t = Type::from_declared(p.type);
         if (t.kind() != Type::Kind::Int && t.kind() != Type::Kind::Float &&
@@ -1946,6 +2138,17 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
     // (que si depende de `params`) se llama despues, mas abajo.
     Generador gen(nombre_por_indice, comprobador, /*ruta=*/true, asincrona);
     std::string cuerpo = "{\n    try {\n";
+    // Igual que prepare_args() (project.cpp) al principio de CUALQUIER
+    // ruta bytecode, no solo una con parametro de cuerpo: si esta peticion
+    // termina en un codigo con `on error <code>:` declarado, ese manejador
+    // lee `error.messages` de este MISMO hilo (ver app.on_error() en
+    // main.cpp, ctx.error_messages = &last_validation_messages()) -- sin
+    // limpiarlo aqui, una ruta que de un error SIN pasar por
+    // codigo_bind_cuerpo() (p.ej. `return status(422)` a mano) heredaria
+    // los mensajes de una validacion de OTRA peticion anterior en este
+    // mismo hilo. Barato: un vector vacio no reasigna memoria al
+    // limpiarse.
+    cuerpo += "    lumen_script::last_validation_messages().clear();\n";
     // Fase 5.5/5.6: equivalentes locales, para toda la duracion de esta
     // peticion, de NativeCtx::pinned_workers/last_exec_workers --
     // lumen_script::await_db() (db.hpp) los toma por referencia para fijar
@@ -1960,6 +2163,10 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
     if (asincrona)
         cuerpo += "    std::map<std::string, int> l_pinned_workers, l_last_exec_workers;\n";
     for (const auto& p : params) {
+        if (p.es_cuerpo) {
+            cuerpo += codigo_bind_cuerpo(p.nombre, p.tipo.class_name(), *p.clase, gen);
+            continue;
+        }
         const std::string mapa = p.en_path ? "req.params" : "req.query";
         const std::string nombre = nombre_cpp(p.nombre);
         cuerpo += "    " + tipo_cpp(p.tipo) + " " + nombre + ";\n";
@@ -2087,21 +2294,33 @@ std::string generar_clase_runtime(const std::string& nombre_clase, const ClaseNa
 void construir_clases(const Program& prog, const ClassSigs& clases_sig, TablaClases& clases,
                       TablaRoles& roles) {
     for (const auto& c : prog.classes) {
-        // Solo entra si TODOS los campos son representables (escalares, no
-        // opcionales) -- el lenguaje ya restringe los campos de clase a
-        // escalares (project.cpp), asi que en la practica el unico motivo
-        // real para quedar fuera es un campo `?`.
+        // Solo entra si TODOS los campos son representables -- el lenguaje ya
+        // restringe los campos de clase a los cuatro escalares
+        // (project.cpp), asi que el unico motivo real para quedar fuera,
+        // hoy, es un campo de un tipo que ni siquiera el lenguaje permite
+        // (no debería pasar nunca: build_classes ya lo rechazaria antes).
+        // Fase 5.7: un campo `?` SI entra -- ver el comentario de
+        // CampoNativo sobre por que se almacena como Json.
         ClaseNativa cn;
         bool todos_soportados = true;
         for (const auto& f : c.fields) {
             Type t = Type::from_declared(f.type);
-            if (t.is_optional() || !tipo_elemento_contenedor_soportado(t)) {
+            Type::Kind k = t.kind();
+            if (k != Type::Kind::Int && k != Type::Kind::Float &&
+                k != Type::Kind::Bool && k != Type::Kind::String) {
                 todos_soportados = false;
                 break;
             }
-            cn.campos.push_back({f.name, t});
+            CampoNativo cf;
+            cf.nombre       = f.name;
+            cf.opcional     = t.is_optional();
+            cf.kind_escalar = k;
+            cf.ortografia   = t.base_name();
+            cf.tipo         = cf.opcional ? Type::json() : t;
+            cn.campos.push_back(std::move(cf));
         }
         if (!todos_soportados) continue;
+        cn.tiene_validate = !c.rules.empty();
 
         auto sig_it = clases_sig.find(c.name);
         if (sig_it == clases_sig.end()) continue; // no deberia pasar: viene del mismo prog
