@@ -193,4 +193,15 @@ lumen::Task<Value> await_db(DbOp op, const std::string& module, lumen::core::Eve
                             std::map<std::string, int>& pinned_workers,
                             std::map<std::string, int>& last_exec_workers);
 
+// Cierra, con ROLLBACK, cualquier transaccion que el handler haya dejado
+// abierta (begin() sin commit() ni rollback() al llegar al final de la
+// ruta). Sin esto, la conexion que la abrio quedaria pinned dentro de una
+// transaccion para siempre y el siguiente que la reutilizara heredaria ese
+// estado a medias. Se llama una vez, justo antes de construir la respuesta
+// -- ver el punto de llamada en project.cpp (bytecode) y en el codigo que
+// genera una ruta nativa asincrona (native_gen.cpp). Vacia `pinned_workers`
+// al terminar.
+lumen::Task<void> rollback_pendientes_db(std::map<std::string, int>& pinned_workers,
+                                         lumen::core::EventLoop* loop);
+
 } // namespace lumen_script

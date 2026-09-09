@@ -485,26 +485,7 @@ lumen::Task<Value> run_db(const VM::Result& r, int op, lumen::Request& req,
 // transaccion para siempre, y el siguiente que la cogiera del pool heredaria
 // ese estado.
 lumen::Task<void> rollback_pendientes(NativeCtx& ctx, lumen::Request& req) {
-    if (ctx.pinned_workers.empty()) co_return;
-
-    auto pendientes = ctx.pinned_workers;
-    for (const auto& [mod, worker] : pendientes) {
-        auto& reg    = DbRegistry::instance();
-        auto* driver = reg.active(mod);
-        auto* pool   = reg.pool(mod);
-        if (!driver || !pool) continue;
-
-        lumen::log().warn("transaccion de '" + mod + "' sin commit ni rollback: "
-                           "se deshace");
-        co_await DbAwaitable{pool, req.loop,
-            [driver](size_t w) {
-                long long n = 0;
-                std::string err;
-                driver->exec(w, "ROLLBACK", {}, n, err);
-            },
-            worker};
-    }
-    ctx.pinned_workers.clear();
+    co_await rollback_pendientes_db(ctx.pinned_workers, req.loop);
 }
 
 // ─── Clases ──────────────────────────────────────────────────────────────────

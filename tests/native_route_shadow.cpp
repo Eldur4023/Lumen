@@ -149,7 +149,15 @@ int main() {
         "        return status(404)\n"
         "    Json fila = filas[0]\n"
         "    int fid = fila[\"id\"]\n"
-        "    return { \"id\": fid, \"nombre\": fila[\"nombre\"] }\n";
+        "    return { \"id\": fid, \"nombre\": fila[\"nombre\"] }\n"
+        "\n"
+        "post endpoint(\"/db/tx/:id\", int id):\n"
+        "    await sqlite.begin()\n"
+        "    await sqlite.exec(\"update cosas set nombre = ? where id = ?\", \"cambiado\", id)\n"
+        "    if id == 0:\n"
+        "        return status(400)\n"
+        "    await sqlite.commit()\n"
+        "    return status(204)\n";
 
     const auto dir  = std::filesystem::temp_directory_path() / "lumen_native_route_check";
     std::error_code ec;
@@ -222,6 +230,27 @@ int main() {
         } else {
             std::printf("  ok    /db/:id compila como ruta asincrona (await sqlite.query + "
                         "Json + indexado + len())\n");
+        }
+    }
+
+    // Fase 5.6: `/db/tx/:id` (await sqlite.begin()/exec()/commit(), con un
+    // `return` de por medio ANTES del commit() -- a proposito, para que
+    // generar_ruta_nativa tenga que generar el cierre de la transaccion
+    // (rollback_pendientes_db, via ret_vacio()) en ese punto de salida
+    // temprano, no solo al final del cuerpo) tiene que compilar como ruta
+    // asincrona igual que /db/:id -- mismo motivo para no ejecutarla aqui
+    // (DbAwaitable necesita un EventLoop real, ver el comentario de arriba).
+    {
+        std::string via;
+        for (const auto& r : mod_nat->rutas_informe)
+            if (r.patron == "/db/tx/:id") { via = r.via; break; }
+        if (via != "nativa (async)") {
+            std::printf("  FALLA /db/tx/:id: se esperaba 'nativa (async)', rutas_informe dice "
+                        "'%s'\n", via.empty() ? "(no aparece)" : via.c_str());
+            ok = false;
+        } else {
+            std::printf("  ok    /db/tx/:id compila como ruta asincrona (await sqlite.begin/"
+                        "exec/commit(), con un return anticipado antes del commit)\n");
         }
     }
     auto comparar = [&](const char* etiqueta, const std::string& path) {

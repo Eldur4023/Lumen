@@ -1,4 +1,5 @@
 #include <lumen_script/db.hpp>
+#include <lumen/logger.hpp>
 
 namespace lumen_script {
 
@@ -222,6 +223,30 @@ lumen::Task<Value> await_db(DbOp op, const std::string& module, lumen::core::Eve
     else if (op == DbOp::Commit || op == DbOp::Rollback) pinned_workers.erase(module);
 
     co_return std::move(*result);
+}
+
+lumen::Task<void> rollback_pendientes_db(std::map<std::string, int>& pinned_workers,
+                                         lumen::core::EventLoop* loop) {
+    if (pinned_workers.empty()) co_return;
+
+    auto pendientes = pinned_workers;
+    for (const auto& [mod, worker] : pendientes) {
+        auto& reg    = DbRegistry::instance();
+        auto* driver = reg.active(mod);
+        auto* pool   = reg.pool(mod);
+        if (!driver || !pool) continue;
+
+        lumen::log().warn("transaccion de '" + mod + "' sin commit ni rollback: "
+                           "se deshace");
+        co_await DbAwaitable{pool, loop,
+            [driver](size_t w) {
+                long long n = 0;
+                std::string err;
+                driver->exec(w, "ROLLBACK", {}, n, err);
+            },
+            worker};
+    }
+    pinned_workers.clear();
 }
 
 } // namespace lumen_script

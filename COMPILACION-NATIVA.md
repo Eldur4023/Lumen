@@ -1402,10 +1402,7 @@ añadiría nada. `es_json_dinamico(Type)` trata las tres formas (`Json` suelto, 
 suelta ni de un parámetro declarado `Json` a mano (aunque, una vez que existe, SÍ puede pasarse como
 argumento a otra función nativa: `tipo_soportado`/`tipo_provable` no le ponen ninguna barrera
 especial ahí, `Type::operator==` ya trata dos `Json` como el mismo tipo). `begin()`/`commit()`/
-`rollback()` siguen sin representación: coordinar el cierre de una transacción pendiente al final de
-una ruta (el `rollback_pendientes()` que ya hace `build_routes()` para bytecode) es trabajo aparte,
-no necesario para que `query`/`exec`/`last_id` sean correctos por sí solos — una ruta que abre una
-transacción sigue cayendo entera a bytecode.
+`rollback()`, en esta versión del documento, ya tienen representación — ver Fase 5.6 más abajo.
 
 *`VarDecl` deja de fiarse del tipo declarado cuando el valor real es Json.* `int stock =
 filas[0]["stock"]` es Lumen válido — el tipo declarado es decorativo, Lumen Script nunca lo exige en
@@ -1462,14 +1459,89 @@ pedidos reales) sirviendo HTTP de verdad: paginación, `JOIN`s de tres tablas, `
 {...}}`) y los casos de error (404 de fila inexistente, 400 de paginación inválida) — respuesta
 IDÉNTICA, byte a byte, en las dos vías, en cada caso. `POST /users`/`POST /products`/`PUT
 /products/:id` siguen en bytecode (el parámetro es una clase, con o sin campos opcionales — fuera de
-esta fase); `POST /orders` sigue en bytecode (usa `begin()`/`commit()`, sin representación
-todavía); `/counter/*`/`/payload/:n` siguen en bytecode por razones ajenas a esto (no relacionadas
+esta fase, ver Fase 5.6 para por qué `POST /orders` sigue así pese a que ya soporta
+`begin()`/`commit()`); `/counter/*`/`/payload/:n` siguen en bytecode por razones ajenas a esto (no relacionadas
 con `sqlite`). `tests/native_route_shadow.cpp` gana una ruta (`/db/:id`) que solo comprueba que
 COMPILA como asíncrona (vía `rutas_informe`, Fase 6) — ejecutarla en la prueba aislada, sin un
 *event loop* real, se quedaría colgada para siempre (`DbAwaitable`, a diferencia de
 `SleepAwaitable`, no tiene atajo sin *loop*: SIEMPRE reanuda desde el hilo del `DbPool` vía
 `loop->post(...)`) — la ejecución de verdad es la de arriba, contra el binario real. 79/79 del
 corpus y las 8 suites de `ctest` en verde.
+
+### Fase 5.6 — `await <módulo>.begin()`/`commit()`/`rollback()`
+
+Pedido explícitamente después de comprobar, con un benchmark real, que la Fase 5.5 dejaba fuera
+justo las rutas que más lo necesitan: cualquier ruta que tocara una transacción (típicamente
+cualquier escritura no trivial — reservar stock y crear un pedido a la vez, por ejemplo) caía
+entera a bytecode, sin importar lo simple que fuera el resto de su cuerpo. La discusión que motivó
+esto: en SQLite el propio motor (E/S + bloqueo) domina el tiempo de una consulta, así que
+`--native` no acelera la consulta en sí — pero SÍ elimina el "precipicio" de caer a bytecode en
+cuanto una ruta abre una transacción, que es la mayoría de las rutas de escritura reales. Con esto,
+la cobertura de `--native` deja de depender de si una ruta hace `begin()`, solo de si usa algo
+todavía no representable (una clase como parámetro de cuerpo, principalmente).
+
+*Lo mínimo que faltaba: tres `native_id` más, cero infraestructura nueva.* `begin()`/`commit()`/
+`rollback()` son, en `natives.cpp`, la misma clase de llamada que `last_id()` — un `DbModuleCall`
+sin argumentos (`min_args = max_args = 1`, donde ese `1` cuenta el nombre del módulo implícito, no
+ningún argumento real de `.lum`) — así que `Comprobador::tipo_provable()` los reconoce con el mismo
+patrón que ya tenía `last_id()`: cero argumentos, `usa_await_ = true`, `Type::json()` de vuelta
+(igual que los demás: éxito da `Value::boolean(true)`, fallo da `{"error": ...}`, ver
+`await_db()` en `db.cpp`). El codegen (`Generador::expr`, caso `Await`) extiende el `switch` de
+`DbOp` que ya tenía Query/Exec/LastId con Begin/Commit/Rollback — mismo `co_await
+lumen_script::await_db(...)`, sql/params vacíos.
+
+*Lo que sí era trabajo de verdad: cerrar una transacción que el handler deja abierta.* Bytecode ya
+resolvía esto con `rollback_pendientes()` (`project.cpp`): tras que el VM termine, si quedó algún
+`pinned_workers` sin `commit()`/`rollback()`, lo deshace con un `ROLLBACK` directo — necesario
+porque, sin eso, la conexión que abrió la transacción quedaría fijada a medio camino para siempre,
+y el siguiente que la reutilizara heredaría ese estado. Para que `--native` tenga la MISMA garantía
+sin reimplementar la lógica aparte (la disciplina de toda esta fase: un solo camino, no dos que
+puedan divergir en silencio), esa función se extrajo a `lumen_script::rollback_pendientes_db()`
+(`db.hpp`/`db.cpp`, tomando `pinned_workers`+`EventLoop*` por referencia en vez de `NativeCtx`+
+`Request` enteros) — `rollback_pendientes()` de bytecode pasa a ser un adaptador de una línea sobre
+esto, igual que ya le pasó a `run_db()`/`await_db()` en la Fase 5.5.
+
+El problema real es DÓNDE llamarla desde código nativo. Bytecode tiene un único punto de salida (el
+`while (Suspended)` de `build_routes()` termina, y ahí, una sola vez, se llama a la limpieza antes
+de construir la respuesta). Una ruta nativa no: cada `return` del cuerpo `.lum` se traduce en un
+`return`/`co_return` de C++ en el punto exacto donde aparece, potencialmente muchos por ruta, y
+C++ no tiene `finally`. La solución fue centralizar en el único sitio por el que YA pasa cualquier
+salida temprana: `Generador::ret_vacio()` (el que decide `return;` vs `co_return;`) es, por
+construcción, el punto de paso obligado de todo `return`/`require ... else ...`/400 de parámetro
+inválido dentro de una ruta — así que ahora, si `Comprobador::usa_transaccion()` (puesto a verdad
+en el mismo sitio que `usa_await_`, solo para `begin()`) dio verdad, `ret_vacio()` antepone `co_await
+lumen_script::rollback_pendientes_db(l_pinned_workers, req.loop);` antes del `co_return;`. El único
+punto de salida que `ret_vacio()` NO cubre — la caída natural al final del cuerpo, sin ningún
+`return` explícito (el 204 implícito) — se cubre aparte, con la misma llamada, en
+`generar_ruta_nativa()` justo antes de ese `res.status(204).send("")`. Un caso concreto lo prueba:
+`tests/native_route_shadow.cpp` añade `/db/tx/:id`, con un `return status(400)` a propósito ANTES
+del `commit()` — exactamente el caso que ejercita la limpieza en un punto de salida temprano, no
+solo al final.
+
+Deliberadamente NO se limpia desde el `catch(...)` que ya envuelve toda ruta nativa (la corrección
+de la Fase 4): una excepción sin atrapar dentro de una transacción abierta ya es, hoy, el mismo
+hueco en bytecode (`build_routes()` tampoco llama a `rollback_pendientes()` en su rama
+`VM::Status::Error`) — y este documento existe justo para que las dos vías no diverjan en qué
+limpian y qué no, no para que `--native` sea silenciosamente "mejor" en un punto que bytecode no
+cubre. Si algún día se corrige en bytecode, corregirlo aquí también es el mismo cambio de una
+línea.
+
+*Verificación.* `tests/native_route_shadow.cpp` gana `/db/tx/:id` (`begin()`/`exec()`/`commit()`,
+con el `return` anticipado ya descrito) — igual que `/db/:id` en la Fase 5.5, solo se comprueba que
+COMPILA como ruta asíncrona (`rutas_informe`), no se ejecuta en la prueba aislada (mismo motivo:
+`DbAwaitable` necesita un *event loop* real). La ejecución de verdad se hizo con una app suelta
+contra el `seed.db` real del banco de pruebas: una ruta con `begin()` → `exec()` (resta *stock*) →
+`query()` → `commit()` deja el descuento persistido — confirmado repitiendo la petición y viendo el
+*stock* bajar de forma acumulativa entre peticiones distintas, no solo dentro de una — y otra con
+`begin()` → `exec()` (resta 999999, deliberadamente disparatado) → `rollback()` deja el *stock*
+intacto. Cinco peticiones concurrentes a la ruta de `commit()` dieron cinco decrementos
+consecutivos sin ninguno perdido ni duplicado, confirmando que el *pinning* de conexión por
+transacción sigue serializando correctamente bajo concurrencia real, no solo en el caso secuencial.
+`bench/lumen/app.lum`/`bench/lumen-native/app.lum` no ganan ninguna ruta nueva en el informe de
+arranque con esto — `POST /orders` sigue cayendo a bytecode, pero ahora por una razón distinta y ya
+documentada (el cuerpo es una clase, ver Fase 3), no por `begin()`/`commit()` — verificado
+comprobando a mano que, quitando el parámetro de cuerpo de una copia de esa ruta, sí compila nativa.
+79/79 del corpus y las 8 suites de `ctest` en verde.
 
 ### Fase 6 — Empaquetado y modo mixto
 - `--native` de punta a punta: caché, `.so`, `dlopen`, informe de arranque, diagnóstico

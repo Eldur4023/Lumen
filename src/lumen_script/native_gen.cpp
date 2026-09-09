@@ -15,9 +15,12 @@ namespace {
 // entrada "__db_query"/"__db_exec"/"__db_last_id" en la tabla de nativos),
 // asi que basta con el nombre de la operacion, sin mirar de que modulo
 // vino la llamada.
-int db_query_id()   { static const int id = native_id("__db_query");   return id; }
-int db_exec_id()    { static const int id = native_id("__db_exec");    return id; }
-int db_last_id_id() { static const int id = native_id("__db_last_id"); return id; }
+int db_query_id()    { static const int id = native_id("__db_query");    return id; }
+int db_exec_id()     { static const int id = native_id("__db_exec");     return id; }
+int db_last_id_id()  { static const int id = native_id("__db_last_id");  return id; }
+int db_begin_id()    { static const int id = native_id("__db_begin");    return id; }
+int db_commit_id()   { static const int id = native_id("__db_commit");   return id; }
+int db_rollback_id() { static const int id = native_id("__db_rollback"); return id; }
 
 // Los unicos elementos de List o valores de Dict que esta fase sabe
 // representar -- un nivel, sin anidar (List<List<int>>, Dict<string,List<int>>
@@ -287,6 +290,14 @@ public:
     // plana.
     bool usa_await() const { return usa_await_; }
 
+    // Fase 5.6: ¿demostro tipo_provable() algun `await <modulo>.begin()` en
+    // lo que llevamos comprobado? Igual que usa_await_: puesto a verdad,
+    // nunca a falso. generar_ruta_nativa() lo usa para decidir si la ruta
+    // necesita cerrar, al final, cualquier transaccion que el handler haya
+    // dejado abierta (rollback_pendientes_db) -- una ruta que nunca llama a
+    // begin() no paga ese co_await de mas.
+    bool usa_transaccion() const { return usa_transaccion_; }
+
     // Ranura -> tipo declarado, en el orden en que VarDecl/parametros/`for`
     // los van presentando -- igual que Generador::ranura_a_nombre_, pero de
     // tipo en vez de nombre. Una vez registrada, una ranura mantiene ESE
@@ -390,16 +401,17 @@ public:
             case IrExprKind::NullLit:
                 return std::nullopt;
 
-            // Fase 5/5.5: los awaits que esta fase sabe representar --
+            // Fase 5/5.5/5.6: los awaits que esta fase sabe representar --
             // `await sleep(ms)` (traducido a `co_await lumen::sleep(...)`
-            // de verdad) y `await <modulo>.query/exec/last_id(...)`
-            // (traducido a `co_await lumen_script::await_db(...)`, el mismo
-            // camino que ya usa bytecode -- ver el comentario de esa
-            // funcion en db.hpp). `begin()`/`commit()`/`rollback()` quedan
-            // fuera todavia (necesitan coordinar el cierre de la
-            // transaccion al final de la ruta, ver el comentario grande en
-            // COMPILACION-NATIVA.md); cualquier otro await (ws.recv()...)
-            // tampoco tiene representacion. No hay caso aparte para
+            // de verdad) y `await <modulo>.query/exec/last_id/begin/commit/
+            // rollback(...)` (traducido a `co_await lumen_script::
+            // await_db(...)`, el mismo camino que ya usa bytecode -- ver el
+            // comentario de esa funcion en db.hpp). `begin()` marca ademas
+            // usa_transaccion_ (ver su comentario) para que
+            // generar_ruta_nativa() cierre, al final de la ruta, cualquier
+            // transaccion que el handler haya dejado abierta; cualquier
+            // otro await (ws.recv()...) sigue sin representacion. No hay
+            // caso aparte para
             // IrCallShape aqui: e.lhs siempre es IrExprKind::Call
             // (Emitter::check_expr lo garantiza para Await), asi que basta
             // con mirar su call_name/call_shape/call_index directamente.
@@ -434,10 +446,22 @@ public:
                         usa_await_ = true;
                         return Type::json();
                     }
-                    // last_id(): sin argumentos.
-                    if (call.call_index == db_last_id_id()) {
+                    // last_id()/begin()/commit()/rollback(): sin argumentos.
+                    // begin()/commit()/rollback() devuelven Value::boolean(true)
+                    // en exito o un Value::Dict {"error":...} en fallo (ver
+                    // await_db() en db.cpp) -- el mismo patron dinamico que
+                    // query/exec/last_id, asi que Type::json() tambien les
+                    // sirve. usa_transaccion_ se marca aparte: una ruta que
+                    // llama a begin() necesita el cierre de la transaccion al
+                    // final (rollback_pendientes_db), aunque nunca llegue a
+                    // llamar a commit()/rollback() (return anticipado, error).
+                    if (call.call_index == db_last_id_id() ||
+                        call.call_index == db_begin_id() ||
+                        call.call_index == db_commit_id() ||
+                        call.call_index == db_rollback_id()) {
                         if (!call.args.empty()) return std::nullopt;
                         usa_await_ = true;
+                        if (call.call_index == db_begin_id()) usa_transaccion_ = true;
                         return Type::json();
                     }
                 }
@@ -996,6 +1020,7 @@ private:
     const TablaRoles&                roles_;
     std::map<int, Type>              ranura_tipos_;
     mutable bool                     usa_await_ = false;
+    mutable bool                     usa_transaccion_ = false;
 };
 
 // ── Generacion ────────────────────────────────────────────────────────────
@@ -1315,12 +1340,15 @@ public:
                 // con el mismo reproductor.
                 {
                     const IrExpr& call = *e.lhs;
-                    const std::string dbop = call.call_index == db_query_id()   ? "Query"
-                                            : call.call_index == db_exec_id()   ? "Exec"
-                                                                                : "LastId";
+                    const std::string dbop = call.call_index == db_query_id()    ? "Query"
+                                            : call.call_index == db_exec_id()    ? "Exec"
+                                            : call.call_index == db_last_id_id() ? "LastId"
+                                            : call.call_index == db_begin_id()   ? "Begin"
+                                            : call.call_index == db_commit_id()  ? "Commit"
+                                                                                 : "Rollback";
                     std::string sql    = "std::string()";
                     std::string params = "lumen_db_params()";
-                    if (dbop != "LastId") {
+                    if (dbop == "Query" || dbop == "Exec") {
                         sql = expr(*call.args[0].value);
                         params = "lumen_db_params(";
                         for (size_t i = 1; i < call.args.size(); ++i) {
@@ -1518,9 +1546,29 @@ public:
     // normal, `co_return;` cuando el cuerpo es una corrutina (`asincrona_`
     // -- una corrutina no admite un `return` a secas, ver el comentario del
     // constructor). Usado en TODO punto de salida que no sea la caida
-    // natural al final del cuerpo (esa no necesita nada explicito en
-    // ninguno de los dos casos).
-    std::string ret_vacio() const { return asincrona_ ? "co_return;" : "return;"; }
+    // natural al final del cuerpo (esa se cubre aparte, ver el comentario
+    // grande en generar_ruta_nativa sobre el 204 implicito).
+    //
+    // Fase 5.6: si el cuerpo demostro un `await <modulo>.begin()`
+    // (Comprobador::usa_transaccion()), CUALQUIER salida -- un `return`
+    // explicito, un `status(...)` como ultima expresion, un 400 de
+    // parametro invalido -- tiene que cerrar antes la transaccion que
+    // pudiera seguir abierta, o la conexion que la abrio quedaria pinned
+    // para siempre (ver rollback_pendientes_db, db.hpp). C++ no tiene
+    // `finally`; como ret_vacio() ya es el punto de paso obligado de TODO
+    // punto de salida temprano (ver el comentario de arriba), basta con
+    // anteponer la limpieza aqui una sola vez en vez de repetirla en cada
+    // llamante. Igual que bytecode (rollback_pendientes en project.cpp), no
+    // se hace desde el catch(...) de la ruta: una excepcion sin atrapar dentro
+    // de una transaccion abierta ya es un fallo grave del motor, y este
+    // documento evita a proposito que bytecode y --native diverjan en que
+    // limpian y que no.
+    std::string ret_vacio() const {
+        if (!asincrona_) return "return;";
+        if (comprobador_.usa_transaccion())
+            return "co_await lumen_script::rollback_pendientes_db(l_pinned_workers, req.loop); co_return;";
+        return "co_return;";
+    }
 
 private:
     const std::vector<std::string>& nombre_por_indice_;
@@ -1898,16 +1946,17 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
     // (que si depende de `params`) se llama despues, mas abajo.
     Generador gen(nombre_por_indice, comprobador, /*ruta=*/true, asincrona);
     std::string cuerpo = "{\n    try {\n";
-    // Fase 5.5: equivalentes locales, para toda la duracion de esta peticion,
-    // de NativeCtx::pinned_workers/last_exec_workers -- lumen_script::
-    // await_db() (db.hpp) los toma por referencia para fijar una consulta a
-    // la misma conexion que abrio una transaccion (todavia sin generar --
-    // begin()/commit()/rollback() no son representables aqui, ver el
-    // comentario grande en COMPILACION-NATIVA.md) o que hizo el ultimo
-    // exec() (para que last_id() lea la conexion correcta). Declarados
-    // siempre que la ruta es asincrona, se usen o no: mas simple que
-    // detectar de antemano si el cuerpo de verdad toca una base de datos, y
-    // el coste de un std::map vacio es insignificante.
+    // Fase 5.5/5.6: equivalentes locales, para toda la duracion de esta
+    // peticion, de NativeCtx::pinned_workers/last_exec_workers --
+    // lumen_script::await_db() (db.hpp) los toma por referencia para fijar
+    // una consulta a la misma conexion que abrio una transaccion (begin(),
+    // ver Comprobador::usa_transaccion()) o que hizo el ultimo exec() (para
+    // que last_id() lea la conexion correcta); rollback_pendientes_db()
+    // (llamada desde ret_vacio()/el 204 implicito, ver esos comentarios)
+    // los consulta al final para cerrar lo que el handler haya dejado
+    // abierto. Declarados siempre que la ruta es asincrona, se usen o no:
+    // mas simple que detectar de antemano si el cuerpo de verdad toca una
+    // base de datos, y el coste de un std::map vacio es insignificante.
     if (asincrona)
         cuerpo += "    std::map<std::string, int> l_pinned_workers, l_last_exec_workers;\n";
     for (const auto& p : params) {
@@ -1962,6 +2011,13 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
     // return_void() con la misma naturalidad) -- y es, ademas, EXACTAMENTE
     // lo mismo que hace el VM cuando el cuerpo de una ruta termina sin
     // `return` explicito (null -> 204, ver build_routes).
+    //
+    // Este es el unico punto de salida que ret_vacio() no cubre (ver su
+    // comentario): la caida natural al final del cuerpo, sin ningun
+    // `return`. Si la ruta demostro un begin() en algun punto, necesita el
+    // mismo cierre de transaccion que cualquier otra salida.
+    if (asincrona && comprobador.usa_transaccion())
+        cuerpo += "    co_await lumen_script::rollback_pendientes_db(l_pinned_workers, req.loop);\n";
     cuerpo += "    res.status(204).send(\"\");\n";
     cuerpo += "    } catch (const LumenNativeError&) {\n";
     cuerpo += "        Value::Dict __e;\n";
