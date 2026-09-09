@@ -283,6 +283,16 @@ add_test(NAME native_class_shadow COMMAND prueba_native_class)
 # que ni falta que hace repetirlas aqui.
 add_executable(prueba_native_route tests/native_route_shadow.cpp)
 target_link_libraries(prueba_native_route PRIVATE lumen_script)
+# Mismo motivo que lumen-bin mas arriba, y la misma clase de sintoma
+# encontrada de la misma forma (probando de verdad, no adivinado antes):
+# state.incr()/state.get() (Fase 5.9) resuelven contra SharedState::
+# instance(), una `static` de funcion en natives.cpp -- sin -rdynamic, el
+# .so que compila_nativo() dlopen-ea aqui se lleva su PROPIA copia
+# (liblumen_script.a enlazada de nuevo dentro del .so), asi que un
+# state.incr() bytecode y uno --native, en la MISMA prueba, incrementaban
+# contadores DISTINTOS -- esta prueba lo detecto (secuencia 1,2,1,1,2 en
+# vez de 1,2,3,3,3) antes de que este comentario se escribiera.
+target_link_options(prueba_native_route PRIVATE -rdynamic)
 add_test(NAME native_route_shadow COMMAND prueba_native_route)
 
 # El traductor de marcadores de postgres es una funcion pura: se prueba sin

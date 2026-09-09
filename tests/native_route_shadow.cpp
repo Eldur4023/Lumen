@@ -181,7 +181,23 @@ int main() {
         "post endpoint(\"/registro\", Registro datos):\n"
         "    if datos.edad < 18:\n"
         "        return { \"error\": \"menor de edad\" }.status(403)\n"
-        "    return { \"nombre\": datos.nombre, \"edad\": datos.edad }.status(201)\n";
+        "    return { \"nombre\": datos.nombre, \"edad\": datos.edad }.status(201)\n"
+        "\n"
+        "post endpoint(\"/contador/incr\"):\n"
+        "    return { \"count\": state.incr(\"contador_prueba\") }\n"
+        "\n"
+        "get endpoint(\"/contador\"):\n"
+        "    return { \"count\": state.get(\"contador_prueba\", 0) }\n"
+        "\n"
+        "get endpoint(\"/lista/:n\", int n):\n"
+        "    require n >= 0 and n <= 100 else status(400)\n"
+        "    List<Json> items = []\n"
+        "    int i = 0\n"
+        "    while i < n:\n"
+        "        bool par = i % 2 == 0\n"
+        "        items.add({ \"id\": i, \"nombre\": \"item-\" + str(i), \"par\": par })\n"
+        "        i++\n"
+        "    return { \"items\": items, \"total\": len(items) }\n";
 
     const auto dir  = std::filesystem::temp_directory_path() / "lumen_native_route_check";
     std::error_code ec;
@@ -410,6 +426,51 @@ int main() {
                         bc.location.empty() ? "" : ", Location=", bc.location.c_str());
         }
     };
+
+    // Fase 5.9: state.incr()/state.get() (SharedState) -- bytecode y
+    // --native, en este mismo binario de prueba, llaman al MISMO
+    // SharedState::instance() (una static de funcion, un solo proceso):
+    // no se pueden comparar como las demas rutas (dos llamadas
+    // independientes NO dan el mismo resultado, comparten contador) --
+    // en su lugar, esto encadena bytecode->bytecode->nativo->nativo y
+    // comprueba que el contador avanza de 1 en 1 SIN IMPORTAR por que via
+    // pasó cada incremento, confirmando que las dos vias leen/escriben
+    // exactamente el mismo almacen, no una copia.
+    {
+        Resultado a  = pedir(*mod_bc, "POST", "/contador/incr");
+        Resultado b  = pedir(*mod_bc, "POST", "/contador/incr");
+        Resultado c  = pedir(*mod_nat, "POST", "/contador/incr");
+        Resultado d  = pedir(*mod_nat, "GET", "/contador");
+        Resultado e  = pedir(*mod_bc, "GET", "/contador");
+        Value va, vb, vc, vd, ve;
+        bool parsea = Value::parse_json(a.body, va) && Value::parse_json(b.body, vb) &&
+                     Value::parse_json(c.body, vc) && Value::parse_json(d.body, vd) &&
+                     Value::parse_json(e.body, ve);
+        long long ca = parsea ? va.as_dict().find("count")->second.as_int() : -1;
+        long long cb = parsea ? vb.as_dict().find("count")->second.as_int() : -1;
+        long long cc = parsea ? vc.as_dict().find("count")->second.as_int() : -1;
+        long long cd = parsea ? vd.as_dict().find("count")->second.as_int() : -1;
+        long long ce = parsea ? ve.as_dict().find("count")->second.as_int() : -1;
+        if (!parsea || cb != ca + 1 || cc != cb + 1 || cd != cc || ce != cc) {
+            std::printf("  FALLA state.incr/get: secuencia %lld,%lld,%lld,%lld,%lld (se esperaba "
+                        "n,n+1,n+2,n+2,n+2)\n", ca, cb, cc, cd, ce);
+            ok = false;
+        } else {
+            std::printf("  ok    state.incr()/state.get(): bytecode y --native comparten el "
+                        "mismo SharedState (secuencia %lld->%lld->%lld, GET coincide en las dos "
+                        "vias)\n", ca, cb, cc);
+        }
+    }
+
+    // Fase 5.10: `/lista/:n` (List<Json> items = [], items.add(<DictLit
+    // heterogeneo>) dentro de un bucle, len(items) sobre el resultado) --
+    // el patron mas comun de construir un List<Json> a mano, antes
+    // irrepresentable (un [] vacio no tiene tipo propio, y un DictLit con
+    // valores de tipos distintos no es el Dict<string,V> homogeneo que
+    // items.add() esperaba demostrar).
+    comparar("lista vacia (n=0)", "/lista/0");
+    comparar("lista con elementos", "/lista/7");
+    comparar("guarda rechaza n=101", "/lista/101");
 
     // Camino feliz: la guarda pasa, fib(10) se calcula nativamente, y el
     // dict de retorno (int + int, pero generado con Value, no Dict<V>) se

@@ -237,6 +237,16 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
     // ya corrigieron las dos comprobaciones criticas anteriores: no asumir
     // que un caso nuevo hereda las condiciones de guarda de una fase
     // anterior sin volver a mirarlas.
+    // <lumen_script/natives.hpp>: SharedState (Fase 5.9, state.incr/decr/
+    // get/set/remove) y last_validation_messages() (Fase 5.7) -- SIEMPRE,
+    // no solo con con_rutas: una funcion suelta puede llamar a
+    // state.incr(...) igual que a una ruta (ReservedMemberCall no esta
+    // restringido a rutas, a diferencia de sse/ws/error -- ver
+    // Emitter::check_call), y un modulo sin ninguna ruta compilable
+    // igualmente podria tener esa funcion. La misma clase de descuido que
+    // ya corrigio value.hpp mas abajo: no asumir que un caso nuevo hereda
+    // las condiciones de guarda de uno anterior sin volver a mirarlas.
+    codigo += "#include <lumen_script/natives.hpp>\n\n";
     codigo += "#include <lumen_script/value.hpp>\nusing lumen_script::Value;\n\n";
     // Cabeceras de lumen::Request/Response y el binding de parametros SOLO
     // si hay al menos una ruta: eso si es exclusivo de rutas (ninguna
@@ -249,15 +259,9 @@ std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const Functio
     // <modulo>.query/exec/last_id(...)` -- mismo criterio que Task/sleep:
     // siempre que haya rutas, no solo las que de verdad usan una base de
     // datos.
-    // <lumen_script/natives.hpp>: last_validation_messages() -- Fase 5.7,
-    // limpiada al principio de CUALQUIER ruta (no solo una con parametro
-    // de cuerpo, ver el comentario en generar_ruta_nativa) para que un
-    // `on error <code>:` que la app declare no herede mensajes de una
-    // peticion anterior en el mismo hilo.
     if (con_rutas)
         codigo += "#include <lumen/request.hpp>\n#include <lumen/response.hpp>\n"
-                  "#include <lumen/task.hpp>\n#include <lumen_script/db.hpp>\n"
-                  "#include <lumen_script/natives.hpp>\n\n" +
+                  "#include <lumen/task.hpp>\n#include <lumen_script/db.hpp>\n\n" +
                   route_runtime_prelude() + "\n";
     codigo += clases_texto + "\n" + prototipos + "\n" + cuerpos;
     if (con_rutas) codigo += rutas_cuerpos;

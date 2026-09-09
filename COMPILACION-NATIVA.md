@@ -1719,6 +1719,114 @@ camino feliz, una rama de negocio que no es un fallo de `validate:` (menor de ed
 cada regla fallando por separado, las dos a la vez, y un campo obligatorio ausente. 79/79 del corpus
 y las 8 suites de `ctest` en verde.
 
+### Fase 5.9 — `state.*` (SharedState)
+
+Con la Fase 5.8 en verde, solo quedaban dos rutas del banco de pruebas en bytecode:
+`POST /counter/incr`/`GET /counter` (`state.incr(...)`/`state.get(...)`) y `GET /payload/:n`
+(siguiente sección). `state.*` resultó pequeño: `ReservedMemberCall` (la forma del IR que usan
+`sse.send(...)`/`ws.send(...)`/`error.messages`/`state.incr(...)`, distinta de `DbModuleCall` —
+nunca asíncrona, un solo `native_id` por operación como `db_query_id()`) no tenía NINGÚN caso en
+`native_gen.cpp` — ni comprobación ni generación — así que cualquier uso de `state.*` tumbaba la
+ruta entera, sin aviso.
+
+*Los tipos, tomados directo de `natives.cpp`.* `incr(clave [, cuánto])`/`decr(...)` siempre
+devuelven `Value::integer(...)` (`fn_state_incr`/`fn_state_decr`): `Int` demostrable sin ninguna
+ambigüedad, a diferencia de `get()`, que depende de lo que haya guardado. `remove(clave)` siempre
+`Bool`. `get(clave [, defecto])`/`set(clave, valor)` son dinámicos — `Type::json()` — porque lo que
+hay en el almacén compartido puede ser cualquier cosa, o nada; `set()` en concreto es identidad
+(`fn_state_set`: guarda y devuelve el mismo valor que recibió), así que su tipo es el del segundo
+argumento tal cual, sin envolver nada.
+
+*El código, llamando directo a la misma clase que ya usa bytecode.* `SharedState` (`natives.hpp`) ya
+era pública y ya vivía incluida sin condiciones desde la Fase 5.7 (`last_validation_messages()`) —
+el código generado llama a `lumen_script::SharedState::instance().incr(...)`/`.get(...)`/etc.
+directamente, sin ningún ayudante intermedio: sus métodos ya devuelven exactamente el tipo C++ que
+hace falta en cada caso (`incr()`/`decr()` → `int64_t`, `get()` → `Value`). `get()` con valor por
+defecto usa una IIFE para no llamar a `SharedState::get()` dos veces; `set()` la usa para no
+construir el `Value` dos veces (una para guardarlo, otra para devolverlo).
+
+*`natives.hpp`, de "solo si hay rutas" a incluida siempre.* Al verificar esto se repitió, casi al
+pie de la letra, un descuido que `value.hpp` ya había corregido antes (ver el comentario de
+`native_build.cpp`, mismo sitio): `state.incr(...)` no está restringido a una ruta —a diferencia de
+`sse`/`ws`/`error`, `Emitter::check_call` no le exige un `route_method_` concreto—, así que una
+FUNCIÓN suelta puede llamarlo igual que una ruta, y un módulo sin ninguna ruta compilable habría
+dejado `natives.hpp` sin incluir, con el mismo `'SharedState' has not been declared` que ya se vio
+una vez. Corregido moviendo su inclusión fuera del `if (con_rutas)`, igual que `value.hpp`.
+
+*Un `-rdynamic` que faltaba, encontrado por la propia prueba automática, no a mano.* Verificando esto
+en `tests/native_route_shadow.cpp` (que SÍ puede ejecutar esta ruta de verdad, sin `await` de por
+medio) apareció una secuencia `1, 2, 1, 1, 2` donde se esperaba `1, 2, 3, 3, 3`: bytecode y
+`--native`, en el MISMO proceso de prueba, estaban incrementando contadores DISTINTOS.
+`SharedState::instance()` es una `static` de función en `natives.cpp` — la misma familia de síntoma
+que ya motivó `-rdynamic` en `lumen-bin` (Fase 5, `lumen::detail::current_loop`): sin exportar los
+símbolos del ejecutable, el `.so` que `compilar_nativo()` dlopen-ea se lleva su PROPIA copia de esa
+`static` (viene de `liblumen_script.a`, enlazada de nuevo DENTRO del `.so`), en vez de resolver
+contra la del proceso que lo cargó. `prueba_native_route` no llevaba `-rdynamic` — nunca hizo falta
+antes, porque ninguna ruta ejecutada de verdad en esa prueba tocaba estado compartido entre las dos
+vías. Corregido añadiéndoselo, igual que a `lumen-bin`.
+
+*Verificación.* `bench/lumen-native/app.lum` pasa de 14 a 16 rutas nativas: `POST /counter/incr`/
+`GET /counter` se suman. Contra HTTP real, incrementos concurrentes (20 peticiones a la vez) dieron
+el conteo final exacto esperado, sin ninguno perdido — el mismo `mutex` interno de `SharedState` que
+ya protegía esto en bytecode protege igual una llamada nativa. `tests/native_route_shadow.cpp` gana
+`POST /contador/incr`/`GET /contador` y una comprobación que encadena las dos vías sobre el MISMO
+contador (bytecode, bytecode, nativo, y una lectura final por cada vía) en vez de comparar
+respuestas independientes — la forma correcta de probar un almacén que las dos rutas comparten de
+verdad. 79/79 del corpus y las 8 suites de `ctest` en verde.
+
+### Fase 5.10 — Construir un `List<Json>` a mano
+
+El último hueco del contrato del banco de pruebas: `GET /payload/:n` construye su respuesta
+acumulando en una lista vacía dentro de un bucle —`List<Json> items = []` seguido de
+`items.add({...})` repetido—, el patrón más común para armar un `List<Json>` cuando no viene de una
+consulta. Ninguna de las dos piezas tenía representación.
+
+*Un `[]`/`{}` vacío no tiene tipo propio — pero el tipo DECLARADO no es ambiguo.*
+`Comprobador::tipo_provable`, casos `ListLit`/`DictLit`, siempre rechaza un literal vacío (no hay de
+dónde inferir el tipo del elemento) — una regla correcta en general, pero que hacía caer
+`List<Json> items = []` en el primerísimo *statement* de la ruta. La declaración SÍ lleva la
+información que falta: `s.decl_type`. `Comprobador::stmt_compilable`, caso `VarDecl`, ahora acepta
+un literal vacío cuando su forma (`ListLit`/`DictLit`) coincide con el tipo declarado
+(`List`/`Dict`) y ese tipo es representable — estar vacío no CONTRADICE ninguna declaración, a
+diferencia de cualquier otro valor no demostrable. El *codegen* correspondiente
+(`Generador::stmt`, mismo caso) tenía su propio riesgo real: `*comprobador_.tipo_provable(*s.value)`
+sin comprobar antes habría sido un `*nullopt` — UB de verdad, no un error de compilación — así que
+ahora se comprueba explícitamente y, si no hay tipo demostrado, usa el declarado y
+`valor_por_defecto()` para el valor inicial.
+
+*`List<Json>` es un `Value`, no un `LList<Value>` — `valor_por_defecto()` lo tenía mal para este
+caso concreto.* La Fase 5.5 ya estableció que `List<Json>`/`Dict<string,Json>` se representan como
+el propio `Value` (que ya sabe ser una lista o un diccionario), no envueltos en otra plantilla.
+`valor_por_defecto()` devolvía `"{}"` para CUALQUIER `List`/`Dict` — válido para un `LList<T>`/
+`LDict<V>` real (llama a su constructor por defecto), pero sobre un `Value` `"{}"` construye
+`Value::null()`, no una lista vacía: `Value::as_list()` sobre eso es comportamiento indefinido (lee
+la unión por la rama equivocada). Corregido: para `List<Json>`/`Dict<string,Json>`,
+`valor_por_defecto()` da `Value::list()`/`Value::dict()` en su lugar — las dos sin argumentos, que
+sí dan el contenedor vacío correcto.
+
+*`.add()` sobre un `List<Json>`: ni el método existe, ni el argumento es casi nunca homogéneo.*
+`LList<T>::lumen_add()` no existe sobre un `Value` — hace falta un camino aparte
+(`lumen_json_list_add()`, nuevo en `route_runtime_prelude()`, que calca `call_method()`
+—`natives.cpp`, rama `recv.is_list()`— campo a campo: `lista.as_list().push_back(std::move(item));
+return lista;`). Y el argumento típico de `items.add(...)` es un `DictLit` HETEROGÉNEO (`{"id": i,
+"name": ..., "active": bool}`, cada valor de un tipo distinto) — exactamente lo que
+`tipo_provable(DictLit)` rechaza siempre (exige valores homogéneos: esa es la vía de "`Dict<string,V>`
+ya tipado", una construcción distinta). `Comprobador`, mismo caso `"add"`, ahora distingue: sobre un
+`List<Json>`, el argumento solo necesita ser construible como `Value` (`es_valor_json()`, la MISMA
+regla que ya usa el valor de retorno de una ruta o un parámetro de `sqlite.exec()`) — sobre
+cualquier otra `List<T>`, sigue exigiendo el tipo exacto del elemento, sin cambios. `Generador`
+pasa el argumento por `valor_json()` en vez de `expr()` en el primer caso: `expr()` sobre un
+`DictLit` asume `Dict<string,V>` homogéneo, justo lo que este literal no es.
+
+*Verificación.* `bench/lumen-native/app.lum` pasa de 16 a **17 de 17** rutas nativas — el contrato
+completo del banco de pruebas compila entero. Contra HTTP real: `/payload/1`, `/payload/5`,
+`/payload/500` y los dos límites de la guarda (`n=0`, `n=5001`) — respuesta IDÉNTICA byte a byte en
+los cinco, listas anidadas de cientos de elementos incluidas. `tests/native_route_shadow.cpp` gana
+`GET /lista/:n` (mismo patrón que `/payload/:n`: lista vacía, `.add()` de un `DictLit` heterogéneo
+en un bucle, `len()` sobre el resultado) y se EJECUTA de verdad (sin `await`) en tres casos: lista
+vacía, lista con elementos, y el límite de la guarda. 79/79 del corpus y las 8 suites de `ctest` en
+verde.
+
 ### Fase 6 — Empaquetado y modo mixto
 - `--native` de punta a punta: caché, `.so`, `dlopen`, informe de arranque, diagnóstico
   explícito de rutas no compilables, respaldo por bytecode ruta a ruta.

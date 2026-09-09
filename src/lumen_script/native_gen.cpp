@@ -22,6 +22,19 @@ int db_begin_id()    { static const int id = native_id("__db_begin");    return 
 int db_commit_id()   { static const int id = native_id("__db_commit");   return id; }
 int db_rollback_id() { static const int id = native_id("__db_rollback"); return id; }
 
+// Fase 5.9: state.incr/decr/get/set/remove (natives.cpp: SharedState, ya
+// expuesta en natives.hpp -- incluida sin condiciones desde la Fase 5.7
+// para last_validation_messages()) son ReservedMemberCall, no
+// DbModuleCall: nunca asincronos (no hay ningun `await state....` en el
+// lenguaje), y su native_id es uno solo por operacion, igual que
+// db_query_id() -- da igual si el llamante escribio `state.incr(...)`,
+// solo hay un modulo "state" posible.
+int state_incr_id()   { static const int id = native_id("__state_incr");   return id; }
+int state_decr_id()   { static const int id = native_id("__state_decr");   return id; }
+int state_get_id()    { static const int id = native_id("__state_get");    return id; }
+int state_set_id()    { static const int id = native_id("__state_set");    return id; }
+int state_remove_id() { static const int id = native_id("__state_remove"); return id; }
+
 // Los unicos elementos de List o valores de Dict que esta fase sabe
 // representar -- un nivel, sin anidar (List<List<int>>, Dict<string,List<int>>
 // quedan fuera: su elemento/valor no es ninguno de estos cuatro).
@@ -743,9 +756,23 @@ public:
                     // (natives.cpp: kList) es "add" -- muta la lista en
                     // sitio y devuelve la MISMA lista (recv), igual que
                     // call_method(). El argumento tiene que ser exactamente
-                    // el tipo del elemento.
+                    // el tipo del elemento -- SALVO sobre List<Json>
+                    // (Fase 5.10): el patron mas comun para construirla a
+                    // mano es un DictLit HETEROGENEO (`{"id": i, "name":
+                    // ..., "active": bool}`, cada valor de un tipo
+                    // distinto), y tipo_provable(DictLit) exige valores
+                    // homogeneos -- nunca demuestra nada de un literal asi
+                    // (esa es la via de "Dict<string,V> ya tipado", una
+                    // cosa distinta). Le basta con ser cualquier cosa
+                    // construible como Value (es_valor_json(), la MISMA
+                    // regla que ya usa el valor de retorno de una ruta o
+                    // un parametro de sqlite.exec()) -- List<Json>.add(x)
+                    // es, en tiempo de ejecucion, exactamente
+                    // items.push_back(x) sobre un LList<Value>.
                     if (tobj->kind() == Type::Kind::List && e.call_name == "add") {
                         if (e.args.size() != 1 || !e.args[0].value) return std::nullopt;
+                        if (tobj->element().kind() == Type::Kind::Json)
+                            return es_valor_json(*e.args[0].value) ? tobj : std::nullopt;
                         auto targ = tipo_provable(*e.args[0].value);
                         if (!targ || *targ != tobj->element()) return std::nullopt;
                         return tobj;
@@ -837,6 +864,70 @@ public:
                     }
                     return mit->second.retorno;
                 }
+                // Fase 5.9: state.incr/decr/get/set/remove (natives.cpp:
+                // SharedState) -- el unico ReservedMemberCall que esta fase
+                // sabe demostrar; sse/ws/error/request/log quedan fuera
+                // (necesitan contexto -- una conexion, un error en curso --
+                // que una expresion "pura" no tiene aqui). incr/decr
+                // SIEMPRE dan Value::integer (fn_state_incr/_decr, ver
+                // natives.cpp): Int provable sin ambiguedad, a diferencia
+                // de get(), que depende de lo que haya guardado. remove()
+                // siempre Bool. set()/get() son dinamicos -- Json, igual
+                // que un resultado de BD: lo que hay guardado en la clave
+                // puede ser cualquier cosa, o nada.
+                if (e.call_shape == IrCallShape::ReservedMemberCall) {
+                    if (e.call_index == state_incr_id() || e.call_index == state_decr_id()) {
+                        if (e.args.empty() || e.args.size() > 2 || !e.args[0].value)
+                            return std::nullopt;
+                        auto tk = tipo_provable(*e.args[0].value);
+                        if (!tk || tk->kind() != Type::Kind::String) return std::nullopt;
+                        if (e.args.size() == 2) {
+                            if (!e.args[1].value) return std::nullopt;
+                            auto tb = tipo_provable(*e.args[1].value);
+                            if (!tb || tb->kind() != Type::Kind::Int) return std::nullopt;
+                        }
+                        return Type::primitive(Type::Kind::Int);
+                    }
+                    if (e.call_index == state_remove_id()) {
+                        if (e.args.size() != 1 || !e.args[0].value) return std::nullopt;
+                        auto tk = tipo_provable(*e.args[0].value);
+                        if (!tk || tk->kind() != Type::Kind::String) return std::nullopt;
+                        return Type::primitive(Type::Kind::Bool);
+                    }
+                    if (e.call_index == state_get_id()) {
+                        if (e.args.empty() || e.args.size() > 2 || !e.args[0].value)
+                            return std::nullopt;
+                        auto tk = tipo_provable(*e.args[0].value);
+                        if (!tk || tk->kind() != Type::Kind::String) return std::nullopt;
+                        if (e.args.size() == 2) {
+                            if (!e.args[1].value) return std::nullopt;
+                            auto td = tipo_provable(*e.args[1].value);
+                            if (!td || !(es_escalar_json(td->kind()) ||
+                                        td->kind() == Type::Kind::List ||
+                                        td->kind() == Type::Kind::Dict ||
+                                        td->kind() == Type::Kind::Json))
+                                return std::nullopt;
+                        }
+                        return Type::json();
+                    }
+                    if (e.call_index == state_set_id()) {
+                        if (e.args.size() != 2 || !e.args[0].value || !e.args[1].value)
+                            return std::nullopt;
+                        auto tk = tipo_provable(*e.args[0].value);
+                        if (!tk || tk->kind() != Type::Kind::String) return std::nullopt;
+                        // fn_state_set devuelve el MISMO valor que recibio
+                        // (identidad) -- el tipo de la llamada es el del
+                        // segundo argumento, tal cual.
+                        auto tv = tipo_provable(*e.args[1].value);
+                        if (!tv || !(es_escalar_json(tv->kind()) ||
+                                    tv->kind() == Type::Kind::List ||
+                                    tv->kind() == Type::Kind::Dict ||
+                                    tv->kind() == Type::Kind::Json))
+                            return std::nullopt;
+                        return tv;
+                    }
+                    return std::nullopt;
+                }
                 // Tres builtins globales puros (natives.cpp: fn_str/fn_len/
                 // fn_int), el resto (sleep/render/status/text/...) o tienen
                 // efecto (escriben la respuesta, leen la peticion) o son
@@ -910,7 +1001,32 @@ public:
             case IrStmtKind::VarDecl: {
                 if (s.value) {
                     auto t = tipo_provable(*s.value);
-                    if (!t) return false;
+                    if (!t) {
+                        // Fase 5.10: `List<Json> items = []` (o `Dict<string,V>
+                        // d = {}`) -- un literal VACIO no tiene de donde
+                        // inferir el tipo de sus elementos (tipo_provable,
+                        // casos ListLit/DictLit, lo rechaza SIEMPRE, tenga o
+                        // no tipo declarado), pero eso no es lo mismo que "no
+                        // se sabe que tipo es": el tipo DECLARADO ya lo dice
+                        // sin ninguna ambiguedad, y estar vacio no lo
+                        // contradice -- a diferencia de cualquier otro valor
+                        // no demostrable, un [] / {} vacio es compatible con
+                        // CUALQUIER List<T>/Dict<string,V> soportado. Sin
+                        // esto, "acumular en una lista vacia dentro de un
+                        // bucle" (el patron mas comun de construir un
+                        // List<Json> a mano, ver bench/lumen/app.lum:
+                        // /payload/:n) nunca compilaba: la ruta entera caia
+                        // en el primerisimo statement.
+                        bool vacio_compatible =
+                            (s.value->kind == IrExprKind::ListLit && s.value->items.empty() &&
+                             s.decl_type.kind() == Type::Kind::List) ||
+                            (s.value->kind == IrExprKind::DictLit && s.value->entries.empty() &&
+                             s.decl_type.kind() == Type::Kind::Dict);
+                        if (!vacio_compatible || !tipo_soportado(s.decl_type, &clases_))
+                            return false;
+                        registrar(s.slot, s.decl_type);
+                        return true;
+                    }
                     if (*t == s.decl_type) {
                         registrar(s.slot, s.decl_type);
                         return true;
@@ -1288,9 +1404,24 @@ public:
                 // (LList::lumen_add), no funcion libre como los de string
                 // -- es el unico metodo que Comprobador acepta sobre un
                 // receptor List (ver metodos_de()/kList en natives.cpp).
+                // Fase 5.10: sobre List<Json> (representada como Value, no
+                // LList<Value>, ver tipo_cpp()) no existe .lumen_add() --
+                // lumen_json_list_add() (route_runtime_prelude) es su
+                // equivalente sobre Value. El argumento pasa por
+                // valor_json() (identidad si YA es Json -- p.ej. una fila
+                // de sqlite.query() reusada -- o construido desde un
+                // DictLit heterogeneo, ver el comentario de Comprobador,
+                // mismo caso) en vez de expr(): expr() en un DictLit
+                // asume Dict<string,V> homogeneo, exactamente lo que este
+                // literal NO es.
                 if (e.call_shape == IrCallShape::BuiltinMethodCall &&
-                    e.object->type.kind() == Type::Kind::List)
+                    e.object->type.kind() == Type::Kind::List) {
+                    auto tobj = comprobador_.tipo_provable(*e.object);
+                    if (tobj && tobj->element().kind() == Type::Kind::Json)
+                        return "lumen_json_list_add(" + expr(*e.object) + ", " +
+                               valor_json(*e.args[0].value) + ")";
                     return expr(*e.object) + ".lumen_add(" + expr(*e.args[0].value) + ")";
+                }
 
                 // "has"/"keys" sobre un Dict: mismo criterio, sintaxis de
                 // metodo nativo (LDict::lumen_has/lumen_keys).
@@ -1337,6 +1468,55 @@ public:
                     if (t->kind() == Type::Kind::String)
                         return "lumen_str_to_int(" + expr(*e.args[0].value) + ")";
                     return "static_cast<int64_t>(" + expr(*e.args[0].value) + ")";
+                }
+
+                // Fase 5.9: state.incr/decr/get/set/remove -- llaman
+                // directamente a lumen_script::SharedState::instance(), la
+                // MISMA clase que fn_state_*() (natives.cpp) ya usa, sin
+                // ningun ayudante intermedio: sus metodos ya devuelven
+                // exactamente el tipo C++ que necesita cada caso
+                // (incr()/decr() -> int64_t, get() -> Value).
+                if (e.call_shape == IrCallShape::ReservedMemberCall) {
+                    const std::string clave = expr(*e.args[0].value);
+                    if (e.call_index == state_incr_id()) {
+                        const std::string cuanto = e.args.size() > 1 ? expr(*e.args[1].value) : "1";
+                        return "lumen_script::SharedState::instance().incr(" + clave + ", " +
+                               cuanto + ")";
+                    }
+                    if (e.call_index == state_decr_id()) {
+                        // fn_state_decr: incr(clave, -cuanto) -- MISMA
+                        // funcion, cuanto en negativo.
+                        const std::string cuanto = e.args.size() > 1 ? expr(*e.args[1].value) : "1";
+                        return "lumen_script::SharedState::instance().incr(" + clave + ", -(" +
+                               cuanto + "))";
+                    }
+                    if (e.call_index == state_remove_id())
+                        return "lumen_script::SharedState::instance().remove(" + clave + ")";
+                    if (e.call_index == state_get_id()) {
+                        // Sin defecto: identidad -- get() ya devuelve
+                        // Value::null() si la clave no existe, igual que
+                        // fn_state_get sin segundo argumento.
+                        if (e.args.size() < 2)
+                            return "lumen_script::SharedState::instance().get(" + clave + ")";
+                        // Con defecto: fn_state_get devuelve args[1] SOLO
+                        // si lo guardado es null (ausente o guardado como
+                        // null explicito no se distinguen, ver
+                        // SharedState::get) -- misma regla aqui, con una
+                        // IIFE para no evaluar get() dos veces.
+                        return "([&]{ Value __v = lumen_script::SharedState::instance().get(" +
+                               clave + "); return __v.is_null() ? " + valor_json(*e.args[1].value) +
+                               " : __v; }())";
+                    }
+                    if (e.call_index == state_set_id()) {
+                        // fn_state_set: guarda args[1] y lo devuelve tal
+                        // cual (identidad) -- una IIFE para no construir el
+                        // Value dos veces (una para guardar, otra para
+                        // devolver).
+                        return "([&]{ Value __v = " + valor_json(*e.args[1].value) +
+                               "; lumen_script::SharedState::instance().set(" + clave +
+                               ", __v); return __v; }())";
+                    }
+                    return ""; // inalcanzable: Comprobador ya lo descarto
                 }
 
                 // BuiltinMethodCall (metodos de string, ver
@@ -1443,9 +1623,26 @@ public:
                 // no un `int64_t`, porque el tipo declarado es decorativo y
                 // Comprobador ya resolvio que el valor real es dinamico.
                 // Cuando coinciden (el caso de siempre) esto no cambia nada.
-                Type tipo_real = s.value ? *comprobador_.tipo_provable(*s.value) : s.decl_type;
-                return tipo_cpp(tipo_real) + " " + nombre_cpp(s.name) + " = " +
-                       (s.value ? expr(*s.value) : valor_por_defecto(s.decl_type)) + ";";
+                //
+                // Fase 5.10: un `[]`/`{}` VACIO no tiene tipo propio
+                // (Comprobador::tipo_provable, casos ListLit/DictLit, lo
+                // rechaza siempre -- `*comprobador_.tipo_provable(*s.value)`
+                // sin comprobar seria un `*nullopt`, UB real) -- si
+                // stmt_compilable() aceptó esta declaración de todas formas
+                // fue precisamente por eso: el tipo declarado ya lo resuelve
+                // sin ambigüedad (ver el comentario de Comprobador, mismo
+                // caso), así que el tipo real ES el declarado. El valor usa
+                // el mismo `{}` que valor_por_defecto() ya da para un
+                // List/Dict SIN parametro -- el tipo completo (con su
+                // elemento) ya está a la izquierda del `=` en la propia
+                // declaración, así que `{}` invoca el constructor por
+                // defecto de ESE tipo exacto sin que haga falta deducir
+                // nada de un literal sin elementos.
+                auto t_valor    = s.value ? comprobador_.tipo_provable(*s.value) : std::nullopt;
+                Type tipo_real  = t_valor ? *t_valor : s.decl_type;
+                std::string val = (!s.value || !t_valor) ? valor_por_defecto(s.decl_type)
+                                                          : expr(*s.value);
+                return tipo_cpp(tipo_real) + " " + nombre_cpp(s.name) + " = " + val + ";";
             }
 
             case IrStmtKind::Assign: {
@@ -1645,7 +1842,18 @@ private:
             case Type::Kind::Int:   return "0";
             case Type::Kind::Float: return "0.0";
             case Type::Kind::Bool:  return "false";
-            default:                return "{}"; // string: "" ; List: vacia (ver list_runtime_prelude)
+            // Fase 5.10: List<Json>/Dict<string,Json> son un Value (no
+            // LList<T>/LDict<V>, ver tipo_cpp()) -- "{}" sobre un Value
+            // default-construye Value::null(), NO una lista/diccionario
+            // vacios (Value::as_list()/as_dict() sobre un null es
+            // comportamiento indefinido: lee la union por la rama
+            // equivocada). Value::list()/Value::dict() sin argumentos SI
+            // dan la lista/diccionario vacios que hace falta aqui.
+            case Type::Kind::List:
+                return t.element().kind() == Type::Kind::Json ? "Value::list()" : "{}";
+            case Type::Kind::Dict:
+                return t.element().kind() == Type::Kind::Json ? "Value::dict()" : "{}";
+            default: return "{}"; // string: ""
         }
     }
 };
@@ -2835,6 +3043,15 @@ std::string route_runtime_prelude() {
         "    if (v.is_bool())  return v.as_bool() ? 1 : 0;\n"
         "    if (v.is_str())   return lumen_str_to_int(v.as_str());\n"
         "    lumen_native_fail(std::string(\"int() no aplica a \") + v.type_name());\n"
+        "}\n"
+        // Fase 5.10: List<Json>.add(x) -- call_method() (natives.cpp,
+        // rama recv.is_list()) hace exactamente esto: push_back en sitio,
+        // devuelve el receptor. List<Json> se representa como Value (no
+        // LList<Value>, ver tipo_cpp()), asi que .lumen_add() (el metodo
+        // de LList<T>) no existe sobre ella -- este es su equivalente.
+        "inline Value& lumen_json_list_add(Value& lista, Value item) {\n"
+        "    lista.as_list().push_back(std::move(item));\n"
+        "    return lista;\n"
         "}\n"
         // Los parametros de `await <modulo>.query/exec(sql, ...)` -- NUNCA
         // se construyen con `std::vector<Value>{...}` directo en la
