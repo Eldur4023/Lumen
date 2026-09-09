@@ -67,6 +67,15 @@ public:
         char* msg = nullptr;
         sqlite3_exec(db, "PRAGMA journal_mode=WAL", nullptr, nullptr, &msg);
         if (msg) sqlite3_free(msg);
+        // synchronous=FULL (el valor por defecto) fsyncea en cada commit --
+        // medido: 2.78ms/commit, contra 0.04ms/commit con NORMAL. En WAL,
+        // NORMAL sigue siendo seguro ante cualquier caida del proceso o de la
+        // aplicacion (el WAL queda consistente); solo se pueden perder los
+        // ultimos commits ante una perdida de energia o un panico del kernel
+        // -- es la recomendacion propia de SQLite para journal_mode=WAL, no
+        // una relajacion improvisada.
+        sqlite3_exec(db, "PRAGMA synchronous=NORMAL", nullptr, nullptr, &msg);
+        if (msg) sqlite3_free(msg);
         sqlite3_exec(db, "PRAGMA foreign_keys=ON", nullptr, nullptr, &msg);
         if (msg) sqlite3_free(msg);
 
