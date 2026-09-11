@@ -546,10 +546,10 @@ void build_classes(const Program& program, const FunctionSigs& fns,
             Emitter emitter(diags, &fns, &sigs, imports);
             size_t  antes = diags.size();
             if (!emitter.emit_condition(*r.condition, field_names, *chunk)) continue;
-            if (shadow_check_activo()) {
+            if (shadow_check_enabled()) {
                 DiagnosticBag shadow;
                 emitter.check_condition(*r.condition, field_names, *chunk, shadow);
-                shadow_comparar("validate", diags, antes, shadow);
+                shadow_compare("validate", diags, antes, shadow);
             }
             info->rules.push_back({chunk, r.message});
         }
@@ -1175,10 +1175,10 @@ void emit_class_bodies(Module& mod, const ClassSigs& classes, const FunctionSigs
             Emitter emitter(diags, &fns, &classes, imports);
             size_t  antes = diags.size();
             emitter.emit_method(c.name, m, *mod.functions[ms->second.index]);
-            if (shadow_check_activo()) {
+            if (shadow_check_enabled()) {
                 DiagnosticBag shadow;
                 emitter.check_method(c.name, m, *mod.functions[ms->second.index], shadow);
-                shadow_comparar(("metodo " + c.name + "." + m.name).c_str(), diags, antes, shadow);
+                shadow_compare(("metodo " + c.name + "." + m.name).c_str(), diags, antes, shadow);
             }
         }
         for (const auto& ct : c.ctors) {
@@ -1187,10 +1187,10 @@ void emit_class_bodies(Module& mod, const ClassSigs& classes, const FunctionSigs
             Emitter emitter(diags, &fns, &classes, imports);
             size_t  antes = diags.size();
             emitter.emit_ctor(c.name, sig.fields, ct, *mod.functions[cs->second]);
-            if (shadow_check_activo()) {
+            if (shadow_check_enabled()) {
                 DiagnosticBag shadow;
                 emitter.check_ctor(c.name, sig.fields, ct, *mod.functions[cs->second], shadow);
-                shadow_comparar(("constructor " + c.name).c_str(), diags, antes, shadow);
+                shadow_compare(("constructor " + c.name).c_str(), diags, antes, shadow);
             }
         }
 
@@ -1212,11 +1212,11 @@ void emit_class_bodies(Module& mod, const ClassSigs& classes, const FunctionSigs
                 size_t  antes = diags.size();
                 emitter.emit_ctor(c.name, sig.fields, implicito,
                                   *mod.functions[cs->second]);
-                if (shadow_check_activo()) {
+                if (shadow_check_enabled()) {
                     DiagnosticBag shadow;
                     emitter.check_ctor(c.name, sig.fields, implicito, *mod.functions[cs->second],
                                        shadow);
-                    shadow_comparar(("constructor implicito " + c.name).c_str(), diags, antes,
+                    shadow_compare(("constructor implicito " + c.name).c_str(), diags, antes,
                                     shadow);
                 }
             }
@@ -1244,10 +1244,10 @@ FunctionSigs build_functions(Module& mod, DiagnosticBag& diags) {
         Emitter emitter(diags, &index, nullptr, &mod.program.imports);
         size_t  antes = diags.size();
         emitter.emit_function(f, *mod.functions[it->second.index]);
-        if (shadow_check_activo()) {
+        if (shadow_check_enabled()) {
             DiagnosticBag shadow;
             emitter.check_function(f, *mod.functions[it->second.index], shadow);
-            shadow_comparar(("funcion " + f.name).c_str(), diags, antes, shadow);
+            shadow_compare(("funcion " + f.name).c_str(), diags, antes, shadow);
         }
     }
     return index;
@@ -1262,10 +1262,10 @@ void build_error_handlers(Module& mod, const FunctionSigs& fns,
         Emitter emitter(diags, &fns, &sigs, &mod.program.imports, &pctx);
         size_t  antes = diags.size();
         if (!emitter.emit_error_handler(e, *chunk)) continue;
-        if (shadow_check_activo()) {
+        if (shadow_check_enabled()) {
             DiagnosticBag shadow;
             emitter.check_error_handler(e, *chunk, shadow);
-            shadow_comparar(("on error " + std::to_string(e.code)).c_str(), diags, antes, shadow);
+            shadow_compare(("on error " + std::to_string(e.code)).c_str(), diags, antes, shadow);
         }
         mod.error_handlers[e.code] = std::move(chunk);
     }
@@ -1320,10 +1320,10 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
             Emitter ws_emitter(diags, &fns, &sigs, &mod.program.imports, &pctx);
             size_t  antes = diags.size();
             if (!ws_emitter.emit_route(r, *ws_chunk)) continue;
-            if (shadow_check_activo()) {
+            if (shadow_check_enabled()) {
                 DiagnosticBag shadow;
                 ws_emitter.check_route(r, *ws_chunk, shadow);
-                shadow_comparar(("ws " + r.pattern).c_str(), diags, antes, shadow);
+                shadow_compare(("ws " + r.pattern).c_str(), diags, antes, shadow);
             }
 
             ++mod.vm_routes;
@@ -1331,7 +1331,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
             lumen::App::WSOptions opts;
             opts.allowed_origins = r.origins;
 
-            mod.rutas_informe.push_back({r.method, r.pattern, "ws"});
+            mod.route_report.push_back({r.method, r.pattern, "ws"});
             mod.router.add_internal("GET", r.pattern,
                 lumen::App::make_ws_handler(
                     [ws_chunk, ws_binds, ws_where, auth, fn_table, native_table, tpl_table]
@@ -1408,15 +1408,15 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
             Emitter sse_emitter(diags, &fns, &sigs, &mod.program.imports, &pctx);
             size_t  antes = diags.size();
             if (!sse_emitter.emit_route(r, *sse_chunk)) continue;
-            if (shadow_check_activo()) {
+            if (shadow_check_enabled()) {
                 DiagnosticBag shadow;
                 sse_emitter.check_route(r, *sse_chunk, shadow);
-                shadow_comparar(("sse " + r.pattern).c_str(), diags, antes, shadow);
+                shadow_compare(("sse " + r.pattern).c_str(), diags, antes, shadow);
             }
 
             ++mod.vm_routes;
             std::string sse_where = "SSE " + r.pattern;
-            mod.rutas_informe.push_back({r.method, r.pattern, "sse"});
+            mod.route_report.push_back({r.method, r.pattern, "sse"});
             mod.router.add_internal("GET", r.pattern,
                 [sse_chunk, sse_binds, sse_where, auth, fn_table, native_table, tpl_table](lumen::Request& req,
                                                         lumen::Response& res)
@@ -1481,7 +1481,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
         // Level 1: declarative route → native action, zero bytecode.
         if (Action a = try_declarative(r, mod.program.app.templates_dir)) {
             ++mod.declarative_routes;
-            mod.rutas_informe.push_back({r.method, r.pattern, "declarativa"});
+            mod.route_report.push_back({r.method, r.pattern, "declarative"});
             mod.router.add_internal(r.method, r.pattern,
                 [a](lumen::Request& req, lumen::Response& res) -> lumen::Task<void> {
                     a(req, res);
@@ -1506,8 +1506,8 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
         if (!bind_params(r, classes, binds, diags)) continue;
 
         // Nivel 1.5: ruta compilada nativamente (Fase 4/5, --native). Mismo
-        // criterio de "todo o nada" que una funcion: generar_ruta_nativa()
-        // (native_gen.cpp), invocado durante compile() -> compilar_nativo(),
+        // criterio de "todo o nada" que una funcion: generate_native_route()
+        // (native_gen.cpp), invocado durante compile() -> compile_native(),
         // ya decidio si esta ruta entera es representable (parametros
         // escalares de patron/query sin valor por defecto, cuerpo sin
         // sesion/JWT/render/contenedores, `await` limitado a `sleep`) -- si
@@ -1525,7 +1525,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
         if (mod.native && ridx < mod.native->rutas_async_por_indice.size() &&
             mod.native->rutas_async_por_indice[ridx]) {
             ++mod.vm_routes;
-            mod.rutas_informe.push_back({r.method, r.pattern, "nativa (async)"});
+            mod.route_report.push_back({r.method, r.pattern, "native (async)"});
             mod.router.add_internal(r.method, r.pattern, mod.native->rutas_async_por_indice[ridx]);
             continue;
         }
@@ -1533,7 +1533,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
             mod.native->rutas_por_indice[ridx]) {
             auto fn = mod.native->rutas_por_indice[ridx];
             ++mod.vm_routes; // cuenta como ruta con logica, aunque no pase por el VM
-            mod.rutas_informe.push_back({r.method, r.pattern, "nativa"});
+            mod.route_report.push_back({r.method, r.pattern, "native"});
             mod.router.add_internal(r.method, r.pattern,
                 [fn](lumen::Request& req, lumen::Response& res) -> lumen::Task<void> {
                     fn(req, res);
@@ -1547,10 +1547,10 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
         Emitter emitter(diags, &fns, &sigs, &mod.program.imports, &pctx);
         size_t  antes = diags.size();
         if (!emitter.emit_route(r, *chunk)) continue;
-        if (shadow_check_activo()) {
+        if (shadow_check_enabled()) {
             DiagnosticBag shadow;
             emitter.check_route(r, *chunk, shadow);
-            shadow_comparar((r.method + " " + r.pattern).c_str(), diags, antes, shadow);
+            shadow_compare((r.method + " " + r.pattern).c_str(), diags, antes, shadow);
         }
 
         ++mod.vm_routes;
@@ -1560,7 +1560,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
                 needs_upload = true;
 
         std::string where = r.method + " " + r.pattern;
-        mod.rutas_informe.push_back({r.method, r.pattern, "bytecode"});
+        mod.route_report.push_back({r.method, r.pattern, "bytecode"});
         mod.router.add_internal(r.method, r.pattern,
             [chunk, binds, where, auth, needs_upload, fn_table, native_table, tpl_table](lumen::Request& req, lumen::Response& res)
                 -> lumen::Task<void> {
@@ -1719,8 +1719,8 @@ std::shared_ptr<Module> compile(const std::vector<fs::path>& inputs,
         // compilo limpio: no tiene sentido invocar g++ sobre un programa que
         // de todas formas no se va a publicar.
         if (native && diags.empty())
-            mod->native = compilar_nativo(mod->program, fns, sigs, ".lumen-native",
-                                          mod->native_aviso);
+            mod->native = compile_native(mod->program, fns, sigs, ".lumen-native",
+                                          mod->native_warning);
 
         ClassTable classes;
         build_classes(mod->program, fns, sigs, &mod->program.imports, classes, diags);

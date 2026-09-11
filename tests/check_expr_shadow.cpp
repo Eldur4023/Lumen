@@ -37,7 +37,7 @@ static ExprPtr parse(const std::string& src, SourceFile& file, DiagnosticBag& di
 // `inspeccionar`, si se da, recibe el IrExpr construido (solo se llama si no
 // es nulo) para comprobar su forma (call_shape, slot, etc.).
 static void caso(const char* nombre, const std::string& src,
-                 const std::vector<NombreTipado>& names,
+                 const std::vector<TypedName>& names,
                  const std::string& esperado_substr,
                  const FunctionSigs* fns = nullptr, const ClassSigs* classes = nullptr,
                  const std::set<std::string>* imports = nullptr,
@@ -127,37 +127,37 @@ static void caso(const char* nombre, const std::string& src,
 int main() {
     // ── Las 6 ramas de emit_expr/emit_call que ya cubre el corpus real
     //    (tests/casos/malos/*.lum) ────────────────────────────────────────
-    caso("builtin async sin await (malos/await.lum)", "sleep(10)", {}, "es asincrono");
+    caso("builtin async sin await (malos/await.lum)", "sleep(10)", {}, "is asynchronous");
 
     caso("objeto reservado fuera de sitio (malos/sse.lum)", "sse.send(\"x\")", {},
-         "solo existe dentro de una ruta sse");
+         "only exists inside a route sse");
 
     {
         ClassSigs classes;
         classes["P"].fields = {"x"};
         caso("campo inexistente en clase (malos/campo_tipo.lum)", "p.noexiste",
-             {{"p", "P"}}, "no tiene un campo", nullptr, &classes);
+             {{"p", "P"}}, "has no field", nullptr, &classes);
     }
 
     {
         ClassSigs classes;
         classes["P"].fields = {"x"};
         caso("metodo inexistente en clase (malos/metodo.lum)", "p.noexiste()",
-             {{"p", "P"}}, "no tiene un metodo", nullptr, &classes);
+             {{"p", "P"}}, "has no method", nullptr, &classes);
     }
 
     caso("metodo builtin inexistente sobre string (malos/metodo_tipo.lum)",
-         "quien.mayusculas()", {{"quien", "string"}}, "no tienen el metodo");
+         "quien.mayusculas()", {{"quien", "string"}}, "have no method");
 
     caso("modulo de BD sin import (malos/import.lum)",
-         "await sqlite.query(\"select 1\")", {}, "falta 'import sqlite'");
+         "await sqlite.query(\"select 1\")", {}, "missing 'import sqlite'");
 
     // ── Ramas de los otros call-shapes (COMPILACION-NATIVA.md §1.2),
     //    sin corpus dedicado pero construidas contra la compilacion real ──
     {
         ClassSigs classes;
         classes["Usuario"].ctors[1] = 0;
-        caso("aridad de constructor", "Usuario(1, 2, 3)", {}, "no tiene constructor de 3",
+        caso("aridad de constructor", "Usuario(1, 2, 3)", {}, "has no constructor taking 3",
              nullptr, &classes);
     }
 
@@ -165,22 +165,22 @@ int main() {
         FunctionSigs fns;
         fns["saluda"].required = 1;
         fns["saluda"].defaults.resize(1);
-        caso("aridad de funcion de usuario", "saluda()", {}, "espera 1 argumento", &fns);
+        caso("aridad de funcion de usuario", "saluda()", {}, "expects 1 argument", &fns);
     }
 
-    caso("funcion desconocida", "no_existe_esta_funcion()", {}, "funcion desconocida");
+    caso("unknown function", "no_existe_esta_funcion()", {}, "unknown function");
 
-    caso("identificador no declarado", "equis", {}, "no esta declarada");
+    caso("identificador no declarado", "equis", {}, "is not declared");
 
-    caso("builtin usado como valor, no llamado", "len", {}, "es un builtin");
+    caso("builtin usado como valor, no llamado", "len", {}, "is a builtin");
 
     caso("await sobre algo que no es una llamada", "await 5", {},
-         "solo se aplica a una llamada asincrona");
+         "only applies to an asynchronous call");
 
     caso("llamada a nada llamable (shape 8: invalid)", "(a + b)()",
-         {{"a", "int"}, {"b", "int"}}, "solo se pueden llamar builtins o metodos");
+         {{"a", "int"}, {"b", "int"}}, "for now only builtins or methods can be called");
 
-    caso("ws fuera de una ruta ws", "ws.send(\"x\")", {}, "solo existe dentro de una ruta ws");
+    caso("ws fuera de una ruta ws", "ws.send(\"x\")", {}, "only exists inside a route ws");
 
     // ── Camino feliz: ninguna de las dos vias debe quejarse, y ademas se
     //    inspecciona la forma del IrExpr construido (call_shape, slot...)

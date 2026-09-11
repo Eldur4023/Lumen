@@ -272,7 +272,7 @@ bool metodo_string_devuelve_bool(const std::string& nombre) {
 // operandos no booleanos, una variable cuyo tipo no se pudo demostrar mas
 // arriba -- devuelve nullopt, y la expresion (o la funcion entera) se queda
 // sin compilar a nativo. No es una traduccion de "es compilable" a
-// "tipo_de() en emitter.cpp": tipo_de() es deliberadamente debil (Unknown
+// "type_of() en emitter.cpp": type_of() es deliberadamente debil (Unknown
 // para casi todo) porque solo necesita servir a un puñado de comprobaciones
 // puntuales del checker; esta funcion necesita ser SOLIDA, asi que es un
 // analisis propio, mas estricto y mas completo, solo para esta fase.
@@ -297,7 +297,7 @@ public:
     // basta para saberlo con certeza al final: si el cuerpo entero fue
     // demostrable Y contenia un await en algun punto, esto ya lo vio.
     // Quien llama (generar_funcion_nativa/generar_metodo_nativo/
-    // generar_ruta_nativa) decide que hacer con el -- una funcion/metodo lo
+    // generate_native_route) decide que hacer con el -- una funcion/metodo lo
     // rechaza (fuera de alcance: nadie mas espera a que termine), una ruta
     // lo usa para generar una corrutina de verdad en vez de una funcion
     // plana.
@@ -305,7 +305,7 @@ public:
 
     // Fase 5.6: ¿demostro tipo_provable() algun `await <modulo>.begin()` en
     // lo que llevamos comprobado? Igual que usa_await_: puesto a verdad,
-    // nunca a falso. generar_ruta_nativa() lo usa para decidir si la ruta
+    // nunca a falso. generate_native_route() lo usa para decidir si la ruta
     // necesita cerrar, al final, cualquier transaccion que el handler haya
     // dejado abierta (rollback_pendientes_db) -- una ruta que nunca llama a
     // begin() no paga ese co_await de mas.
@@ -439,7 +439,7 @@ public:
             // await_db(...)`, el mismo camino que ya usa bytecode -- ver el
             // comentario de esa funcion en db.hpp). `begin()` marca ademas
             // usa_transaccion_ (ver su comentario) para que
-            // generar_ruta_nativa() cierre, al final de la ruta, cualquier
+            // generate_native_route() cierre, al final de la ruta, cualquier
             // transaccion que el handler haya dejado abierta; cualquier
             // otro await (ws.recv()...) sigue sin representacion. No hay
             // caso aparte para
@@ -501,7 +501,7 @@ public:
 
             // El unico nodo del IR que YA lleva el nombre de la clase
             // directamente en su tipo (e.type = Type::class_ref(cls),
-            // puesto por tipo_de() -- ver check_method/check_ctor: "this"
+            // puesto por type_of() -- ver check_method/check_ctor: "this"
             // se declara con exactamente ese tipo). No hace falta pasar
             // por ranura_tipos_: "this" no es reasignable (no existe
             // "this = x" en la gramatica), asi que su tipo es solido sin
@@ -982,7 +982,7 @@ public:
         switch (s.kind) {
             case IrStmtKind::Return: {
                 // Type::Kind::Json es el centinela de "esto es una ruta,
-                // no una funcion" (ver generar_ruta_nativa): el valor de
+                // no una funcion" (ver generate_native_route): el valor de
                 // retorno se serializa a JSON, asi que no tiene que
                 // demostrar un Type nativo concreto -- basta con ser
                 // construible como Value (es_valor_json()) o ser una de las
@@ -1214,7 +1214,7 @@ public:
     // decidir nada, solo consulta lo que tipo_provable() ya demostro.
     // `ruta`: si es verdad, un Return/Require con destino serializa su
     // valor como respuesta HTTP en vez de generar un `return <valor>;` de
-    // funcion -- ver esos dos casos en stmt() y generar_ruta_nativa().
+    // funcion -- ver esos dos casos en stmt() y generate_native_route().
     // `asincrona` (solo tiene sentido si `ruta` tambien lo es, ver
     // Comprobador::usa_await()): la ruta se genera como `lumen::Task<void>`
     // -- toda salida temprana tiene que ser `co_return;`, no `return;` (una
@@ -1553,7 +1553,7 @@ public:
                 // await <modulo>.query/exec/last_id(...) (Fase 5.5): mismo
                 // camino que bytecode (lumen_script::await_db(), ver
                 // db.hpp) -- l_pinned_workers/l_last_exec_workers son las
-                // dos variables locales que generar_ruta_nativa() declara
+                // dos variables locales que generate_native_route() declara
                 // al principio de cualquier ruta asincrona, equivalentes a
                 // los mapas que NativeCtx lleva para una peticion bytecode.
                 // El vector de parametros NUNCA se construye con
@@ -1805,7 +1805,7 @@ public:
     // -- una corrutina no admite un `return` a secas, ver el comentario del
     // constructor). Usado en TODO punto de salida que no sea la caida
     // natural al final del cuerpo (esa se cubre aparte, ver el comentario
-    // grande en generar_ruta_nativa sobre el 204 implicito).
+    // grande en generate_native_route sobre el 204 implicito).
     //
     // Fase 5.6: si el cuerpo demostro un `await <modulo>.begin()`
     // (Comprobador::usa_transaccion()), CUALQUIER salida -- un `return`
@@ -2097,7 +2097,7 @@ std::optional<FuncionNativa> generar_metodo_nativo(const std::string& clase, con
     // simbolo_abi/wrapper_cpp quedan vacios: solo invocable directamente en
     // C++ desde otra funcion nativa (otro metodo, o una funcion suelta cuyo
     // cuerpo pasa una instancia sin construirla -- ver el comentario sobre
-    // classes_ == nullptr en compilar_nativo).
+    // classes_ == nullptr en compile_native).
     return out;
 }
 
@@ -2133,7 +2133,7 @@ std::string codigo_bind_cuerpo(const std::string& nombre_param, const std::strin
     s += "    Value " + cuerpo_var + ";\n";
     s += "    if (!Value::parse_json(req.body, " + cuerpo_var + ")) {\n";
     s += "        Value::Dict __d;\n";
-    s += "        __d[\"error\"] = Value::str(\"JSON invalido\");\n";
+    s += "        __d[\"error\"] = Value::str(\"invalid JSON\");\n";
     s += "        res.status(400).header(\"Content-Type\", \"application/json; charset=utf-8\")"
          ".send(Value::dict(std::move(__d)).to_json_text());\n";
     s += "        " + gen.ret_vacio() + "\n";
@@ -2142,8 +2142,8 @@ std::string codigo_bind_cuerpo(const std::string& nombre_param, const std::strin
     s += "        Value::Dict __d;\n";
     s += "        __d[\"error\"] = Value::str(\"Validacion fallida\");\n";
     s += "        Value::List __l;\n";
-    s += "        __l.push_back(Value::str(\"el cuerpo tiene que ser un objeto JSON\"));\n";
-    s += "        __d[\"mensajes\"] = Value::list(std::move(__l));\n";
+    s += "        __l.push_back(Value::str(\"the body must be a JSON object\"));\n";
+    s += "        __d[\"messages\"] = Value::list(std::move(__l));\n";
     s += "        res.status(422).header(\"Content-Type\", \"application/json; charset=utf-8\")"
          ".send(Value::dict(std::move(__d)).to_json_text());\n";
     s += "        " + gen.ret_vacio() + "\n";
@@ -2173,10 +2173,10 @@ std::string codigo_bind_cuerpo(const std::string& nombre_param, const std::strin
         s += "        if (it == " + cuerpo_var + ".as_dict().end() || it->second.is_null()) {\n";
         if (!c.opcional)
             s += "            " + msgs_var + ".push_back(" +
-                 literal_string(c.nombre + ": obligatorio") + ");\n";
+                 literal_string(c.nombre + ": required") + ");\n";
         s += "        } else if (!it->second." + chequeo + "()) {\n";
         s += "            " + msgs_var + ".push_back(" +
-             literal_string(c.nombre + ": se esperaba " + c.ortografia) + ");\n";
+             literal_string(c.nombre + ": expected " + c.ortografia) + ");\n";
         s += "        } else {\n";
         if (c.opcional) {
             // valor_encaja() (project.cpp): float/double SIEMPRE se
@@ -2235,7 +2235,7 @@ std::string codigo_bind_cuerpo(const std::string& nombre_param, const std::strin
     s += "        __d[\"error\"] = Value::str(\"Validacion fallida\");\n";
     s += "        Value::List __l;\n";
     s += "        for (const auto& __m : " + msgs_var + ") __l.push_back(Value::str(__m));\n";
-    s += "        __d[\"mensajes\"] = Value::list(std::move(__l));\n";
+    s += "        __d[\"messages\"] = Value::list(std::move(__l));\n";
     s += "        res.status(422).header(\"Content-Type\", \"application/json; charset=utf-8\")"
          ".send(Value::dict(std::move(__d)).to_json_text());\n";
     s += "        " + gen.ret_vacio() + "\n";
@@ -2253,7 +2253,7 @@ std::string codigo_bind_cuerpo(const std::string& nombre_param, const std::strin
     return s;
 }
 
-std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBlock& body,
+std::optional<RutaNativa> generate_native_route(const RouteDecl& route, const IrBlock& body,
                                               int indice,
                                               const std::vector<std::string>& nombre_por_indice,
                                               const TablaFirmas& firmas,
@@ -2282,7 +2282,7 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
         // peticion -- misma idea que bind_params() (project.cpp), pero
         // reproducida a mano aqui por el mismo motivo que el resto de esta
         // funcion: bind_params todavia no ha corrido cuando
-        // compilar_nativo() llama a esto (ver el comentario grande sobre
+        // compile_native() llama a esto (ver el comentario grande sobre
         // el orden en compile(), project.cpp), asi que las reglas
         // estructurales ("un unico parametro de cuerpo", "GET/DELETE no
         // llevan cuerpo", "no puede estar en el patron") se repiten aqui.
@@ -2459,11 +2459,11 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
             cuerpo += "            " + nombre + " = " + cero + ";\n";
             cuerpo += "        } else if (!" + fn + "(raw, " + nombre + ")) {\n";
             cuerpo += "            Value::Dict __d;\n";
-            cuerpo += "            __d[\"error\"] = Value::str(\"parametro invalido\");\n";
+            cuerpo += "            __d[\"error\"] = Value::str(\"invalid parameter\");\n";
             cuerpo += "            __d[\"param\"] = Value::str(" + literal_string(p.nombre) + ");\n";
-            cuerpo += "            __d[\"esperado\"] = Value::str(" + literal_string(p.tipo.to_string()) +
+            cuerpo += "            __d[\"expected\"] = Value::str(" + literal_string(p.tipo.to_string()) +
                       ");\n";
-            cuerpo += "            __d[\"recibido\"] = Value::str(raw);\n";
+            cuerpo += "            __d[\"received\"] = Value::str(raw);\n";
             cuerpo += "            res.status(400).header(\"Content-Type\", "
                       "\"application/json; charset=utf-8\")"
                       ".send(Value::dict(std::move(__d)).to_json_text());\n";
@@ -2599,7 +2599,7 @@ void construir_clases(const Program& prog, const ClassSigs& clases_sig,
         // clases_vacias y esta rama la rechazara limpio, no con un fallo a
         // medias.
         if (!c.rules.empty()) {
-            std::vector<NombreTipado> field_names;
+            std::vector<TypedName> field_names;
             for (const auto& f : c.fields) field_names.push_back({f.name, f.type.name});
 
             static const std::vector<std::string> nombre_por_indice_vacio;
@@ -2734,12 +2734,12 @@ std::string error_runtime_prelude() {
         "}\n"
         "template <class T, class U>\n"
         "static auto lumen_div_check(T a, U b) {\n"
-        "    if (b == 0) lumen_native_fail(\"division por cero\");\n"
+        "    if (b == 0) lumen_native_fail(\"division by zero\");\n"
         "    return a / b;\n"
         "}\n"
         "template <class T, class U>\n"
         "static auto lumen_mod_check(T a, U b) {\n"
-        "    if (b == 0) lumen_native_fail(\"modulo por cero\");\n"
+        "    if (b == 0) lumen_native_fail(\"modulo by zero\");\n"
         "    return a % b;\n"
         "}\n"
         // int(x) sobre string (natives.cpp: fn_int) -- mismo std::stoll SIN
@@ -2882,7 +2882,7 @@ std::string dict_runtime_prelude() {
 
 std::string route_runtime_prelude() {
     // Mismas tres reglas que coerce() en project.cpp, reproducidas a mano
-    // (ver el comentario de generar_ruta_nativa): std::stoll/std::stod
+    // (ver el comentario de generate_native_route): std::stoll/std::stod
     // aceptan basura al final ("12abc" -> 12) sin comprobar cuanto
     // consumieron -- eso NO es un descuido de aqui, es replicar el mismo
     // comportamiento del interprete bit a bit, para que --native nunca
@@ -2934,7 +2934,7 @@ std::string route_runtime_prelude() {
         // semantica EXACTA que vm.cpp (numeric_pair()/compare()/
         // Op::Add/Sub/Mul/Div/Mod/Eq/Ne/GetIndex), mismos mensajes de
         // error, mismo canal (lumen_native_fail -- atrapado por el
-        // try/catch de la ruta, ver generar_ruta_nativa). Un valor de base
+        // try/catch de la ruta, ver generate_native_route). Un valor de base
         // de datos no tiene un tipo fijo demostrable en tiempo de
         // compilacion (el driver puede fallar y devolver una forma
         // distinta), asi que estas decisiones se resuelven aqui, en tiempo
@@ -2968,11 +2968,11 @@ std::string route_runtime_prelude() {
         "    bool ints = a.is_int() && b.is_int();\n"
         "    if (op == '%') {\n"
         "        if (!ints) lumen_native_fail(\"'%' solo aplica a enteros\");\n"
-        "        if (b.as_int() == 0) lumen_native_fail(\"modulo por cero\");\n"
+        "        if (b.as_int() == 0) lumen_native_fail(\"modulo by zero\");\n"
         "        return Value::integer(a.as_int() % b.as_int());\n"
         "    }\n"
         "    if (op == '/') {\n"
-        "        if (b.as_float() == 0) lumen_native_fail(\"division por cero\");\n"
+        "        if (b.as_float() == 0) lumen_native_fail(\"division by zero\");\n"
         "        if (ints && a.as_int() % b.as_int() == 0) return Value::integer(a.as_int() / b.as_int());\n"
         "        return Value::real(a.as_float() / b.as_float());\n"
         "    }\n"

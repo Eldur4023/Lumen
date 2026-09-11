@@ -1,20 +1,20 @@
 // Fase 3 de --native (COMPILACION-NATIVA.md): clases de usuario. A
 // diferencia de string/List/Dict, esta pieza no se puede probar a traves de
-// compilar_nativo() -- ni siquiera sirviendo HTTP de verdad -- porque hoy es
+// compile_native() -- ni siquiera sirviendo HTTP de verdad -- porque hoy es
 // estructuralmente inalcanzable desde cualquier programa Lumen en
 // ejecucion: una funcion SUELTA no puede tocar una clase (el checker real
 // solo resuelve ConstructorCall/ClassMethodCall dentro de una ruta o un
 // metodo, que reciben ClassSigs; build_functions() en project.cpp se lo
 // niega a proposito a una funcion suelta), y un metodo nunca cruza la ABI
 // (el receptor es de tipo clase), asi que nunca entra en por_indice.
-// compilar_nativo() maneja esto con seguridad (generadas.empty() -> vuelve
+// compile_native() maneja esto con seguridad (generadas.empty() -> vuelve
 // nullptr, nada se pierde ni se rompe) pero eso significa que, hasta que la
 // Fase 4 compile rutas a nativo, el codigo de esta pieza no tiene ningun
 // punto de entrada real.
 //
 // Esta prueba valida el generador de todas formas -- construyendo el C++ de
 // la clase y sus metodos directamente (generar_clase_runtime()/
-// generar_metodo_nativo(), sin pasar por compilar_nativo()), y ensamblando
+// generar_metodo_nativo(), sin pasar por compile_native()), y ensamblando
 // un ejecutable con un main() propio que los llama, igual que
 // native_gen_shadow.cpp hace para fib/cuenta_primos. Es la prueba de que el
 // C++ generado es correcto; la de que es ALCANZABLE llegara con la Fase 4.
@@ -344,14 +344,14 @@ static bool prueba_inalcanzable_no_rompe() {
     auto cache_dir = std::filesystem::temp_directory_path() / "lumen_native_class_inalcanzable";
     std::error_code ec;
     std::filesystem::remove_all(cache_dir, ec);
-    auto nativo = compilar_nativo(prog, fns, classes, cache_dir, aviso);
+    auto nativo = compile_native(prog, fns, classes, cache_dir, aviso);
     std::filesystem::remove_all(cache_dir, ec);
     if (nativo != nullptr) {
         std::printf("  FALLA: se esperaba nullptr (nada cruza la ABI todavia), hubo %zu "
-                   "funcion(es)\n", nativo->compiladas());
+                   "funcion(es)\n", nativo->compiled());
         return false;
     }
-    std::printf("  ok    un programa solo-clases no rompe nada: compilar_nativo() da nullptr "
+    std::printf("  ok    un programa solo-clases no rompe nada: compile_native() da nullptr "
                "sin aviso de error\n");
     return true;
 }

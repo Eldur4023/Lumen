@@ -72,7 +72,7 @@ struct FirmaNativa {
     Type               retorno = Type::void_();
 };
 // Por nombre de funcion Lumen -- construida una sola vez por
-// compilar_nativo() a partir de TODO el programa (no solo las funciones que
+// compile_native() a partir de TODO el programa (no solo las funciones que
 // terminan compilando), porque una funcion nativa puede llamar a otra que
 // el mapa (alfabetico) todavia no proceso.
 using TablaFirmas = std::unordered_map<std::string, FirmaNativa>;
@@ -116,12 +116,12 @@ struct CampoNativo {
 //
 // Fase 5.8: `reglas` es cada `validate:` ya compilada a IR y reprobada
 // como Type::Kind::Bool contra los CAMPOS de la clase (0..N-1, mismo
-// orden que `campos` -- ver construir_clases()) -- generar_ruta_nativa()
+// orden que `campos` -- ver construir_clases()) -- generate_native_route()
 // las evalua, en orden, justo antes de construir la instancia, igual que
 // bind_body() (project.cpp). `reglas_ok`: si la clase declara ALGUN
 // `validate:` y CUALQUIER regla no demuestra Bool, esta en false y
 // `reglas` queda VACIO a proposito -- la clase entera se rechaza como
-// parametro de cuerpo (generar_ruta_nativa) en vez de compilar solo una
+// parametro de cuerpo (generate_native_route) en vez de compilar solo una
 // parte: ejecutar unas reglas si y otras no dejaria pasar datos que
 // deberian haber fallado una validacion que --native se salto en
 // silencio, la misma clase de divergencia que este documento existe para
@@ -268,7 +268,7 @@ std::string dict_runtime_prelude();
 // dict_runtime_prelude), justo el "pendiente" que documenta
 // COMPILACION-NATIVA.md.
 //
-// Alcance de este primer corte (ver generar_ruta_nativa): solo parametros
+// Alcance de este primer corte (ver generate_native_route): solo parametros
 // escalares de patron (:id) o query string, SIN valor por defecto -- un
 // File, un parametro de tipo clase (cuerpo de peticion) o cualquier `?`
 // dejan la ruta entera fuera, igual que un cuerpo que use `session`/`jwt`/
@@ -287,7 +287,7 @@ struct RutaNativa {
     // verdad -- una corrutina, no una funcion plana -- porque es el UNICO
     // punto de entrada nativo que build_routes() invoca directamente (nadie
     // mas necesita suspenderse a mitad). `simbolo` es el mismo en los dos
-    // casos; compilar_nativo() usa este campo para saber en cual de las dos
+    // casos; compile_native() usa este campo para saber en cual de las dos
     // tablas de NativeModule (rutas_por_indice / rutas_async_por_indice)
     // dejar el puntero que resuelva dlsym().
     bool asincrona = false;
@@ -297,9 +297,9 @@ struct RutaNativa {
 // cae fuera de lo que esta fase representa -- ver el comentario de
 // RutaNativa. `indice` es la posicion de `route` en Program::routes: hace
 // falta para nombrar el simbolo (dos rutas nunca comparten indice) y para
-// que compilar_nativo() sepa en que hueco de NativeModule::rutas_por_indice
+// que compile_native() sepa en que hueco de NativeModule::rutas_por_indice
 // dejar el puntero ya resuelto por dlsym().
-std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBlock& body,
+std::optional<RutaNativa> generate_native_route(const RouteDecl& route, const IrBlock& body,
                                               int indice,
                                               const std::vector<std::string>& nombre_por_indice,
                                               const TablaFirmas& firmas,
@@ -307,7 +307,7 @@ std::optional<RutaNativa> generar_ruta_nativa(const RouteDecl& route, const IrBl
                                               const TablaRoles& roles);
 
 // Funciones libres que necesita el binding de parametros que genera
-// generar_ruta_nativa() -- mismo criterio, mismo formato de error, que
+// generate_native_route() -- mismo criterio, mismo formato de error, que
 // coerce() en project.cpp, reproducido aqui porque el .cpp generado no
 // puede llamar a una funcion `static`/de anonimo de ese otro archivo.
 // Antepuesto una sola vez, igual que las demas *_runtime_prelude(), y SOLO

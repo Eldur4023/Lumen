@@ -7,7 +7,7 @@ namespace lumen_script {
 struct TypeRef; // ast.hpp
 
 // Representacion tipada de un tipo de Lumen Script, pensada para sustituir a
-// las cadenas ad-hoc que usa hoy Emitter (Local::type, tipo_de()) y para ser
+// las cadenas ad-hoc que usa hoy Emitter (Local::type, type_of()) y para ser
 // la base del IR tipado que necesita el backend de compilacion nativa
 // (COMPILACION-NATIVA.md, fase 1).
 //
@@ -36,7 +36,7 @@ struct TypeRef; // ast.hpp
 class Type {
 public:
     // Unknown es el "no se sabe" de hoy (la cadena vacia que devuelve
-    // tipo_de() cuando no hay nada evidente que comprobar: una variable de
+    // type_of() cuando no hay nada evidente que comprobar: una variable de
     // for sobre un Json, una expresion que no es un literal ni un
     // identificador declarado...). Es un estado real, distinto de Void (una
     // fn que no devuelve nada SI es un tipo conocido).
@@ -69,12 +69,12 @@ public:
     static Type from_declared(const TypeRef& t);
 
     // A partir de un nombre desnudo ya resuelto (lo que hoy lleva
-    // NombreTipado::tipo: un campo de clase, o el tipo exacto de un Value
+    // TypedName::tipo: un campo de clase, o el tipo exacto de un Value
     // constante). "" da unknown(). No hay generics ni '?' que reconstruir
-    // porque NombreTipado nunca los llevo.
+    // porque TypedName nunca los llevo.
     static Type from_legacy_name(const std::string& name);
 
-    // El nombre desnudo tal y como lo usan hoy Local::type/tipo_de: sin `?`,
+    // El nombre desnudo tal y como lo usan hoy Local::type/type_of: sin `?`,
     // sin los argumentos de un generico ("List<int>" da "List", no
     // "List<int>"). Es la clave de busqueda que ya esperan ClassSigs y
     // metodos_de() (natives.hpp) -- no to_string(), que es mas descriptivo

@@ -121,7 +121,7 @@ static void caso_clase(const char* nombre, const std::string& src,
     std::vector<std::string> fields;
     for (const auto& f : cls.fields) fields.push_back(f.name);
 
-    // comprobar_campo/check_campo solo miran classes_ si viene con la clase
+    // comprobar_campo/check_field solo miran classes_ si viene con la clase
     // ya registrada: sin esto, "P" no tiene tabla y el campo se da por bueno.
     ClassSigs classes;
     classes[cls.name].fields = fields;
@@ -310,25 +310,25 @@ int main() {
         "fn int malo():\n"
         "    equis = 1\n"
         "    return equis\n",
-        "no esta declarada");
+        "is not declared");
 
     caso_fn("break fuera de un bucle",
         "fn int malo2():\n"
         "    break\n"
         "    return 0\n",
-        "'break' fuera de un bucle");
+        "'break' outside a loop");
 
     caso_fn("continue fuera de un bucle",
         "fn int malo3():\n"
         "    continue\n"
         "    return 0\n",
-        "'continue' fuera de un bucle");
+        "'continue' outside a loop");
 
     caso_fn("require con condicion que usa una variable no declarada",
         "fn int malo4():\n"
         "    require equis else 0\n"
         "    return 1\n",
-        "no esta declarada");
+        "is not declared");
 
     // ── Clases: campo valido/invalido en Assign a un Member, y constructor
     //    sin cuerpo con un parametro que no es campo ───────────────────────
@@ -361,14 +361,14 @@ int main() {
         "\n"
         "    fn void pon(int v):\n"
         "        this.noexiste = v\n",
-        "no tiene un campo");
+        "has no field");
 
     caso_clase("constructor implicito con parametro que no es campo",
         "class P:\n"
         "    int x\n"
         "\n"
         "    P(int x, int sobra)\n",
-        "no es un campo");
+        "is not a field");
 
     if (fallos == 0) {
         std::printf("check_stmt_shadow: todo reproducido, %d fallos\n", fallos);

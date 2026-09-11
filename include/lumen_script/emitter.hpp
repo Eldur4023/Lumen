@@ -119,7 +119,7 @@ public:
     //
     // Ademas de comprobar, CONSTRUYE y devuelve el IrExpr correspondiente
     // (nulo si algo no compilo -- ya se llamo a shadow.error en el sitio
-    // exacto). El tipo de cada nodo es tipo_de(e), sin excepcion: nunca un
+    // exacto). El tipo de cada nodo es type_of(e), sin excepcion: nunca un
     // tipo mas preciso inventado aqui, porque eso seria funcionalidad nueva
     // y no una reproduccion de lo que ya hace el compilador. Publico porque
     // la verificacion (comparar shadow contra diags_ real, y el shape del
@@ -142,7 +142,7 @@ public:
     // el canario de project.cpp) es valido: declare_local() vuelve a anotar
     // los mismos nombres, pero num_locals ya no puede subir mas de lo que ya
     // subio, asi que no cambia nada observable.
-    IrExprPtr check_condition(const Expr& e, const std::vector<NombreTipado>& names,
+    IrExprPtr check_condition(const Expr& e, const std::vector<TypedName>& names,
                               Chunk& out, DiagnosticBag& shadow);
 
     // check_stmt/check_block: la misma idea que check_expr, pero para

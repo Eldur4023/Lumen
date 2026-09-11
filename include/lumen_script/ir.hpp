@@ -81,7 +81,7 @@ struct IrExpr {
     SourceLoc  loc;
 
     // Tipo ya resuelto por el checker. Type::unknown() es un resultado
-    // legitimo (lo mismo que hoy devuelve tipo_de() para lo que no se puede
+    // legitimo (lo mismo que hoy devuelve type_of() para lo que no se puede
     // saber en compilacion), no una marca de "todavia sin rellenar".
     Type type = Type::unknown();
 

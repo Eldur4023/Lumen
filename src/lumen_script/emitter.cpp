@@ -2,7 +2,7 @@
 #include <fstream>
 #include <filesystem>
 #include <iostream>
-#include <lumen_script/plantilla.hpp>
+#include <lumen_script/template.hpp>
 #include <lumen_script/natives.hpp>
 
 #include <algorithm>
@@ -143,7 +143,7 @@ bool Emitter::emit_ctor(const std::string& cls, const std::vector<std::string>& 
     return !failed_;
 }
 
-bool Emitter::emit_condition(const Expr& e, const std::vector<NombreTipado>& names,
+bool Emitter::emit_condition(const Expr& e, const std::vector<TypedName>& names,
                              Chunk& out) {
     IrExprPtr ir = check_condition(e, names, out, diags_);
     if (!ir) { failed_ = true; return false; }
@@ -154,7 +154,7 @@ bool Emitter::emit_condition(const Expr& e, const std::vector<NombreTipado>& nam
     return !failed_;
 }
 
-IrExprPtr Emitter::check_condition(const Expr& e, const std::vector<NombreTipado>& names,
+IrExprPtr Emitter::check_condition(const Expr& e, const std::vector<TypedName>& names,
                                    Chunk& out, DiagnosticBag& shadow) {
     chunk_        = &out;
     route_method_ = {};
@@ -162,7 +162,7 @@ IrExprPtr Emitter::check_condition(const Expr& e, const std::vector<NombreTipado
     loops_.clear();
     scope_depth_ = 0;
 
-    for (const auto& n : names) declare_local(n.nombre, e.loc, Type::from_legacy_name(n.tipo));
+    for (const auto& n : names) declare_local(n.name, e.loc, Type::from_legacy_name(n.type));
 
     return check_expr(e, shadow);
 }
@@ -254,7 +254,7 @@ bool Emitter::check_ctor(const std::string& cls, const std::vector<std::string>&
     } else {
         for (const auto& p : ct.params) {
             if (std::find(fields.begin(), fields.end(), p.name) == fields.end())
-                shadow.error(p.loc, "'" + p.name + "' no es un campo de '" + cls + "'");
+                shadow.error(p.loc, "'" + p.name + "' is not a field of '" + cls + "'");
         }
     }
     return shadow.size() == antes;
@@ -432,12 +432,12 @@ IrStmtPtr Emitter::check_stmt(const Stmt& s, DiagnosticBag& shadow) {
             }
 
             if (s.target->kind != ExprKind::Ident) {
-                shadow.error(s.loc, "solo se puede asignar a una variable o a un campo");
+                shadow.error(s.loc, "can only assign to a variable or a field");
                 return nullptr;
             }
             int slot = resolve_local(s.target->text);
             if (slot < 0) {
-                shadow.error(s.target->loc, "'" + s.target->text + "' no esta declarada");
+                shadow.error(s.target->loc, "'" + s.target->text + "' is not declared");
                 return nullptr;
             }
             IrExprPtr val = check_expr(*s.value, shadow);
@@ -478,11 +478,11 @@ IrStmtPtr Emitter::check_stmt(const Stmt& s, DiagnosticBag& shadow) {
             return check_require_like(s.loc, *s.value, *s.target, shadow);
 
         case StmtKind::Break:
-            if (loops_.empty()) { shadow.error(s.loc, "'break' fuera de un bucle"); return nullptr; }
+            if (loops_.empty()) { shadow.error(s.loc, "'break' outside a loop"); return nullptr; }
             return nodo();
 
         case StmtKind::Continue:
-            if (loops_.empty()) { shadow.error(s.loc, "'continue' fuera de un bucle"); return nullptr; }
+            if (loops_.empty()) { shadow.error(s.loc, "'continue' outside a loop"); return nullptr; }
             return nodo();
 
         case StmtKind::For: {
@@ -542,14 +542,14 @@ Type Emitter::type_of(const Expr& e) const {
         case ExprKind::BoolLit:   return Type::primitive(Type::Kind::Bool);
         case ExprKind::Ident:     return local_type(e.text);
         case ExprKind::This:      return local_type("this");
-        // Metodo builtin sobre un receptor de tipo conocido: la cadena sigue.
+        // Metodo builtin on un receptor de tipo conocido: la cadena sigue.
         case ExprKind::Call: {
             if (!e.object || e.object->kind != ExprKind::Member) return Type::unknown();
             const Type recv = type_of(*e.object->object);
-            const auto* lista = metodos_de(recv.base_name());
+            const auto* lista = methods_of(recv.base_name());
             if (!lista) return Type::unknown();
             for (const auto& m : *lista)
-                if (e.object->text == m.nombre)
+                if (e.object->text == m.name)
                     return m.devuelve ? Type::from_legacy_name(m.devuelve) : recv;
             return Type::unknown();
         }
@@ -571,19 +571,19 @@ bool Emitter::check_field(const Expr& objeto, const std::string& campo, SourceLo
             const auto& f = it->second.fields;
             if (std::find(f.begin(), f.end(), campo) != f.end()) return true;
             if (it->second.methods.count(campo)) {
-                shadow.error(loc, "'" + base + "." + campo + "' es un metodo: "
-                           "hay que llamarlo con ()");
+                shadow.error(loc, "'" + base + "." + campo + "' es un method: "
+                           "it must be called with ()");
             } else {
                 std::string hay;
                 for (const auto& n : f) hay += (hay.empty() ? "" : ", ") + n;
-                shadow.error(loc, "'" + base + "' no tiene un campo '" + campo + "'" +
-                           (hay.empty() ? "" : "; tiene " + hay));
+                shadow.error(loc, "'" + base + "' has no field '" + campo + "'" +
+                           (hay.empty() ? "" : "; it has " + hay));
             }
             return false;
         }
     }
-    if (metodos_de(base) && base != "Dict") {
-        shadow.error(loc, "'" + campo + "' sobre " + base + ", que no tiene campos");
+    if (methods_of(base) && base != "Dict") {
+        shadow.error(loc, "'" + campo + "' on " + base + ", which has no fields");
         return false;
     }
     return true;
@@ -592,19 +592,19 @@ bool Emitter::check_field(const Expr& objeto, const std::string& campo, SourceLo
 // Shadow de comprobar_metodo_builtin: idem.
 bool Emitter::check_builtin_method(const Expr& e, DiagnosticBag& shadow) const {
     const Type recv = type_of(*e.object->object);
-    const auto* lista = metodos_de(recv.base_name());
+    const auto* lista = methods_of(recv.base_name());
     if (!lista) return true;
 
     const std::string& metodo = e.object->text;
-    const MetodoBuiltin* def = nullptr;
+    const BuiltinMethod* def = nullptr;
     for (const auto& m : *lista)
-        if (metodo == m.nombre) { def = &m; break; }
+        if (metodo == m.name) { def = &m; break; }
 
     if (!def) {
         std::string hay;
-        for (const auto& m : *lista) hay += (hay.empty() ? "" : ", ") + std::string(m.nombre);
-        shadow.error(e.object->loc, "los valores de tipo " + recv.base_name() +
-                             " no tienen el metodo '" + metodo + "'; tienen " + hay);
+        for (const auto& m : *lista) hay += (hay.empty() ? "" : ", ") + std::string(m.name);
+        shadow.error(e.object->loc, "values of type " + recv.base_name() +
+                             " have no method '" + metodo + "'; it has " + hay);
         return false;
     }
 
@@ -616,15 +616,15 @@ bool Emitter::check_builtin_method(const Expr& e, DiagnosticBag& shadow) const {
         static_cast<int>(argc) > def->max_args) {
         std::string espera = std::to_string(def->min_args);
         if (def->max_args != def->min_args) espera += "-" + std::to_string(def->max_args);
-        shadow.error(e.loc, "'" + metodo + "()' espera " + espera +
-                     " argumento(s), pero recibe " + std::to_string(argc));
+        shadow.error(e.loc, "'" + metodo + "()' expects " + espera +
+                     " argument(s), but receives " + std::to_string(argc));
         return false;
     }
     return true;
 }
 
 // Traduce un ExprKind al IrExprKind correspondiente. Es una funcion, no un
-// static_cast: las dos enumeraciones tienen hoy el mismo orden a proposito,
+// static_cast: las dos enumeraciones it has hoy el mismo orden a proposito,
 // pero un cast confiaria en eso silenciosamente. Con un switch explicito, si
 // alguien anade un ExprKind sin actualizar esta funcion, el compilador avisa
 // (switch no exhaustivo) en vez de dejar pasar un IrExprKind inventado.
@@ -683,10 +683,10 @@ IrExprPtr Emitter::check_expr(const Expr& e, DiagnosticBag& shadow) const {
             int slot = resolve_local(e.text);
             if (slot < 0) {
                 if (native_id(e.text) >= 0)
-                    shadow.error(e.loc, "'" + e.text + "' es un builtin: hay que llamarlo, "
-                                 "no usarlo como valor");
+                    shadow.error(e.loc, "'" + e.text + "' is a builtin: it must be called, "
+                                 "not to use it as a value");
                 else
-                    shadow.error(e.loc, "'" + e.text + "' no esta declarada");
+                    shadow.error(e.loc, "'" + e.text + "' is not declared");
                 return nullptr;
             }
             auto r = nodo();
@@ -720,7 +720,7 @@ IrExprPtr Emitter::check_expr(const Expr& e, DiagnosticBag& shadow) const {
             static const std::set<std::string> ops = {
                 "+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">="};
             if (!ops.count(e.text)) {
-                shadow.error(e.loc, "operador no soportado: " + e.text);
+                shadow.error(e.loc, "unsupported operator: " + e.text);
                 return nullptr;
             }
             if (!l || !r2) return nullptr;
@@ -792,23 +792,23 @@ IrExprPtr Emitter::check_expr(const Expr& e, DiagnosticBag& shadow) const {
 
                 int id = member_native_id(e.object->text, e.text);
                 if (id < 0) {
-                    shadow.error(e.loc, "'" + e.object->text + "' no tiene un miembro '" +
+                    shadow.error(e.loc, "'" + e.object->text + "' has no member '" +
                                  e.text + "'");
                     return nullptr;
                 }
                 if (native_at(id).min_args > 0) {
                     shadow.error(e.loc, "'" + e.object->text + "." + e.text +
-                                 "' es una operacion: hay que llamarla con ()");
+                                 "' is an operation: it must be called with ()");
                     return nullptr;
                 }
                 if ((e.object->text == "sse" && route_method_ != "SSE") ||
                     (e.object->text == "ws"  && route_method_ != "WS")) {
-                    shadow.error(e.loc, "'" + e.object->text + "' solo existe dentro de "
-                                 "una ruta " + e.object->text);
+                    shadow.error(e.loc, "'" + e.object->text + "' only exists inside "
+                                 "a route " + e.object->text);
                     return nullptr;
                 }
                 if (e.object->text == "error" && route_method_ != "ERROR") {
-                    shadow.error(e.loc, "'error' solo existe dentro de un 'on error'");
+                    shadow.error(e.loc, "'error' only exists inside an 'on error'");
                     return nullptr;
                 }
                 // Miembro de 0 argumentos de un objeto reservado (`sse.open`):
@@ -838,7 +838,7 @@ IrExprPtr Emitter::check_expr(const Expr& e, DiagnosticBag& shadow) const {
             if (tgt.kind == ExprKind::Ident) {
                 int slot = resolve_local(tgt.text);
                 if (slot < 0) {
-                    shadow.error(tgt.loc, "'" + tgt.text + "' no esta declarada");
+                    shadow.error(tgt.loc, "'" + tgt.text + "' is not declared");
                     return nullptr;
                 }
                 auto objetivo = std::make_unique<IrExpr>();
@@ -882,14 +882,14 @@ IrExprPtr Emitter::check_expr(const Expr& e, DiagnosticBag& shadow) const {
                 r->lhs  = std::move(objetivo);
                 return r;
             }
-            shadow.error(e.loc, "'++' y '--' solo se aplican a una variable, un campo "
-                         "o un elemento indexado");
+            shadow.error(e.loc, "'++' y '--' only apply to a variable, a field "
+                         "or an indexed element");
             return nullptr;
         }
 
         case ExprKind::Await: {
             if (!e.lhs || e.lhs->kind != ExprKind::Call) {
-                shadow.error(e.loc, "'await' solo se aplica a una llamada asincrona "
+                shadow.error(e.loc, "'await' only applies to an asynchronous call "
                              "(de momento: sleep)");
                 return nullptr;
             }
@@ -903,7 +903,7 @@ IrExprPtr Emitter::check_expr(const Expr& e, DiagnosticBag& shadow) const {
         case ExprKind::This: {
             int slot = resolve_local("this");
             if (slot < 0) {
-                shadow.error(e.loc, "'this' solo existe dentro de un metodo o un constructor");
+                shadow.error(e.loc, "'this' only exists inside a method or a constructor");
                 return nullptr;
             }
             auto r = nodo();
@@ -952,7 +952,7 @@ bool Emitter::looks_like_direct_request_data(const Expr& e) {
 }
 
 IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow) const {
-    if (!e.object) { shadow.error(e.loc, "llamada sin destino"); return nullptr; }
+    if (!e.object) { shadow.error(e.loc, "call without a target"); return nullptr; }
 
     auto llamada = [&](IrCallShape shape) {
         auto r = std::make_unique<IrExpr>();
@@ -978,22 +978,22 @@ IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow
         id   = member_native_id(e.object->object->text, e.object->text);
         if (id < 0) {
             shadow.error(e.object->loc, "'" + e.object->object->text +
-                                 "' no tiene un miembro '" + e.object->text + "'");
+                                 "' has no member '" + e.object->text + "'");
             return nullptr;
         }
         const std::string& obj = e.object->object->text;
 
         bool is_module = is_db_module(obj);
         if (is_module && (!imports_ || !imports_->count(obj))) {
-            shadow.error(e.object->loc, "falta 'import " + obj + "' para poder usar '" +
+            shadow.error(e.object->loc, "missing 'import " + obj + "' in order to use '" +
                                  obj + "." + e.object->text + "'");
             return nullptr;
         }
         if (is_module) {
             const NativeDef& mdef = native_at(id);
             if (!awaited) {
-                shadow.error(e.loc, "'" + obj + "." + e.object->text + "()' es asincrono: "
-                             "hay que escribir 'await " + obj + "." + e.object->text +
+                shadow.error(e.loc, "'" + obj + "." + e.object->text + "()' is asynchronous: "
+                             "you must write 'await " + obj + "." + e.object->text +
                              "(...)'");
                 return nullptr;
             }
@@ -1051,7 +1051,7 @@ IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow
             size_t argc = 1;
             for (const auto& a : e.args) {
                 if (!a.name.empty()) {
-                    shadow.error(a.loc, "las consultas no admiten argumentos con nombre");
+                    shadow.error(a.loc, "queries do not accept named arguments");
                     return nullptr;
                 }
                 IrExprPtr v = check_expr(*a.value, shadow);
@@ -1061,25 +1061,25 @@ IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow
             }
             if (argc < static_cast<size_t>(mdef.min_args)) {
                 shadow.error(e.loc, "'" + obj + "." + e.object->text +
-                             "()' espera al menos la consulta SQL");
+                             "()' expects at least the SQL query");
                 return nullptr;
             }
             if (mdef.max_args >= 0 && argc > static_cast<size_t>(mdef.max_args)) {
                 shadow.error(e.loc, "'" + obj + "." + e.object->text +
-                             "()' no lleva argumentos");
+                             "()' takes no arguments");
                 return nullptr;
             }
-            if (argc > 255) { shadow.error(e.loc, "demasiados argumentos"); return nullptr; }
+            if (argc > 255) { shadow.error(e.loc, "too many arguments"); return nullptr; }
             return r;
         }
 
         if ((obj == "sse" && route_method_ != "SSE") ||
             (obj == "ws"  && route_method_ != "WS")) {
-            shadow.error(e.object->loc, "'" + obj + "' solo existe dentro de una ruta " + obj);
+            shadow.error(e.object->loc, "'" + obj + "' only exists inside a route " + obj);
             return nullptr;
         }
         if (obj == "error" && route_method_ != "ERROR") {
-            shadow.error(e.object->loc, "'error' solo existe dentro de un 'on error'");
+            shadow.error(e.object->loc, "'error' only exists inside an 'on error'");
             return nullptr;
         }
         shape = IrCallShape::ReservedMemberCall;
@@ -1098,8 +1098,7 @@ IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow
                 size_t given = 0;
                 for (const auto& a : e.args) {
                     if (!a.name.empty()) {
-                        shadow.error(a.loc, "una funcion de usuario no admite argumentos "
-                                     "con nombre");
+                        shadow.error(a.loc, "a user function does not accept named arguments");
                         return nullptr;
                     }
                     IrExprPtr v = check_expr(*a.value, shadow);
@@ -1111,9 +1110,9 @@ IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow
                 if (given < sig.required || given > sig.defaults.size()) {
                     std::string esperado = std::to_string(sig.required);
                     if (sig.defaults.size() != sig.required)
-                        esperado += " a " + std::to_string(sig.defaults.size());
-                    shadow.error(e.loc, "'" + name + "()' espera " + esperado +
-                                 " argumento(s), pero recibe " + std::to_string(given));
+                        esperado += " to " + std::to_string(sig.defaults.size());
+                    shadow.error(e.loc, "'" + name + "()' expects " + esperado +
+                                 " argument(s), but receives " + std::to_string(given));
                     return nullptr;
                 }
                 // Los que faltan se rellenan con su valor por defecto: la
@@ -1133,7 +1132,7 @@ IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow
                 size_t argc = 0;
                 for (const auto& a : e.args) {
                     if (!a.name.empty()) {
-                        shadow.error(a.loc, "un constructor no admite argumentos con nombre");
+                        shadow.error(a.loc, "a constructor does not accept named arguments");
                         return nullptr;
                     }
                     IrExprPtr v = check_expr(*a.value, shadow);
@@ -1146,16 +1145,16 @@ IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow
                     std::string opciones;
                     for (const auto& [n, _] : ct->second.ctors)
                         opciones += (opciones.empty() ? "" : ", ") + std::to_string(n);
-                    shadow.error(e.loc, "'" + name + "' no tiene constructor de " +
-                                 std::to_string(argc) + " parametro(s)" +
-                                 (opciones.empty() ? "" : "; los hay de " + opciones));
+                    shadow.error(e.loc, "'" + name + "' has no constructor taking " +
+                                 std::to_string(argc) + " parameter(s)" +
+                                 (opciones.empty() ? "" : "; there are ones taking " + opciones));
                     return nullptr;
                 }
                 r->call_index = static_cast<int>(found->second);
                 return r;
             }
 
-            shadow.error(e.object->loc, "funcion desconocida: '" + name + "'");
+            shadow.error(e.object->loc, "unknown function: '" + name + "'");
             return nullptr;
         }
         shape = IrCallShape::BuiltinGlobalCall;
@@ -1175,7 +1174,7 @@ IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow
                 if (!cls->second.fields.empty() &&
                     std::find(cls->second.fields.begin(), cls->second.fields.end(),
                               e.object->text) == cls->second.fields.end()) {
-                    shadow.error(e.object->loc, "'" + recv_name + "' no tiene un metodo '" +
+                    shadow.error(e.object->loc, "'" + recv_name + "' has no method '" +
                                          e.object->text + "'");
                     return nullptr;
                 }
@@ -1192,7 +1191,7 @@ IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow
                 size_t given = 0;
                 for (const auto& a : e.args) {
                     if (!a.name.empty()) {
-                        shadow.error(a.loc, "un metodo no admite argumentos con nombre");
+                        shadow.error(a.loc, "a method does not accept named arguments");
                         return nullptr;
                     }
                     IrExprPtr v = check_expr(*a.value, shadow);
@@ -1202,8 +1201,8 @@ IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow
                 }
                 if (given < sig.required || given > sig.defaults.size()) {
                     shadow.error(e.loc, "'" + recv_name + "." + e.object->text +
-                                 "()' espera " + std::to_string(sig.required) +
-                                 " argumento(s), pero recibe " + std::to_string(given));
+                                 "()' expects " + std::to_string(sig.required) +
+                                 " argument(s), but receives " + std::to_string(given));
                     return nullptr;
                 }
                 for (size_t i = given; i < sig.defaults.size(); ++i) {
@@ -1252,7 +1251,7 @@ IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow
         return r;
     }
     else {
-        shadow.error(e.loc, "de momento solo se pueden llamar builtins o metodos");
+        shadow.error(e.loc, "for now only builtins or methods can be called");
         return nullptr;
     }
 
@@ -1262,12 +1261,12 @@ IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow
     const NativeDef& def = native_at(id);
 
     if (def.is_async && !awaited) {
-        shadow.error(e.loc, "'" + name + "()' es asincrono: hay que escribir "
+        shadow.error(e.loc, "'" + name + "()' is asynchronous: you must write "
                      "'await " + name + "(...)'");
         return nullptr;
     }
     if (!def.is_async && awaited) {
-        shadow.error(e.loc, "'" + name + "()' no es asincrono: sobra el 'await'");
+        shadow.error(e.loc, "'" + name + "()' is not asynchronous: the 'await' is unnecessary");
         return nullptr;
     }
 
@@ -1275,7 +1274,7 @@ IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow
     for (const auto& a : e.args) (a.name.empty() ? positional : named)++;
 
     if (named > 0 && name != "render") {
-        shadow.error(e.loc, "'" + name + "()' no admite argumentos con nombre");
+        shadow.error(e.loc, "'" + name + "()' does not accept named arguments");
         return nullptr;
     }
 
@@ -1309,13 +1308,13 @@ IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow
     if (name == "render") {
         if (e.args.empty() || !e.args[0].name.empty() ||
             e.args[0].value->kind != ExprKind::StringLit) {
-            shadow.error(e.loc, "render() necesita el nombre de la plantilla escrito, no una "
-                         "variable. Para elegir entre varias, usa un if con nombres "
-                         "literales: cada rama queda comprobada al compilar");
+            shadow.error(e.loc, "render() needs the template name written out, not a "
+                         "variable. To choose between several, use an if with literal "
+                         "literals: every branch is checked at compile time");
             return nullptr;
         }
-        if (!plantillas_ || !plantillas_->tabla) {
-            shadow.error(e.loc, "render() no se puede usar aqui");
+        if (!templates_ || !templates_->table) {
+            shadow.error(e.loc, "render() cannot be used here");
             return nullptr;
         }
         for (const auto& a : e.args) {
@@ -1350,11 +1349,11 @@ IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow
         if (def.max_args != def.min_args)
             expected += def.max_args < 0 ? " o mas"
                                          : "-" + std::to_string(def.max_args);
-        shadow.error(e.loc, "'" + name + "()' espera " + expected +
-                     " argumento(s), pero recibe " + std::to_string(argc));
+        shadow.error(e.loc, "'" + name + "()' expects " + expected +
+                     " argument(s), but receives " + std::to_string(argc));
         return nullptr;
     }
-    if (argc > 255) { shadow.error(e.loc, "demasiados argumentos"); return nullptr; }
+    if (argc > 255) { shadow.error(e.loc, "too many arguments"); return nullptr; }
 
     return r;
 }
@@ -1367,7 +1366,7 @@ IrExprPtr Emitter::check_call(const Expr& e, bool awaited, DiagnosticBag& shadow
 // por nombre -- porque para cuando se llama a cualquiera de estas funciones,
 // el checker ya dio el visto bueno: lee campos ya resueltos (slot,
 // call_shape, call_index, call_name, type) en vez de resolverlos. La version
-// sobre Expr/Stmt que este emisor reemplaza (mismos opcodes, mismo orden;
+// on Expr/Stmt que este emisor reemplaza (mismos opcodes, mismo orden;
 // esto es su contrapartida MECANICA, node a nodo) ya no existe: se retiro
 // una vez confirmado, con el corte real hecho y probado, que nada la seguia
 // llamando.
@@ -1519,7 +1518,7 @@ void Emitter::emit_expr(const IrExpr& e) {
             // Sin receptor: o bien session.x (__session_get) o bien un
             // miembro de 0 argumentos de un objeto reservado (sse.open),
             // distinguibles por si call_name viene relleno -- ver el
-            // comentario de ir.hpp sobre este reuso.
+            // comentario de ir.hpp on este reuso.
             if (!e.object) {
                 if (e.call_name.empty()) {
                     chunk_->emit(Op::Const, e.loc, chunk_->add_constant(Value::str(e.text)));
@@ -1628,7 +1627,7 @@ void Emitter::emit_expr(const IrExpr& e) {
     }
 }
 
-// Contrapartida de emit_method_call_dynamic sobre el IR: mismo orden
+// Contrapartida de emit_method_call_dynamic on el IR: mismo orden
 // (receptor, posicionales, nombrados agrupados en un Dict), mismo opcode.
 void Emitter::emit_method_call_dynamic(const IrExpr& e) {
     emit_expr(*e.object);
@@ -1724,11 +1723,11 @@ void Emitter::emit_call(const IrExpr& e) {
     }
 }
 
-// Contrapartida de emit_compiled_render sobre el IR. Sigue siendo la
+// Contrapartida de emit_compiled_render on el IR. Sigue siendo la
 // unica excepcion real a "check_* es la unica fuente de diagnosticos": la
 // plantilla en si (su fichero, sus propios {{ }}) no se puede validar sin
 // leerla y compilarla, y eso es superficie de plantillas (fase 3), no algo
-// que check_call pueda anticipar sobre una expresion. error()/diags_ siguen
+// que check_call pueda anticipar on una expresion. error()/diags_ siguen
 // siendo correctos aqui a proposito.
 void Emitter::emit_compiled_render(const IrExpr& e) {
     const std::string& nombre = e.args[0].value->text;
@@ -1739,30 +1738,30 @@ void Emitter::emit_compiled_render(const IrExpr& e) {
         return;
     }
 
-    std::vector<NombreTipado> claves;
+    std::vector<TypedName> claves;
     for (const auto& a : e.args) {
         if (a.name.empty()) continue;
         claves.push_back({a.name, a.value->type.base_name()});
     }
 
     const std::filesystem::path ruta =
-        std::filesystem::path(plantillas_->dir) / nombre;
+        std::filesystem::path(templates_->dir) / nombre;
     std::ifstream f(ruta, std::ios::binary);
     if (!f) {
         error(e.args[0].loc, "no se encuentra la plantilla '" + nombre + "' en " +
-                             plantillas_->dir);
+                             templates_->dir);
         return;
     }
     const std::string fuente((std::istreambuf_iterator<char>(f)),
                              std::istreambuf_iterator<char>());
 
-    Plantilla tpl;
-    if (!compilar_plantilla(fuente, nombre, plantillas_->dir, claves, diags_, tpl)) {
+    Template tpl;
+    if (!compilar_plantilla(fuente, nombre, templates_->dir, claves, diags_, tpl)) {
         failed_ = true;
         return;
     }
-    const uint32_t idx = static_cast<uint32_t>(plantillas_->tabla->size());
-    plantillas_->tabla->push_back(std::move(tpl));
+    const uint32_t idx = static_cast<uint32_t>(templates_->table->size());
+    templates_->table->push_back(std::move(tpl));
 
     chunk_->emit(Op::Const, e.loc, chunk_->add_constant(Value::integer(idx)));
     for (const auto& a : e.args) {

@@ -230,15 +230,15 @@ int main() {
                     diags_nat.items().front().message.c_str());
         return 1;
     }
-    if (!mod_nat->native_aviso.empty())
-        std::printf("aviso de --native: %s\n", mod_nat->native_aviso.c_str());
+    if (!mod_nat->native_warning.empty())
+        std::printf("aviso de --native: %s\n", mod_nat->native_warning.c_str());
 
     // Si esto no compilo a nativo, el resto de la prueba compararia
-    // bytecode contra bytecode -- no probaria nada nuevo. rutas_compiladas()
-    // no es publico (solo el conteo total via compiladas()), asi que basta
+    // bytecode contra bytecode -- no probaria nada nuevo. routes_compiled()
+    // no es publico (solo el conteo total via compiled()), asi que basta
     // con pedir una respuesta y comprobar mas abajo que las dos vias
     // coinciden; el fallo real que esto quiere atrapar (no compilar nada)
-    // ya lo señala native_aviso arriba con detalle. Aun asi, se deja
+    // ya lo señala native_warning arriba con detalle. Aun asi, se deja
     // constancia explicita: sin mod_nat->native, la ruta cayo entera a
     // bytecode y esta prueba no vale para nada.
     if (!mod_nat->native) {
@@ -251,7 +251,7 @@ int main() {
 
     // Fase 5.5: `/db/:id` (List<Json>/Json/indexado/len() sobre el
     // resultado de `await sqlite.query(...)`) tiene que compilar como ruta
-    // asincrona -- SOLO se comprueba que compilo (rutas_informe, Fase 6),
+    // asincrona -- SOLO se comprueba que compilo (route_report, Fase 6),
     // no se ejecuta: un await sobre DbAwaitable de verdad suspende sobre un
     // DbPool y solo se reanuda cuando el EventLoop real hace
     // loop->post(...) -- esta prueba no tiene uno (a diferencia de `await
@@ -261,10 +261,10 @@ int main() {
     // real sirviendo HTTP) esta verificada a mano -- ver COMPILACION-NATIVA.md.
     {
         std::string via;
-        for (const auto& r : mod_nat->rutas_informe)
-            if (r.patron == "/db/:id") { via = r.via; break; }
-        if (via != "nativa (async)") {
-            std::printf("  FALLA /db/:id: se esperaba 'nativa (async)', rutas_informe dice "
+        for (const auto& r : mod_nat->route_report)
+            if (r.pattern == "/db/:id") { via = r.path; break; }
+        if (via != "native (async)") {
+            std::printf("  FALLA /db/:id: se esperaba 'nativa (async)', route_report dice "
                         "'%s'\n", via.empty() ? "(no aparece)" : via.c_str());
             ok = false;
         } else {
@@ -275,17 +275,17 @@ int main() {
 
     // Fase 5.6: `/db/tx/:id` (await sqlite.begin()/exec()/commit(), con un
     // `return` de por medio ANTES del commit() -- a proposito, para que
-    // generar_ruta_nativa tenga que generar el cierre de la transaccion
+    // generate_native_route tenga que generar el cierre de la transaccion
     // (rollback_pendientes_db, via ret_vacio()) en ese punto de salida
     // temprano, no solo al final del cuerpo) tiene que compilar como ruta
     // asincrona igual que /db/:id -- mismo motivo para no ejecutarla aqui
     // (DbAwaitable necesita un EventLoop real, ver el comentario de arriba).
     {
         std::string via;
-        for (const auto& r : mod_nat->rutas_informe)
-            if (r.patron == "/db/tx/:id") { via = r.via; break; }
-        if (via != "nativa (async)") {
-            std::printf("  FALLA /db/tx/:id: se esperaba 'nativa (async)', rutas_informe dice "
+        for (const auto& r : mod_nat->route_report)
+            if (r.pattern == "/db/tx/:id") { via = r.path; break; }
+        if (via != "native (async)") {
+            std::printf("  FALLA /db/tx/:id: se esperaba 'nativa (async)', route_report dice "
                         "'%s'\n", via.empty() ? "(no aparece)" : via.c_str());
             ok = false;
         } else {
@@ -303,10 +303,10 @@ int main() {
     // byte, no solo comprobar que compila.
     {
         std::string via;
-        for (const auto& r : mod_nat->rutas_informe)
-            if (r.patron == "/ajuste") { via = r.via; break; }
-        if (via != "nativa") {
-            std::printf("  FALLA /ajuste: se esperaba 'nativa', rutas_informe dice '%s'\n",
+        for (const auto& r : mod_nat->route_report)
+            if (r.pattern == "/ajuste") { via = r.path; break; }
+        if (via != "native") {
+            std::printf("  FALLA /ajuste: se esperaba 'nativa', route_report dice '%s'\n",
                         via.empty() ? "(no aparece)" : via.c_str());
             ok = false;
         } else {
@@ -360,10 +360,10 @@ int main() {
     // compila.
     {
         std::string via;
-        for (const auto& r : mod_nat->rutas_informe)
-            if (r.patron == "/registro") { via = r.via; break; }
-        if (via != "nativa") {
-            std::printf("  FALLA /registro: se esperaba 'nativa', rutas_informe dice '%s'\n",
+        for (const auto& r : mod_nat->route_report)
+            if (r.pattern == "/registro") { via = r.path; break; }
+        if (via != "native") {
+            std::printf("  FALLA /registro: se esperaba 'nativa', route_report dice '%s'\n",
                         via.empty() ? "(no aparece)" : via.c_str());
             ok = false;
         } else {
@@ -484,7 +484,7 @@ int main() {
     comparar("guarda rechaza n=50", "/compute/fib/50");
 
     // El parametro de patron no es un entero: el binding que genera
-    // generar_ruta_nativa reproduce coerce()/prepare_args a mano -- este es
+    // generate_native_route reproduce coerce()/prepare_args a mano -- este es
     // el caso que prueba que el 400 {"error":"parametro invalido",...} sale
     // BYTE A BYTE igual, JSON-escapado incluido.
     comparar("parametro invalido n='abc'", "/compute/fib/abc");
@@ -541,7 +541,7 @@ int main() {
     // especulativa): una ruta nativa no tiene NINGUN wrapper de la ABI (a
     // diferencia de una funcion) -- nadie la llama a traves de ella, la
     // invoca build_routes() directamente -- asi que, antes de que
-    // generar_ruta_nativa() envolviera el cuerpo entero en un try/catch, un
+    // generate_native_route() envolviera el cuerpo entero en un try/catch, un
     // modulo por cero (lumen_mod_check, el mismo canal de error que ya usan
     // las funciones) escapaba de la corrutina sin que nadie lo atrapara.
     // Confirmado contra el binario real: NO tumbaba el proceso (Task<void>

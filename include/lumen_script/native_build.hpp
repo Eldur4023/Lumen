@@ -52,7 +52,7 @@ public:
     // Fase 4: una ruta nunca cruza la ABI fija (NativeValue) -- nadie la
     // llama desde bytecode, solo build_routes() en C++ normal, asi que el
     // simbolo que exporta tiene la firma real que necesita (ver
-    // generar_ruta_nativa en native_gen.hpp), no la generica de CompiledFn.
+    // generate_native_route en native_gen.hpp), no la generica de CompiledFn.
     // Indexado por posicion en Program::routes, igual que rutas_por_indice
     // aqui debajo -- un hueco a nullptr significa "esta ruta se sigue
     // sirviendo con bytecode".
@@ -67,15 +67,15 @@ public:
     using RouteFnAsync = lumen::Task<void> (*)(lumen::Request&, lumen::Response&);
     std::vector<RouteFnAsync> rutas_async_por_indice;
 
-    size_t compiladas() const;
-    size_t rutas_compiladas() const;
+    size_t compiled() const;
+    size_t routes_compiled() const;
 
     // Vista liviana para VM::start() -- ver el comentario de NativeDispatch
     // en native_abi.hpp.
     NativeDispatch dispatch() const { return {&por_indice, error_message}; }
 
 private:
-    friend std::unique_ptr<NativeModule> compilar_nativo(const Program&, const FunctionSigs&,
+    friend std::unique_ptr<NativeModule> compile_native(const Program&, const FunctionSigs&,
                                                           const ClassSigs&,
                                                           const std::filesystem::path&,
                                                           std::string&);
@@ -96,7 +96,7 @@ private:
 // quien llama lo imprima como advertencia, nunca en silencio. Devuelve
 // nullptr tanto si nada se pudo generar (no es un error, `aviso` queda
 // vacio) como si `g++`/dlopen fallaron.
-std::unique_ptr<NativeModule> compilar_nativo(const Program& prog, const FunctionSigs& sigs,
+std::unique_ptr<NativeModule> compile_native(const Program& prog, const FunctionSigs& sigs,
                                               const ClassSigs& clases,
                                               const std::filesystem::path& cache_dir,
                                               std::string& aviso);

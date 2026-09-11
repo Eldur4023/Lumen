@@ -12,39 +12,53 @@ namespace lumen_script {
 struct SessionState;
 struct NativeCtx;
 
-// ─── Sesion firmada y JWT ────────────────────────────────────────────────────
+// ─── Signed session and JWT ──────────────────────────────────────────────────
 //
-// La sesion es una cookie firmada, como en Flask: sin estado en servidor, lo
-// que encaja con un VM por peticion y N event loops sin nada que sincronizar.
+// The session is a signed cookie, like in Flask: no server-side state, which
+// fits one VM per request and N event loops with nothing to synchronize.
 //
-// Formato:  base64url(json) "." base64url(hmac_sha256(secreto, base64url(json)))
+// Format:  exp "." base64url(json) "." base64url(hmac_sha256(secret, exp "." base64url(json)))
 //
-// El contenido va firmado pero NO cifrado: el usuario puede leerlo, solo no
-// puede falsificarlo.  No se guarda ahi nada que no pueda ver.
+// `exp` (unix seconds) is signed but kept OUTSIDE the JSON payload, so it
+// never shows up as a spurious key when a handler reads `session.*` or
+// iterates the session dict — it is envelope, not application data.
 //
-// Header publico a proposito: esta logica no depende del bytecode ni del VM
-// -- la necesita cualquier backend que ejecute rutas de Lumen Script, sea el
-// interprete de hoy o un backend de compilacion nativa (ver
-// COMPILACION-NATIVA.md, fase 0).
+// Without it, `Max-Age` on the cookie was the ONLY expiry: a client that
+// keeps an old Set-Cookie value (or an attacker who steals one) could replay
+// it forever, and `session.clear()` / logout only ever told the *browser* to
+// drop the cookie — a copy taken before that request stayed valid, HMAC and
+// all.  Rejecting on `exp` here closes that: a stolen or retained cookie
+// stops working on its own once session_max_age has passed, no rotation of
+// the secret required.
+//
+// The content is signed but NOT encrypted: the user can read it, they just
+// cannot forge it.  Nothing they should not see is kept there.
+//
+// Deliberately a public header: this logic does not depend on bytecode or
+// the VM — any backend that runs Lumen Script routes needs it, whether
+// today's interpreter or a native-compilation backend (see
+// COMPILACION-NATIVA.md, phase 0).
 
 constexpr const char* kSessionCookie = "lumen_session";
 
-std::string sign_session(const Value::Dict& data, const std::string& secret);
+std::string sign_session(const Value::Dict& data, const std::string& secret,
+                         long long exp);
 
-// Devuelve false si la cookie falta, esta mal formada o la firma no cuadra.
-// En cualquiera de esos casos la sesion arranca vacia, nunca a medias.
+// Returns false if the cookie is missing, malformed, expired, or the
+// signature does not match.  In any of those cases the session starts empty,
+// never half-filled.
 bool load_session(const std::string& cookie, const std::string& secret,
-                   Value::Dict& out);
+                  Value::Dict& out);
 
-// Verifica un JWT HS256 y devuelve los claims.
+// Verifies an HS256 JWT and returns the claims.
 //
-// Comprueba alg, firma y expiracion.  Un token con alg "none", o con RS256
-// cuando esperamos HS256, se rechaza: aceptar el alg que diga el token es la
-// vulnerabilidad clasica de las librerias de JWT.
+// It checks alg, signature and expiry.  A token with alg "none", or with RS256
+// when we expect HS256, is rejected: accepting whatever alg the token names is
+// the classic JWT library vulnerability.
 bool verify_jwt(const std::string& token, const std::string& secret,
-                 const std::string& issuer, Value& claims_out);
+                const std::string& issuer, Value& claims_out);
 
-// Configuracion de autenticacion que cada handler necesita en runtime.
+// Authentication configuration each handler needs at runtime.
 struct AuthConfig {
     std::string session_secret;
     int         session_max_age = 86400;
@@ -53,12 +67,12 @@ struct AuthConfig {
     std::string jwt_issuer;
 };
 
-// Prepara sesion y claims antes de ejecutar el handler.
+// Prepares session and claims before running the handler.
 void begin_auth(const AuthConfig& cfg, lumen::Request& req,
-                 SessionState& session, Value& claims, NativeCtx& ctx);
+                SessionState& session, Value& claims, NativeCtx& ctx);
 
-// Reescribe la cookie solo si el handler toco la sesion.
+// Rewrites the cookie only if the handler touched the session.
 void end_auth(const AuthConfig& cfg, const SessionState& session,
-               lumen::Response& res);
+              lumen::Response& res);
 
 } // namespace lumen_script

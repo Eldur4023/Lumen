@@ -1,6 +1,6 @@
 // Fase 2 de --native, la mitad que native_gen_shadow.cpp no cubre: aquella
 // prueba genera texto C++ y lo compila/ejecuta con un driver escrito a mano;
-// esta usa compilar_nativo() de verdad -- el mismo camino que toma
+// esta usa compile_native() de verdad -- el mismo camino que toma
 // project.cpp::compile() cuando se pide --native -- y comprueba que la VM,
 // con la tabla nativa resultante conectada via VM::start(), da exactamente
 // el mismo resultado que sin ella. Es la prueba de que el despacho dentro
@@ -60,7 +60,7 @@ static long long ejecutar(const Chunk& chunk, long long arg, const FunctionTable
 
 // Compila `prog` (con `sigs` ya calculadas) tanto a bytecode como a nativo, y
 // devuelve la tabla de bytecode y el NativeModule resultante. Nulo en
-// `nativo` si compilar_nativo() no genero nada (no es forzosamente un
+// `nativo` si compile_native() no genero nada (no es forzosamente un
 // fallo: puede que ninguna funcion cruce la ABI, ver mas abajo).
 static bool compilar_las_dos_vias(Program& prog, FunctionSigs& sigs, FunctionTable& tabla_vm,
                                   std::unique_ptr<NativeModule>& nativo,
@@ -81,8 +81,8 @@ static bool compilar_las_dos_vias(Program& prog, FunctionSigs& sigs, FunctionTab
     std::error_code ec;
     std::filesystem::remove_all(cache_dir, ec);
     std::string aviso;
-    nativo = compilar_nativo(prog, sigs, ClassSigs{}, cache_dir, aviso);
-    if (!aviso.empty()) std::printf("aviso de compilar_nativo(): %s\n", aviso.c_str());
+    nativo = compile_native(prog, sigs, ClassSigs{}, cache_dir, aviso);
+    if (!aviso.empty()) std::printf("aviso de compile_native(): %s\n", aviso.c_str());
     return true;
 }
 
@@ -135,16 +135,16 @@ static bool prueba_strings() {
     if (!compilar_las_dos_vias(prog, sigs, tabla_vm, nativo, cache_dir)) return false;
 
     if (!nativo) {
-        std::printf("FALLA (strings): compilar_nativo() no compilo nada (usa_saluda deberia, "
+        std::printf("FALLA (strings): compile_native() no compilo nada (usa_saluda deberia, "
                     "es int->int con string solo en el cuerpo)\n");
         return false;
     }
     // Solo usa_saluda cruza la ABI (int->int); saluda usa `string` en su
     // propia frontera y se queda sin wrapper -- se compila igual, pero no
     // aparece en por_indice.
-    if (nativo->compiladas() != 1) {
+    if (nativo->compiled() != 1) {
         std::printf("FALLA (strings): se esperaba 1 funcion con wrapper (usa_saluda), hay %zu\n",
-                    nativo->compiladas());
+                    nativo->compiled());
         return false;
     }
 
@@ -165,7 +165,7 @@ static bool prueba_strings() {
 // paso, el orden alfabetico de FunctionSigs (un std::map): "usa" llama a
 // "valida", que el mapa visita DESPUES por nombre -- sin un prototipo
 // adelantado en el .cpp ensamblado, esto no compilaria (bug real que este
-// caso encontro al escribirlo, corregido en compilar_nativo() generando
+// caso encontro al escribirlo, corregido en compile_native() generando
 // prototipos para todas las funciones antes que ningun cuerpo).
 static bool prueba_metodos_string() {
     const std::string src =
@@ -197,9 +197,9 @@ static bool prueba_metodos_string() {
         std::filesystem::temp_directory_path() / "lumen_native_build_check_metodos_str";
     if (!compilar_las_dos_vias(prog, sigs, tabla_vm, nativo, cache_dir)) return false;
 
-    if (!nativo || nativo->compiladas() != 1) {
+    if (!nativo || nativo->compiled() != 1) {
         std::printf("FALLA (metodos de string): se esperaba 1 funcion con wrapper (usa), hay %zu\n",
-                    nativo ? nativo->compiladas() : 0);
+                    nativo ? nativo->compiled() : 0);
         return false;
     }
 
@@ -266,9 +266,9 @@ static bool prueba_listas() {
     // suma(List<int>) no cruza la ABI (List, como string, se queda sin
     // wrapper); usa_lista/fuera_de_rango/alias son int->X, las tres deberian
     // compilar.
-    if (!nativo || nativo->compiladas() != 3) {
+    if (!nativo || nativo->compiled() != 3) {
         std::printf("FALLA (listas): se esperaban 3 funciones con wrapper, hay %zu\n",
-                    nativo ? nativo->compiladas() : 0);
+                    nativo ? nativo->compiled() : 0);
         return false;
     }
 
@@ -384,9 +384,9 @@ static bool prueba_diccionarios() {
     // cuenta_claves(Dict<...>) no cruza la ABI (Dict, como List/string, se
     // queda sin wrapper); usa_dict/alias son int->bool, las dos deberian
     // compilar.
-    if (!nativo || nativo->compiladas() != 2) {
+    if (!nativo || nativo->compiled() != 2) {
         std::printf("FALLA (diccionarios): se esperaban 2 funciones con wrapper, hay %zu\n",
-                    nativo ? nativo->compiladas() : 0);
+                    nativo ? nativo->compiled() : 0);
         return false;
     }
 
@@ -447,9 +447,9 @@ static bool prueba_str_len() {
 
     // usa_str/usa_len son int->int, cruzan la ABI; describe (string en la
     // frontera) no -- mismo criterio que prueba_strings().
-    if (!nativo || nativo->compiladas() != 2) {
+    if (!nativo || nativo->compiled() != 2) {
         std::printf("FALLA (str/len): se esperaban 2 funciones con wrapper (usa_str, usa_len), "
-                    "hay %zu\n", nativo ? nativo->compiladas() : 0);
+                    "hay %zu\n", nativo ? nativo->compiled() : 0);
         return false;
     }
 
@@ -504,9 +504,9 @@ static bool prueba_conversion_int() {
     const auto cache_dir = std::filesystem::temp_directory_path() / "lumen_native_build_check_int";
     if (!compilar_las_dos_vias(prog, sigs, tabla_vm, nativo, cache_dir)) return false;
 
-    if (!nativo || nativo->compiladas() != 2) {
+    if (!nativo || nativo->compiled() != 2) {
         std::printf("FALLA (int()): se esperaban 2 funciones (usa_int, int_invalido), hay %zu\n",
-                    nativo ? nativo->compiladas() : 0);
+                    nativo ? nativo->compiled() : 0);
         return false;
     }
 
@@ -566,9 +566,9 @@ static bool prueba_require() {
     const auto cache_dir = std::filesystem::temp_directory_path() / "lumen_native_build_check_require";
     if (!compilar_las_dos_vias(prog, sigs, tabla_vm, nativo, cache_dir)) return false;
 
-    if (!nativo || nativo->compiladas() != 1) {
+    if (!nativo || nativo->compiled() != 1) {
         std::printf("FALLA (require): se esperaba 1 funcion compilada, hay %zu\n",
-                    nativo ? nativo->compiladas() : 0);
+                    nativo ? nativo->compiled() : 0);
         return false;
     }
 
@@ -654,7 +654,7 @@ static bool prueba_tipos_dinamicos() {
         std::error_code ec;
         auto cache = std::filesystem::temp_directory_path() / "lumen_native_build_check_reasig";
         std::filesystem::remove_all(cache, ec);
-        auto nativo = compilar_nativo(prog, sigs, ClassSigs{}, cache, aviso);
+        auto nativo = compile_native(prog, sigs, ClassSigs{}, cache, aviso);
         std::filesystem::remove_all(cache, ec);
         if (nativo) {
             std::printf("  FALLA reasignacion de tipo: se compilo a nativo (deberia caer a "
@@ -688,9 +688,9 @@ static bool prueba_tipos_dinamicos() {
         std::error_code ec;
         std::filesystem::remove_all(cache, ec);
 
-        if (!nativo || nativo->compiladas() != 1) {
+        if (!nativo || nativo->compiled() != 1) {
             std::printf("  FALLA and/or: se esperaba exactamente 1 funcion nativa (booleano), "
-                        "hay %zu\n", nativo ? nativo->compiladas() : 0);
+                        "hay %zu\n", nativo ? nativo->compiled() : 0);
             ok = false;
         } else {
             std::printf("  ok    and/or: 'no_booleano' (int) se queda en bytecode, 'booleano' "
@@ -742,9 +742,9 @@ static bool prueba_tipos_dinamicos() {
         std::error_code ec;
         std::filesystem::remove_all(cache, ec);
 
-        if (!nativo || nativo->compiladas() != 1) {
+        if (!nativo || nativo->compiled() != 1) {
             std::printf("  FALLA modulo cero: se esperaba que 'f' compilase a nativo (es "
-                        "segura), hay %zu\n", nativo ? nativo->compiladas() : 0);
+                        "segura), hay %zu\n", nativo ? nativo->compiled() : 0);
             ok = false;
         } else {
             const Chunk& chunk = *tabla_vm[sigs.at("f").index];
@@ -835,16 +835,16 @@ int main() {
     std::filesystem::remove_all(cache_dir, ec);
 
     std::string aviso;
-    auto        nativo = compilar_nativo(prog, sigs, ClassSigs{}, cache_dir, aviso);
-    if (!aviso.empty()) std::printf("aviso de compilar_nativo(): %s\n", aviso.c_str());
+    auto        nativo = compile_native(prog, sigs, ClassSigs{}, cache_dir, aviso);
+    if (!aviso.empty()) std::printf("aviso de compile_native(): %s\n", aviso.c_str());
     if (!nativo) {
-        std::printf("FALLA: compilar_nativo() no compilo nada (deberia, fib/cuenta_primos "
+        std::printf("FALLA: compile_native() no compilo nada (deberia, fib/cuenta_primos "
                     "son puras)\n");
         return 1;
     }
-    if (nativo->compiladas() != prog.functions.size()) {
+    if (nativo->compiled() != prog.functions.size()) {
         std::printf("FALLA: se esperaban %zu funciones nativas, se compilaron %zu\n",
-                    prog.functions.size(), nativo->compiladas());
+                    prog.functions.size(), nativo->compiled());
         return 1;
     }
 

@@ -11,25 +11,46 @@
 
 namespace lumen_script {
 
-std::string sign_session(const Value::Dict& data, const std::string& secret) {
+std::string sign_session(const Value::Dict& data, const std::string& secret,
+                         long long exp) {
+    std::string exp_str = std::to_string(exp);
     std::string payload = crypto::base64url_encode(
         Value::dict(data).to_json_text());
+    std::string signing_input = exp_str + "." + payload;
     std::string mac = crypto::base64url_encode(
-        crypto::hmac_sha256(secret, payload));
-    return payload + "." + mac;
+        crypto::hmac_sha256(secret, signing_input));
+    return signing_input + "." + mac;
 }
 
 bool load_session(const std::string& cookie, const std::string& secret,
-                   Value::Dict& out) {
-    size_t dot = cookie.rfind('.');
-    if (dot == std::string::npos) return false;
+                  Value::Dict& out) {
+    size_t dot2 = cookie.rfind('.');
+    if (dot2 == std::string::npos) return false;
+    size_t dot1 = cookie.rfind('.', dot2 - 1);
+    if (dot1 == std::string::npos) return false;
 
-    std::string payload = cookie.substr(0, dot);
-    std::string given   = cookie.substr(dot + 1);
+    std::string exp_str = cookie.substr(0, dot1);
+    std::string payload = cookie.substr(dot1 + 1, dot2 - dot1 - 1);
+    std::string given   = cookie.substr(dot2 + 1);
 
+    std::string signing_input = exp_str + "." + payload;
     std::string expected = crypto::base64url_encode(
-        crypto::hmac_sha256(secret, payload));
+        crypto::hmac_sha256(secret, signing_input));
     if (!crypto::constant_time_equal(given, expected)) return false;
+
+    // The MAC just verified proves this cookie was minted by us with this
+    // exact exp_str, so branching on its value now leaks nothing an attacker
+    // could use — they would need a valid signature to get here at all.
+    long long exp = 0;
+    try {
+        size_t consumed = 0;
+        exp = std::stoll(exp_str, &consumed);
+        if (consumed != exp_str.size()) return false;
+    } catch (...) {
+        return false;
+    }
+    const long long now = static_cast<long long>(std::time(nullptr));
+    if (now >= exp) return false;
 
     std::string json_text;
     if (!crypto::base64url_decode(payload, json_text)) return false;
@@ -41,7 +62,7 @@ bool load_session(const std::string& cookie, const std::string& secret,
 }
 
 bool verify_jwt(const std::string& token, const std::string& secret,
-                 const std::string& issuer, Value& claims_out) {
+                const std::string& issuer, Value& claims_out) {
     size_t p1 = token.find('.');
     if (p1 == std::string::npos) return false;
     size_t p2 = token.find('.', p1 + 1);
@@ -88,7 +109,7 @@ bool verify_jwt(const std::string& token, const std::string& secret,
 }
 
 void begin_auth(const AuthConfig& cfg, lumen::Request& req,
-                 SessionState& session, Value& claims, NativeCtx& ctx) {
+                SessionState& session, Value& claims, NativeCtx& ctx) {
     session.secret = cfg.session_secret;
     if (!cfg.session_secret.empty()) {
         auto cookie = req.cookie(kSessionCookie);
@@ -113,7 +134,7 @@ void end_auth(const AuthConfig& cfg, const SessionState& session,
 
     lumen::CookieOptions opts;
     opts.path      = "/";
-    opts.http_only = true;                 // JS no la puede leer
+    opts.http_only = true;                 // JS cannot read it
     opts.secure    = cfg.session_secure;
     opts.same_site = lumen::SameSite::Lax;
 
@@ -122,7 +143,8 @@ void end_auth(const AuthConfig& cfg, const SessionState& session,
         return;
     }
     opts.max_age = cfg.session_max_age;
-    res.cookie(kSessionCookie, sign_session(session.data, cfg.session_secret), opts);
+    const long long exp = static_cast<long long>(std::time(nullptr)) + cfg.session_max_age;
+    res.cookie(kSessionCookie, sign_session(session.data, cfg.session_secret, exp), opts);
 }
 
 } // namespace lumen_script
