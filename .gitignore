@@ -7,3 +7,10 @@ build/
 # Artifacts left behind by the test suite.
 tests-suite.db*
 tests-sqlite-types.db*
+
+# Benchmark scratch data, not part of the project.
+bench
+
+# --native (COMPILACION-NATIVA.md, section 11): the .cpp/.so that
+# compile_native() generates, regenerated on every --native startup.
+.lumen-native/

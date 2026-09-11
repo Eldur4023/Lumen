@@ -84,8 +84,26 @@ private:
     off_t  file_offset_    = 0;
     size_t file_remaining_ = 0;
 
+    // ── WebSocket outbound queue ────────────────────────────────────────────
+    // Once the handshake completes, individual frames are written straight to
+    // the socket (queue_ws_write()) instead of going through write_buf_ / the
+    // request-response cycle — a WS session has no "one response" shape and
+    // is full-duplex, so on_write_complete()'s keep-alive/timeout bookkeeping
+    // does not apply to it.
+    //
+    // A write that would block is buffered here and drained by do_ws_write()
+    // on EPOLLOUT, exactly like write_buf_ is for HTTP responses — a frame
+    // either reaches the wire whole or the connection closes, it is never
+    // torn in the middle.  Capped so a peer that stops reading (deliberately
+    // or not) cannot grow this without bound; the cap sits at kMaxResponseBytes
+    // so one legitimate large ws.send() still fits without fragmenting.
+    std::string ws_write_buf_;
+    size_t      ws_write_offset_ = 0;
+
     void do_read();
     void do_write();
+    void do_ws_write();
+    void queue_ws_write(std::string frame);
     void do_sendfile();
     void on_write_complete();
 

@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "bytecode.hpp"
+#include "native_abi.hpp"
 #include "natives.hpp"
 #include "value.hpp"
 
@@ -35,10 +36,18 @@ public:
         std::vector<Value> await_args;
     };
 
-    // Starts `chunk` with `params` in the first slots.  `functions` is the
+    // Starts `chunk` with `params` in the first slots. `functions` is the
     // module's user function table; it may be null if there is none.
+    //
+    // `native` (see native_abi.hpp), indexed the same way as `functions` (by
+    // FnSig::index): a slot in `native->funcs` that isn't nullptr redirects
+    // that whole call to compiled native code, bypassing bytecode entirely.
+    // May be null (the normal case, without --native) or shorter than
+    // `functions` (functions with no entry were never compiled to native):
+    // an out-of-range index is treated the same as an empty slot.
     Result start(const Chunk& chunk, std::vector<Value> params, NativeCtx& ctx,
-                 const FunctionTable* functions = nullptr);
+                 const FunctionTable* functions = nullptr,
+                 const NativeDispatch* native = nullptr);
 
     // Continues after a suspension, leaving `awaited` as the value of the
     // `await` expression.
@@ -68,7 +77,8 @@ private:
     std::vector<Frame> frames_;
     std::vector<Value> stack_;
     std::vector<Value> locals_;
-    const FunctionTable* functions_ = nullptr;
+    const FunctionTable*  functions_ = nullptr;
+    const NativeDispatch* native_    = nullptr;
 
     Result execute(NativeCtx& ctx);
     Result run_until_error(NativeCtx& ctx);

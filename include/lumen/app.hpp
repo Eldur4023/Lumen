@@ -231,25 +231,45 @@ public:
             auto ws_state = std::make_shared<detail::WSState>();
             ws_state->token = req.cancel_token;
             ws_state->loop  = req.loop;
-            // Outbound frames: best-effort lossy write through the TLS-aware
-            // writer.  EAGAIN/partial writes drop the frame to keep the loop
-            // responsive (matches the prior plaintext behaviour).
-            auto writer = req._raw_write;
-            ws_state->send_fn = [writer](std::string frame) {
+
+            // Weak, never strong: send_fn is stored INSIDE ws_state, so
+            // capturing the shared_ptr would make the state own itself.
+            auto state_weak = std::weak_ptr<detail::WSState>(ws_state);
+
+            // Outbound frames go through the connection's own EPOLLOUT-driven
+            // queue (HttpConnection::queue_ws_write), the same idea as
+            // write_buf_ for a normal HTTP response: a write that would
+            // block gets buffered and finished later instead of torn in the
+            // middle or dropped once it has started. That is what makes
+            // backpressure ("ws.send() while the peer isn't reading") safe
+            // to hit instead of merely closing the connection on it.
+            //
+            // Fallback for a caller that sets _raw_write without
+            // _ws_queue_write (none does today; kept so a future one fails
+            // safe): best-effort, and a frame already partly on the wire
+            // that cannot be completed closes the connection rather than
+            // desynchronising the stream by writing a truncated frame.
+            auto queue_write = req._ws_queue_write;
+            auto writer       = req._raw_write;
+            ws_state->send_fn = [queue_write, writer, state_weak](std::string frame) {
+                if (queue_write) { queue_write(std::move(frame)); return; }
                 size_t w = 0;
                 while (w < frame.size()) {
                     ssize_t n = writer(frame.data() + w, frame.size() - w);
                     if (n < 0) {
                         if (errno == EINTR) continue;
-                        return;   // EAGAIN / fatal → drop remainder
+                        if (w == 0) return;   // nothing sent yet: safe to drop
+                        break;
                     }
-                    if (n == 0) return;
+                    if (n == 0) break;
                     w += static_cast<size_t>(n);
+                }
+                if (w != 0 && w < frame.size()) {
+                    if (auto s = state_weak.lock()) s->notify_closed();
                 }
             };
 
             // Incoming bytes (decrypted by HttpConnection::do_read) flow here.
-            auto state_weak = std::weak_ptr<detail::WSState>(ws_state);
             req._ws_on_data = [state_weak](const char* data, size_t len) {
                 if (auto s = state_weak.lock())
                     s->feed(reinterpret_cast<const uint8_t*>(data), len);

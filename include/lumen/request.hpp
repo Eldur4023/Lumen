@@ -47,6 +47,14 @@ public:
     // did its own ::read) so reads work over TLS too.
     std::function<void(const char*, size_t)> _ws_on_data;
 
+    // WebSocket mode: queues one already-built frame for the socket, backed
+    // by an EPOLLOUT-driven buffer instead of a single best-effort
+    // ::write(). Set by HttpConnection::dispatch(); used by WSState::send_fn
+    // instead of writing straight through _raw_write, so a frame that would
+    // otherwise be torn mid-payload by backpressure gets queued and finished
+    // in order rather than corrupting the stream.
+    std::function<void(std::string)> _ws_queue_write;
+
     // Cancellation token — shared with the HttpConnection.
     // Cancelled when the connection closes (timeout, disconnect, write error).
     // Check in long-running handlers to exit early.
