@@ -1419,6 +1419,7 @@ object to fill in and carry around the function body.
 | `return text("...")` | `200`, `text/plain` |
 | `return html("...")` | `200`, `text/html` |
 | `return send_file(path)` | The file, served with `sendfile(2)` — without copying through user space |
+| `return send_file(path, root)` | Same, but `path` is confined inside `root` (symlinks resolved, `..` rejected) |
 | `return redirect(path)` | `302` |
 | `return redirect(path, code)` | The given code, typically `301` |
 | `return status(code)` | The status code, no body |
@@ -1428,9 +1429,21 @@ object to fill in and carry around the function body.
 get endpoint("/download"):
     return send_file("/var/files/report.pdf")
 
+get endpoint("/files/:name"):
+    # :name comes from the client — send_file(path) alone would let it read
+    # anything the process can, e.g. name=/etc/passwd or name=../app.lum.
+    # The two-argument form confines it inside "./uploads" instead.
+    return send_file(name, "./uploads")
+
 get endpoint("/legacy"):
     return redirect("/new", 301)
 ```
+
+`send_file(path)` (one argument) trusts `path` completely, the same way a hardcoded string
+literal is trusted — never call it with `query(...)`, a path param, or any other value that
+came from the request. Use `send_file(path, root)` for that; `redirect(path)` has the same
+rule (a redirect target taken straight from request input, with nothing validated, is an open
+redirect).
 
 ## 44. Chaining: `status`, `header`, `cookie`
 

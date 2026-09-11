@@ -89,6 +89,15 @@ Value fn_status(NativeCtx& ctx, std::vector<Value>& args, std::string& error) {
     return Value::null();
 }
 
+// WARNING: redirect() sends its argument verbatim as the Location header —
+// including a full external URL, which is intentional (an OAuth callback, a
+// payment gateway return, a link to another site are all legitimate uses a
+// framework primitive cannot tell apart from an attacker's ?next=). It is
+// safe with a literal or with a value validated against an allowlist; it is
+// an open redirect if the target comes straight from request input
+// (query()/param()/a form field) with nothing checked — do that validation
+// in the handler, the same way the grammar guide already flags for
+// send_file(path) taking unsanitised input.
 Value fn_redirect(NativeCtx& ctx, std::vector<Value>& args, std::string& error) {
     if (!args[0].is_str()) {
         error = "redirect() expects the target as a string";
@@ -112,7 +121,22 @@ Value fn_send_file(NativeCtx& ctx, std::vector<Value>& args, std::string& error)
         error = "send_file() expects a path as a string";
         return Value::null();
     }
-    ctx.res.send_file(args[0].as_str());
+    if (args.size() == 2) {
+        // Two-argument form: send_file(path, root) confines `path` inside
+        // `root` — symlinks and ".." are resolved and checked, so a path
+        // built from request input (query(), a path param, a form field)
+        // cannot escape it.  This is the ONLY safe way to pass user input
+        // to send_file(): the one-argument form trusts the caller the same
+        // way a hardcoded literal does, and must never see unsanitised
+        // input (see the LFI note on Response::send_file in response.hpp).
+        if (!args[1].is_str()) {
+            error = "the second argument of send_file() is the root directory";
+            return Value::null();
+        }
+        ctx.res.serve_file_from(args[1].as_str(), args[0].as_str());
+    } else {
+        ctx.res.send_file(args[0].as_str());
+    }
     ctx.response_written = true;
     return Value::null();
 }
@@ -366,7 +390,7 @@ const std::array<NativeDef, 49> kNatives = {{
     {"__render_tpl", 2, 2, fn_render_tpl},
     {"status",    1, 1,  fn_status},
     {"redirect",  1, 2,  fn_redirect},
-    {"send_file", 1, 1,  fn_send_file},
+    {"send_file", 1, 2,  fn_send_file},
     // Utilities
     {"len",       1, 1,  fn_len},
     {"str",       1, 1,  fn_str},

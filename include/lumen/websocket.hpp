@@ -198,6 +198,16 @@ struct WSState {
                 fail_close(1002); return;
             }
 
+            // RFC 6455 §5.1: "The server MUST close the connection upon
+            // receiving a frame that is not masked." Every frame a client
+            // sends MUST be masked; only server->client frames are exempt.
+            // Without this, an intermediary that mis-parses the (attacker-
+            // controlled) frame boundary sees a different byte stream than
+            // this parser does — the classic WebSocket smuggling/cache-
+            // poisoning setup RFC 6455 closes off by making masking
+            // mandatory in this direction.
+            if (!masked) { fail_close(1002); return; }
+
             size_t   hdr = 2;
             uint64_t payload_len;
             if      (len7 == 126) { if (read_buf.size()<4)  break; payload_len=(uint8_t(p[2])<<8)|uint8_t(p[3]); hdr+=2; }

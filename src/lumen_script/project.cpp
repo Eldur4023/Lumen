@@ -590,34 +590,68 @@ void build_classes(const Program& program, const FunctionSigs& fns,
 // The session is a signed cookie, like in Flask: no server-side state, which
 // fits one VM per request and N event loops with nothing to synchronize.
 //
-// Format:  base64url(json) "." base64url(hmac_sha256(secret, base64url(json)))
+// Format:  exp "." base64url(json) "." base64url(hmac_sha256(secret, exp "." base64url(json)))
+//
+// `exp` (unix seconds) is signed but kept OUTSIDE the JSON payload, so it
+// never shows up as a spurious key when a handler reads `session.*` or
+// iterates the session dict — it is envelope, not application data.
+//
+// Without it, `Max-Age` on the cookie was the ONLY expiry: a client that
+// keeps an old Set-Cookie value (or an attacker who steals one) could replay
+// it forever, and `session.clear()` / logout only ever told the *browser* to
+// drop the cookie — a copy taken before that request stayed valid, HMAC and
+// all.  Rejecting on `exp` here closes that: a stolen or retained cookie
+// stops working on its own once session_max_age has passed, no rotation of
+// the secret required.
 //
 // The content is signed but NOT encrypted: the user can read it, they just
 // cannot forge it.  Nothing they should not see is kept there.
 
 constexpr const char* kSessionCookie = "lumen_session";
 
-std::string sign_session(const Value::Dict& data, const std::string& secret) {
+std::string sign_session(const Value::Dict& data, const std::string& secret,
+                         long long exp) {
+    std::string exp_str = std::to_string(exp);
     std::string payload = crypto::base64url_encode(
         Value::dict(data).to_json_text());
+    std::string signing_input = exp_str + "." + payload;
     std::string mac = crypto::base64url_encode(
-        crypto::hmac_sha256(secret, payload));
-    return payload + "." + mac;
+        crypto::hmac_sha256(secret, signing_input));
+    return signing_input + "." + mac;
 }
 
-// Returns false if the cookie is missing, malformed or the signature does not
-// match.  In any of those cases the session starts empty, never half-filled.
+// Returns false if the cookie is missing, malformed, expired, or the
+// signature does not match.  In any of those cases the session starts empty,
+// never half-filled.
 bool load_session(const std::string& cookie, const std::string& secret,
                   Value::Dict& out) {
-    size_t dot = cookie.rfind('.');
-    if (dot == std::string::npos) return false;
+    size_t dot2 = cookie.rfind('.');
+    if (dot2 == std::string::npos) return false;
+    size_t dot1 = cookie.rfind('.', dot2 - 1);
+    if (dot1 == std::string::npos) return false;
 
-    std::string payload = cookie.substr(0, dot);
-    std::string given   = cookie.substr(dot + 1);
+    std::string exp_str = cookie.substr(0, dot1);
+    std::string payload = cookie.substr(dot1 + 1, dot2 - dot1 - 1);
+    std::string given   = cookie.substr(dot2 + 1);
 
+    std::string signing_input = exp_str + "." + payload;
     std::string expected = crypto::base64url_encode(
-        crypto::hmac_sha256(secret, payload));
+        crypto::hmac_sha256(secret, signing_input));
     if (!crypto::constant_time_equal(given, expected)) return false;
+
+    // The MAC just verified proves this cookie was minted by us with this
+    // exact exp_str, so branching on its value now leaks nothing an attacker
+    // could use — they would need a valid signature to get here at all.
+    long long exp = 0;
+    try {
+        size_t consumed = 0;
+        exp = std::stoll(exp_str, &consumed);
+        if (consumed != exp_str.size()) return false;
+    } catch (...) {
+        return false;
+    }
+    const long long now = static_cast<long long>(std::time(nullptr));
+    if (now >= exp) return false;
 
     std::string json_text;
     if (!crypto::base64url_decode(payload, json_text)) return false;
@@ -726,7 +760,8 @@ void end_auth(const AuthConfig& cfg, const SessionState& session,
         return;
     }
     opts.max_age = cfg.session_max_age;
-    res.cookie(kSessionCookie, sign_session(session.data, cfg.session_secret), opts);
+    const long long exp = static_cast<long long>(std::time(nullptr)) + cfg.session_max_age;
+    res.cookie(kSessionCookie, sign_session(session.data, cfg.session_secret, exp), opts);
 }
 
 // ─── Parameter binding ───────────────────────────────────────────────────────
@@ -746,9 +781,28 @@ struct ParamBind {
 // the client sent it wrong, it is not a server failure.
 bool coerce(const std::string& text, const std::string& type, Value& out) {
     try {
-        if (type == "string")                    { out = Value::str(text); return true; }
-        if (type == "int" || type == "long")     { out = Value::integer(std::stoll(text)); return true; }
-        if (type == "float" || type == "double") { out = Value::real(std::stod(text)); return true; }
+        if (type == "string") { out = Value::str(text); return true; }
+        if (type == "int" || type == "long") {
+            // std::stoll() only requires a valid prefix, not the whole
+            // string: "42abc" silently becomes 42, and "0x10" becomes 0 (it
+            // reads the "0", stops at 'x', and reports success) since it
+            // parses base 10 unless told otherwise. Requiring the full text
+            // be consumed rejects both instead of quietly truncating input
+            // the client sent wrong — README promises no implicit coercion
+            // anywhere in the language; a route param is not an exception.
+            size_t pos = 0;
+            long long v = std::stoll(text, &pos);
+            if (pos != text.size()) return false;
+            out = Value::integer(v);
+            return true;
+        }
+        if (type == "float" || type == "double") {
+            size_t pos = 0;
+            double v = std::stod(text, &pos);
+            if (pos != text.size()) return false;
+            out = Value::real(v);
+            return true;
+        }
         if (type == "bool") {
             if (text == "true"  || text == "1") { out = Value::boolean(true);  return true; }
             if (text == "false" || text == "0") { out = Value::boolean(false); return true; }

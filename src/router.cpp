@@ -1,6 +1,7 @@
 #include "../include/lumen/router.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -75,6 +76,39 @@ static std::vector<std::string> split_path(const std::string& s) {
         if (!seg.empty()) parts.push_back(seg);
     }
     return parts;
+}
+
+// Percent-decodes one path segment bound to a `:param`.  Static segments are
+// matched as literal text on purpose (that is what makes route registration
+// predictable), so this is applied ONLY to the value handed to a handler —
+// never to the segments used for matching, which stay exactly as received.
+//
+// Without it, `GET /echo/%34%32` (which is "42") bound `id` to the literal
+// text "%34%32" instead of "42": every consumer downstream (int/float
+// coercion, a string param compared against a literal) saw percent-escapes
+// no client-facing route documents, while query() and form() — which already
+// decode — did not have the same problem.  No '+' -> ' ' folding here: that
+// convention belongs to application/x-www-form-urlencoded bodies and query
+// strings, not path segments.
+static std::string url_decode_segment(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size()) {
+            char buf[3] = {s[i + 1], s[i + 2], '\0'};
+            char* end = nullptr;
+            unsigned long v = std::strtoul(buf, &end, 16);
+            if (end == buf + 2) {
+                // Drop %00: a NUL bound into a param could desync a later
+                // C-string-based use of it from what the router matched on.
+                if (v != 0) out += static_cast<char>(v);
+                i += 2;
+                continue;
+            }
+        }
+        out += s[i];
+    }
+    return out;
 }
 
 void Router::add_internal(std::string method, std::string pattern, Handler handler) {
@@ -160,7 +194,7 @@ bool Router::match_recursive(
     // 2. Try param
     next = node->find_param_child();
     if (next) {
-        params[next->segment] = seg;
+        params[next->segment] = url_decode_segment(seg);
         if (match_recursive(next, segments, index + 1, method, params, out_handler)) {
             return true;
         }

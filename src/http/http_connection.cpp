@@ -452,15 +452,36 @@ void HttpConnection::on_write_complete() {
 }
 
 void HttpConnection::finish_cycle() {
-    // Pipelining: drain any buffered bytes that belong to the next request.
-    // Resume the parser, feed the saved bytes, and let the resulting dispatch
-    // start a fresh response cycle.  We deliberately avoid re-arming EPOLLIN
-    // here when a new dispatch fires — the next on_write_complete will do it.
-    if (parser_.is_paused()) parser_.resume();
-    if (!pending_buf_.empty()) {
+    // Pipelining: drain any buffered bytes that belong to the next request(s).
+    //
+    // Looped rather than one-shot, and the nested feed() below is bracketed
+    // with in_parser_ exactly like do_read() brackets its own feed() call.
+    // Without that bracket, a pipelined request whose handler is synchronous
+    // finishes its whole cycle *inside* this feed() call (on_message_complete
+    // -> dispatch() -> ... -> on_write_complete()), and on_write_complete()
+    // saw in_parser_ == false here and called finish_cycle() again right
+    // then and there — reentrantly, from underneath a parser_.feed() that
+    // was still on the stack (llhttp_execute() had not even returned
+    // HPE_PAUSED to its caller yet). That reentrant call resumed a parser
+    // that had not actually paused and stomped on pending_buf_ out from
+    // under the feed() call above it, which is why only the first couple of
+    // requests in a pipelined batch ever got answered and the connection
+    // wedged until the Slowloris timer killed it.
+    //
+    // With the bracket, on_write_complete() instead sets cycle_pending_ and
+    // returns (same as the top-level do_read() case), and this loop picks
+    // that up on its next iteration once the feed() call has fully unwound.
+    for (;;) {
+        if (parser_.is_paused()) parser_.resume();
+        if (pending_buf_.empty()) break;
+
         std::string buf;
         buf.swap(pending_buf_);
-        if (!parser_.feed(buf.data(), buf.size())) {
+
+        in_parser_ = true;
+        bool ok = parser_.feed(buf.data(), buf.size());
+        in_parser_ = false;
+        if (!ok) {
             send_error(parser_.body_too_large() ? 413 : 400,
                        parser_.body_too_large() ? "Content Too Large" : "Bad Request");
             close();
@@ -477,9 +498,20 @@ void HttpConnection::finish_cycle() {
                 pending_buf_.assign(buf.data() + buf.size() - un, un);
             }
         }
-        // dispatch() inside feed() flipped in_flight_ back on; defer the
-        // EPOLLIN re-arm and the Slowloris timer until that request's write
-        // completes.
+
+        // The handler was synchronous and already replied inside the feed()
+        // above: loop back around to resume the parser and drain whatever is
+        // left in pending_buf_ (set by cycle_pending_, deferred exactly like
+        // do_read() defers it for the first request in a batch).
+        if (cycle_pending_) {
+            cycle_pending_ = false;
+            continue;
+        }
+
+        // The handler suspended (awaited something): dispatch() flipped
+        // in_flight_ back on and finish_dispatch() -> ... ->
+        // on_write_complete() will call finish_cycle() itself once it
+        // resumes. Nothing left to do on this stack frame.
         if (in_flight_) return;
     }
 

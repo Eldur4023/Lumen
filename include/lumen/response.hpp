@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <cerrno>
 #include <iostream>
+#include <utility>
 #include <vector>
 #include "cookies.hpp"
 
@@ -301,8 +302,7 @@ public:
         std::ostringstream os;
         os << "HTTP/1.1 " << state_->status_code
            << ' ' << reason_phrase(state_->status_code) << "\r\n";
-        for (const auto& [k, v] : state_->headers)
-            os << k << ": " << v << "\r\n";
+        emit_headers(os);
         for (const auto& c : state_->cookies)
             os << "Set-Cookie: " << c << "\r\n";
         os << "\r\n";
@@ -318,8 +318,7 @@ public:
                     ? state_->body.size()
                     : static_cast<std::size_t>(state_->sendfile_size);
         os << "Content-Length: " << clen << "\r\n";
-        for (const auto& [k, v] : state_->headers)
-            os << k << ": " << v << "\r\n";
+        emit_headers(os);
         for (const auto& c : state_->cookies)
             os << "Set-Cookie: " << c << "\r\n";
         os << "\r\n";
@@ -330,6 +329,27 @@ public:
     }
 
 private:
+    // Every response the framework sends gets this baseline of hardening
+    // headers, unless the handler already set one explicitly — a handler
+    // that wants to frame its own content (res.header("X-Frame-Options",
+    // "SAMEORIGIN")) or set its own Referrer-Policy always wins, this only
+    // fills gaps left by handlers that set neither.  Content-Security-Policy
+    // is deliberately NOT defaulted: it is inline-script/style dependent per
+    // app, and a wrong default would silently break pages rather than
+    // protect them.
+    void emit_headers(std::ostringstream& os) const {
+        static constexpr std::pair<const char*, const char*> kDefaults[] = {
+            {"X-Content-Type-Options", "nosniff"},
+            {"X-Frame-Options",        "DENY"},
+            {"Referrer-Policy",        "strict-origin-when-cross-origin"},
+        };
+        for (const auto& [k, v] : state_->headers)
+            os << k << ": " << v << "\r\n";
+        for (const auto& [k, v] : kDefaults)
+            if (state_->headers.find(k) == state_->headers.end())
+                os << k << ": " << v << "\r\n";
+    }
+
     static bool is_template_name(const std::string& s) {
         if (s.empty() || s.find('\n') != std::string::npos) return false;
         if (s.find('<') != std::string::npos) return false;
