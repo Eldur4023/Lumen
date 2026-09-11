@@ -121,6 +121,18 @@ public:
         return *this;
     }
 
+    // The argument is ALWAYS the response body, never a filename.
+    //
+    // This used to sniff the content: a string ending in ".html"/".htm" with
+    // no '<' in it was taken for a template name and read off disk from
+    // templates_dir instead of being sent.  That made the behaviour depend on
+    // the *value*, so a handler doing html(query("c")) — content the client
+    // controls — flipped between "send this string" and "read this file"
+    // based on what the client sent, and `?c=page.html` came back with the
+    // raw source of a template rather than the text.  Nothing in the language
+    // or the C++ API documented that branch, and no caller used it: templates
+    // go through render() (resolved to a compile-time index, so a name can
+    // never come from a request) and files through send_file().
     Response& html(const std::string& content) {
         if (state_->body_committed) {
             std::cerr << "[lumen] Response.html() called after body already committed — ignoring\n";
@@ -128,39 +140,7 @@ public:
         }
         header("Content-Type", "text/html; charset=utf-8");
         state_->body_committed = true;
-        if (is_template_name(content)) {
-            namespace fs = std::filesystem;
-            // Reject traversal/absolute paths: html("../../etc/passwd.html") would
-            // otherwise read arbitrary files reachable from the templates dir.
-            fs::path requested(content);
-            if (requested.is_absolute()) {
-                state_->status_code = 403;
-                state_->body = R"({"error":"Forbidden"})";
-                state_->headers["Content-Type"] = "application/json; charset=utf-8";
-                return *this;
-            }
-            for (const auto& comp : requested) {
-                if (comp == "..") {
-                    state_->status_code = 403;
-                    state_->body = R"({"error":"Forbidden"})";
-                    state_->headers["Content-Type"] = "application/json; charset=utf-8";
-                    return *this;
-                }
-            }
-            fs::path path = fs::path(state_->templates_dir) / requested;
-            std::ifstream f(path, std::ios::binary);
-            if (!f) {
-                std::cerr << "[lumen] template not found: " << path.string() << '\n';
-                state_->status_code = 500;
-                state_->body = R"({"error":"Internal Server Error"})";
-                state_->headers["Content-Type"] = "application/json; charset=utf-8";
-                return *this;
-            }
-            state_->body = std::string(std::istreambuf_iterator<char>(f),
-                                       std::istreambuf_iterator<char>());
-        } else {
-            state_->body = content;
-        }
+        state_->body = content;
         return *this;
     }
 
@@ -348,12 +328,6 @@ private:
         for (const auto& [k, v] : kDefaults)
             if (state_->headers.find(k) == state_->headers.end())
                 os << k << ": " << v << "\r\n";
-    }
-
-    static bool is_template_name(const std::string& s) {
-        if (s.empty() || s.find('\n') != std::string::npos) return false;
-        if (s.find('<') != std::string::npos) return false;
-        return s.ends_with(".html") || s.ends_with(".htm");
     }
 
     static const char* reason_phrase(int code) noexcept {

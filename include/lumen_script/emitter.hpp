@@ -138,6 +138,7 @@ private:
     // over-specializing would be a bug.
     bool is_int_expr(const Expr& e) const;
     static void flatten_concat(const Expr& e, std::vector<const Expr*>& out);
+    static bool looks_like_direct_request_data(const Expr& e);
     int  resolve_local(const std::string& name) const;
     void begin_scope();
     void end_scope();

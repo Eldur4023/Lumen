@@ -107,7 +107,17 @@ void HttpConnection::on_event(uint32_t events) {
 
     // While write_buf_ has data, only EPOLLOUT is armed.
     // Once the buffer is drained, EPOLLIN is re-armed (see on_write_complete).
-    if (events & EPOLLOUT) do_write();
+    //
+    // WS mode is full-duplex — EPOLLIN stays armed alongside EPOLLOUT while a
+    // frame is backed up (see queue_ws_write()) — so telling the two writers
+    // apart has to happen here rather than by "which events fired": _ws_on_data
+    // is the same signal do_read() already uses to route incoming bytes to the
+    // WS parser instead of the HTTP one, set for the whole WS session and
+    // cleared only in close().
+    if (events & EPOLLOUT) {
+        if (auto req = current_req_.lock(); req && req->_ws_on_data) do_ws_write();
+        else                                                         do_write();
+    }
     if (events & EPOLLIN)  do_read();
 }
 
@@ -216,6 +226,9 @@ void HttpConnection::dispatch(ParsedRequest req_parsed) {
         req_ptr->_raw_write = [self](const char* data, size_t len) -> ssize_t {
             if (self->closed_) { errno = EBADF; return -1; }
             return ::write(self->fd_, data, len);
+        };
+        req_ptr->_ws_queue_write = [self](std::string frame) {
+            self->queue_ws_write(std::move(frame));
         };
     }
 
@@ -409,6 +422,79 @@ void HttpConnection::do_write() {
     if (file_fd_ >= 0) { do_sendfile(); return; }
 
     on_write_complete();
+}
+
+// ── WebSocket write path ─────────────────────────────────────────────────────
+//
+// Mirrors do_write()/send_response() but stays independent of them on
+// purpose: a WS session has no request/response cycle to close (no
+// keep-alive decision, no timeout to cancel), it just has frames that need
+// to reach the wire in order and whole.
+
+void HttpConnection::do_ws_write() {
+    while (ws_write_offset_ < ws_write_buf_.size()) {
+        ssize_t n = ::write(fd_,
+                            ws_write_buf_.data() + ws_write_offset_,
+                            ws_write_buf_.size() - ws_write_offset_);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;  // EPOLLOUT stays armed
+            if (errno == EINTR) continue;
+            close(); return;
+        }
+        if (n == 0) { close(); return; }
+        ws_write_offset_ += static_cast<size_t>(n);
+    }
+
+    ws_write_buf_.clear();
+    ws_write_offset_ = 0;
+
+    // Fully drained: back to read-only interest. Reading (incoming WS
+    // frames, including a Close from the peer) never stopped while this was
+    // draining — EPOLLIN stayed armed the whole time, see queue_ws_write().
+    loop_.modify(fd_, EPOLLIN);
+}
+
+// Queues one already-built frame for the socket. Tries an immediate write
+// first — the common case, most frames are small and the send buffer is
+// usually free — and only falls back to buffering on backpressure.
+//
+// Ordering matters here as much as it does in send_response(): if anything
+// is already queued, this frame goes on the end of it rather than racing a
+// second ::write() against do_ws_write()'s drain of the first.
+void HttpConnection::queue_ws_write(std::string frame) {
+    if (closed_) return;
+
+    if (!ws_write_buf_.empty()) {
+        if (ws_write_buf_.size() - ws_write_offset_ + frame.size() > kMaxResponseBytes) {
+            // The peer is not draining even with EPOLLOUT backing this up —
+            // continuing to buffer would just be unbounded growth driven by
+            // however many times the handler calls ws.send().
+            close();
+            return;
+        }
+        ws_write_buf_ += frame;
+        return;
+    }
+
+    ssize_t n = ::write(fd_, frame.data(), frame.size());
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            ws_write_buf_    = std::move(frame);
+            ws_write_offset_ = 0;
+            loop_.modify(fd_, EPOLLIN | EPOLLOUT);
+            return;
+        }
+        close();
+        return;
+    }
+    if (n == 0) { close(); return; }
+
+    size_t written = static_cast<size_t>(n);
+    if (written == frame.size()) return;  // whole frame out, nothing to queue
+
+    ws_write_buf_    = std::move(frame);
+    ws_write_offset_ = written;
+    loop_.modify(fd_, EPOLLIN | EPOLLOUT);
 }
 
 void HttpConnection::do_sendfile() {

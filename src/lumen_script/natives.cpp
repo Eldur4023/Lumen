@@ -1,5 +1,6 @@
 #include <lumen_script/natives.hpp>
 #include <lumen_script/template.hpp>
+#include <lumen_script/crypto.hpp>
 
 #include <lumen/request.hpp>
 #include <lumen/response.hpp>
@@ -10,8 +11,12 @@
 
 #include <array>
 #include <cctype>
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace lumen_script {
 
@@ -511,6 +516,25 @@ std::string safe_name(const std::string& raw) {
     return base;
 }
 
+std::string to_hex(const std::string& raw) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(raw.size() * 2);
+    for (unsigned char c : raw) {
+        out += kHex[c >> 4];
+        out += kHex[c & 0xF];
+    }
+    return out;
+}
+
+// Splits "name.ext" into {"name", ".ext"}. No dot, or a dot-only hidden
+// file like ".bashrc", keeps the whole thing as the stem and an empty ext.
+std::pair<std::string, std::string> split_ext(const std::string& name) {
+    auto dot = name.find_last_of('.');
+    if (dot == std::string::npos || dot == 0) return {name, ""};
+    return {name.substr(0, dot), name.substr(dot)};
+}
+
 } // namespace
 
 Value call_method(NativeCtx& ctx, Value& recv, const std::string& name,
@@ -634,12 +658,51 @@ Value call_method(NativeCtx& ctx, Value& recv, const std::string& name,
             std::error_code ec;
             std::filesystem::create_directories(dir, ec);
 
-            std::ofstream out(dir + base, std::ios::binary);
-            if (!out) { error = "cannot write to " + dir + base; return Value::null(); }
+            // `filename` is whatever the client sent: two uploads can
+            // legitimately pick the same name, and an attacker can pick one
+            // on purpose (index.html, another user's upload, a file this
+            // route itself serves back). O_CREAT|O_EXCL — instead of
+            // checking exists() and then opening — makes "does this name
+            // already exist" and "claim it" one atomic step, so a
+            // concurrent save() for the same name can't win a TOCTOU race
+            // and get its bytes silently clobbered by this call either. On
+            // a collision the name gets a random suffix before the
+            // extension and this retries with a fresh one, bounded, rather
+            // than ever overwriting what is already there.
+            auto [stem, ext] = split_ext(base);
+            std::string final_name;
+            int fd = -1;
+            for (int attempt = 0; attempt < 6 && fd < 0; ++attempt) {
+                std::string candidate = (attempt == 0)
+                    ? base
+                    : stem + "-" + to_hex(crypto::random_bytes(4)) + ext;
+                fd = ::open((dir + candidate).c_str(),
+                            O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0644);
+                if (fd >= 0) { final_name = candidate; break; }
+                if (errno != EEXIST) {
+                    error = "cannot write to " + dir + candidate + ": " + std::strerror(errno);
+                    return Value::null();
+                }
+            }
+            if (fd < 0) {
+                error = "save(): could not find a free name for '" + base + "' in " + dir;
+                return Value::null();
+            }
+
             const std::string& bytes = (*ctx.parts)[i].body;
-            out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-            if (!out) { error = "fallo al write " + dir + base; return Value::null(); }
-            return Value::str(base);
+            size_t written = 0;
+            while (written < bytes.size()) {
+                ssize_t n = ::write(fd, bytes.data() + written, bytes.size() - written);
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    ::close(fd);
+                    error = "fallo al write " + dir + final_name + ": " + std::strerror(errno);
+                    return Value::null();
+                }
+                written += static_cast<size_t>(n);
+            }
+            ::close(fd);
+            return Value::str(final_name);
         }
 
         if (name == "has") {

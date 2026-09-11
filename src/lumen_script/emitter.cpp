@@ -1,6 +1,7 @@
 #include <lumen_script/emitter.hpp>
 #include <fstream>
 #include <filesystem>
+#include <iostream>
 #include <lumen_script/template.hpp>
 #include <lumen_script/natives.hpp>
 
@@ -59,6 +60,26 @@ void Emitter::flatten_concat(const Expr& e, std::vector<const Expr*>& out) {
         return;
     }
     out.push_back(&e);
+}
+
+// True if `e` IS, or is built by concatenating in, a direct call to
+// query()/header() — the two builtins that hand back exactly what the
+// client sent, unvalidated. No dataflow tracking: assigning the result to a
+// local first (`string next = query("next")`) is not caught, on purpose —
+// that shape at least gives the developer a place to put a check before the
+// value reaches redirect(). This only catches the literal, unguarded splice,
+// which is also the only shape with no legitimate reading.
+bool Emitter::looks_like_direct_request_data(const Expr& e) {
+    if (e.kind == ExprKind::Call && e.object &&
+        e.object->kind == ExprKind::Ident &&
+        (e.object->text == "query" || e.object->text == "header")) {
+        return true;
+    }
+    if (e.kind == ExprKind::Binary && e.text == "+" && e.lhs && e.rhs) {
+        return looks_like_direct_request_data(*e.lhs) ||
+               looks_like_direct_request_data(*e.rhs);
+    }
+    return false;
 }
 
 int Emitter::resolve_local(const std::string& name) const {
@@ -896,6 +917,52 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
                              "(...)'");
                 return;
             }
+
+            // Gluing a value into the SQL string is the one way left to
+            // reintroduce injection in an API that is parameterised by
+            // default: query()/exec() take the values as extra arguments and
+            // bind them through the driver (sqlite3_bind_*, PQexecParams,
+            // mysql_stmt_bind_param), and a '+' with a non-literal operand
+            // walks straight past all of it.
+            if ((e.object->text == "query" || e.object->text == "exec") &&
+                !e.args.empty() && e.args[0].value &&
+                e.args[0].value->kind == ExprKind::Binary &&
+                e.args[0].value->text == "+") {
+
+                // Unambiguous case: query()/header() spliced straight into
+                // the SQL text with nothing in between. There is no reading
+                // of this that isn't the injection — hard error, same as
+                // redirect() above.
+                if (looks_like_direct_request_data(*e.args[0].value)) {
+                    error(e.args[0].value->loc,
+                          "request data glued directly into SQL text in '" + obj + "." +
+                          e.object->text + "()' — this is SQL injection. Pass the "
+                          "value as an extra argument and write '?' in the query "
+                          "instead: it goes through the driver's bind, not the "
+                          "string.");
+                    return;
+                }
+
+                // Everything else that concatenates in a non-literal is only
+                // a warning: '... in (' + marks + ')' with a placeholder
+                // list built at runtime is legitimate and has no other
+                // spelling, so refusing to compile it would be wrong.
+                // Concatenating only string literals is left alone too —
+                // that is just a long query split over several lines.
+                std::vector<const Expr*> partes;
+                flatten_concat(*e.args[0].value, partes);
+                bool interpolado = false;
+                for (const Expr* p : partes)
+                    if (p->kind != ExprKind::StringLit) { interpolado = true; break; }
+                if (interpolado) {
+                    const SourceLoc& l = e.args[0].value->loc;
+                    std::cerr << "lumen: warning: " << (l.file ? *l.file : "?")
+                              << ":" << l.line << ":" << l.col
+                              << ": SQL built by concatenation in '" << obj << '.'
+                              << e.object->text << "()'; pass the value as an argument "
+                                 "and write '?' in the query, or it goes in unescaped\n";
+                }
+            }
             chunk_->emit(Op::Const, e.loc, chunk_->add_constant(Value::str(obj)));
             size_t argc = 1;
             for (const auto& a : e.args) {
@@ -1071,6 +1138,25 @@ void Emitter::emit_call(const Expr& e, bool awaited) {
     }
 
     const NativeDef& def = native_at(id);
+
+    // redirect(query("next")) / redirect(header("referer") + "/x") is the
+    // textbook open redirect: whatever the client sends becomes the
+    // Location header verbatim. There is no legitimate reason to splice
+    // query()/header() straight into a redirect target — a route that
+    // genuinely needs to bounce somewhere request-dependent validates it
+    // first (an allowlist, an if/else over a fixed set of literals) and
+    // hands redirect() the already-checked local variable, which this does
+    // not flag. redirect(path, code) — a hardcoded/config-derived target,
+    // by far the common case — is untouched.
+    if (name == "redirect" && !e.args.empty() && e.args[0].value &&
+        looks_like_direct_request_data(*e.args[0].value)) {
+        error(e.loc, "redirect() target comes straight from query()/header(): "
+                     "an attacker controls it and can point it anywhere "
+                     "('open redirect'). Validate it first (compare against an "
+                     "allowlist or a fixed set of literals) and pass that "
+                     "checked value instead.");
+        return;
+    }
 
     // A builtin that suspends forces you to await it, and one that does not
     // will not accept await: that way the call signature always says whether
