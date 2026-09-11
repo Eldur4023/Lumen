@@ -4,7 +4,7 @@
 #include <lumen_script/parser.hpp>
 #include <lumen_script/emitter.hpp>
 #include <lumen_script/vm.hpp>
-#include <lumen_script/crypto.hpp>
+#include <lumen_script/auth.hpp>
 #include <lumen_script/db.hpp>
 
 #include <lumen/request.hpp>
@@ -18,7 +18,8 @@
 
 #include <algorithm>
 #include <cctype>
-#include <ctime>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <fstream>
@@ -81,6 +82,34 @@ std::string format_errors(const DiagnosticBag& diags,
 // that has to be computed, the route needs the VM and that is another milestone.
 
 namespace {
+
+// --native phase 1 (COMPILACION-NATIVA.md): for ONE specific call to
+// emit_route/emit_function/emit_method/emit_ctor/emit_error_handler/
+// emit_condition, compares the diagnostics it added against what its check_*
+// equivalent gives. Purely observational — never touches `diags`, never
+// changes the result of a real compilation — so it only runs if
+// LUMEN_SHADOW_CHECK is set in the environment: zero cost on the normal
+// path. It is the canary that validates, before taking the step of turning
+// emit_expr/emit_stmt/emit_call into IR consumers and stripping their own
+// checks, that check_expr/check_stmt keep reproducing the real compilation
+// on organic .lum programs too (not just the hand-written cases in
+// tests/check_*_shadow.cpp).
+bool shadow_check_enabled() {
+    static const bool v = std::getenv("LUMEN_SHADOW_CHECK") != nullptr;
+    return v;
+}
+
+void shadow_compare(const char* label, const DiagnosticBag& diags, size_t before,
+                    const DiagnosticBag& shadow) {
+    if (!shadow_check_enabled()) return;
+    std::vector<std::string> real, shadow_msgs;
+    for (size_t i = before; i < diags.items().size(); ++i) real.push_back(diags.items()[i].message);
+    for (const auto& it : shadow.items()) shadow_msgs.push_back(it.message);
+    if (real == shadow_msgs) return;
+    std::fprintf(stderr, "[shadow-check] discrepancy in %s\n", label);
+    for (const auto& m : real)       std::fprintf(stderr, "  real:   %s\n", m.c_str());
+    for (const auto& m : shadow_msgs) std::fprintf(stderr, "  shadow: %s\n", m.c_str());
+}
 
 // Lumen Script type name for an already built value.  Used where the data is
 // constant and therefore its type is exact.
@@ -414,83 +443,40 @@ Value db_error(const std::string& msg) {
 // The first argument is always the module name, which the emitter pushes.
 // An engine failure does not blow up the handler: it arrives as a value with
 // `error`, which the .lum can inspect or ignore.
+//
+// Thin adapter over lumen_script::await_db() (db.hpp/db.cpp) — the real
+// logic (resolving the driver/pool, deciding the pinned worker, invoking
+// DbAwaitable, updating pinned_workers/last_exec_workers) lives there,
+// shared with the code that generates a --native route for the same thing:
+// both paths run EXACTLY the same code, not a separate reproduction that
+// could silently diverge (the same class of bug that already caused two
+// critical fixes in this phase).
 lumen::Task<Value> run_db(const VM::Result& r, int op, lumen::Request& req,
                            NativeCtx& ctx) {
     if (r.await_args.empty() || !r.await_args[0].is_str())
-        co_return db_error("consulta mal formada");
+        co_return db_error("malformed query");
 
     const std::string mod = r.await_args[0].as_str();
 
-    auto& reg    = DbRegistry::instance();
-    auto* driver = reg.active(mod);
-    auto* pool   = reg.pool(mod);
-    if (!driver || !pool)
-        co_return db_error("module '" + mod + "' is not configured: "
-                           "its block is missing from app:");
+    DbOp dbop = DbOp::Rollback;
+    if      (op == async_db_query_id())  dbop = DbOp::Query;
+    else if (op == async_db_exec_id())   dbop = DbOp::Exec;
+    else if (op == async_db_last_id())   dbop = DbOp::LastId;
+    else if (op == async_db_begin_id())  dbop = DbOp::Begin;
+    else if (op == async_db_commit_id()) dbop = DbOp::Commit;
 
-    bool needs_sql = (op == async_db_query_id() || op == async_db_exec_id());
     std::string sql;
     std::vector<Value> params;
-    if (needs_sql) {
+    if (dbop == DbOp::Query || dbop == DbOp::Exec) {
         if (r.await_args.size() < 2 || !r.await_args[1].is_str())
             co_return db_error("missing the SQL query");
         sql    = r.await_args[1].as_str();
         params = std::vector<Value>(r.await_args.begin() + 2, r.await_args.end());
     }
 
-    // Inside a transaction, everything goes through the connection that opened it.
-    int  pin   = -1;
-    auto pinit = ctx.pinned_workers.find(mod);
-    if (pinit != ctx.pinned_workers.end()) pin = pinit->second;
-
-    // last_id() is routed to the connection of the last exec: the generated
-    // identifier does not exist on the others.
-    if (pin < 0 && op == async_db_last_id()) {
-        auto le = ctx.last_exec_workers.find(mod);
-        if (le != ctx.last_exec_workers.end()) pin = le->second;
-    }
-
-    auto result   = std::make_shared<Value>(Value::null());
-    auto errmsg   = std::make_shared<std::string>();
-    auto used     = std::make_shared<int>(-1);
-
-    co_await DbAwaitable{pool, req.loop,
-        [driver, sql, params, op, result, errmsg, used](size_t worker) {
-            *used = static_cast<int>(worker);
-            std::string err;
-            if (!driver->open(worker, err)) { *errmsg = err; return; }
-
-            long long n = 0;
-            if (op == async_db_query_id()) {
-                Value rows;
-                if (!driver->query(worker, sql, params, rows, err)) { *errmsg = err; return; }
-                *result = std::move(rows);
-            } else if (op == async_db_exec_id()) {
-                if (!driver->exec(worker, sql, params, n, err)) { *errmsg = err; return; }
-                *result = Value::integer(n);
-            } else if (op == async_db_last_id()) {
-                if (!driver->last_insert_id(worker, n, err)) { *errmsg = err; return; }
-                *result = Value::integer(n);
-            } else {
-                const char* stmt = (op == async_db_begin_id())    ? "BEGIN"
-                                 : (op == async_db_commit_id())   ? "COMMIT"
-                                                                  : "ROLLBACK";
-                if (!driver->exec(worker, stmt, {}, n, err)) { *errmsg = err; return; }
-                *result = Value::boolean(true);
-            }
-        },
-        pin};
-
-    if (!errmsg->empty()) co_return db_error(*errmsg);
-
-    if (op == async_db_exec_id()) ctx.last_exec_workers[mod] = *used;
-
-    // The transaction pins its connection when it opens and releases it on close.
-    if (op == async_db_begin_id())       ctx.pinned_workers[mod] = *used;
-    else if (op == async_db_commit_id() ||
-             op == async_db_rollback_id()) ctx.pinned_workers.erase(mod);
-
-    co_return std::move(*result);
+    Value v = co_await await_db(dbop, mod, req.loop, sql, std::move(params),
+                                ctx.pinned_workers, ctx.last_exec_workers);
+    co_return v;
 }
 
 // Closes the transactions the handler left open.
@@ -499,26 +485,7 @@ lumen::Task<Value> run_db(const VM::Result& r, int op, lumen::Request& req,
 // connection inside a transaction forever, and whoever took it from the pool
 // next would inherit that state.
 lumen::Task<void> rollback_pendientes(NativeCtx& ctx, lumen::Request& req) {
-    if (ctx.pinned_workers.empty()) co_return;
-
-    auto pendientes = ctx.pinned_workers;
-    for (const auto& [mod, worker] : pendientes) {
-        auto& reg    = DbRegistry::instance();
-        auto* driver = reg.active(mod);
-        auto* pool   = reg.pool(mod);
-        if (!driver || !pool) continue;
-
-        lumen::log().warn("transaction on '" + mod + "' without commit or rollback: "
-                           "rolling back");
-        co_await DbAwaitable{pool, req.loop,
-            [driver](size_t w) {
-                long long n = 0;
-                std::string err;
-                driver->exec(w, "ROLLBACK", {}, n, err);
-            },
-            worker};
-    }
-    ctx.pinned_workers.clear();
+    co_await rollback_pendientes_db(ctx.pinned_workers, req.loop);
 }
 
 // ─── Classes ─────────────────────────────────────────────────────────────────
@@ -577,7 +544,13 @@ void build_classes(const Program& program, const FunctionSigs& fns,
         for (const auto& r : c.rules) {
             auto    chunk = std::make_shared<Chunk>();
             Emitter emitter(diags, &fns, &sigs, imports);
+            size_t  antes = diags.size();
             if (!emitter.emit_condition(*r.condition, field_names, *chunk)) continue;
+            if (shadow_check_activo()) {
+                DiagnosticBag shadow;
+                emitter.check_condition(*r.condition, field_names, *chunk, shadow);
+                shadow_comparar("validate", diags, antes, shadow);
+            }
             info->rules.push_back({chunk, r.message});
         }
 
@@ -585,184 +558,14 @@ void build_classes(const Program& program, const FunctionSigs& fns,
     }
 }
 
-// ─── Signed session and JWT ──────────────────────────────────────────────────
-//
-// The session is a signed cookie, like in Flask: no server-side state, which
-// fits one VM per request and N event loops with nothing to synchronize.
-//
-// Format:  exp "." base64url(json) "." base64url(hmac_sha256(secret, exp "." base64url(json)))
-//
-// `exp` (unix seconds) is signed but kept OUTSIDE the JSON payload, so it
-// never shows up as a spurious key when a handler reads `session.*` or
-// iterates the session dict — it is envelope, not application data.
-//
-// Without it, `Max-Age` on the cookie was the ONLY expiry: a client that
-// keeps an old Set-Cookie value (or an attacker who steals one) could replay
-// it forever, and `session.clear()` / logout only ever told the *browser* to
-// drop the cookie — a copy taken before that request stayed valid, HMAC and
-// all.  Rejecting on `exp` here closes that: a stolen or retained cookie
-// stops working on its own once session_max_age has passed, no rotation of
-// the secret required.
-//
-// The content is signed but NOT encrypted: the user can read it, they just
-// cannot forge it.  Nothing they should not see is kept there.
-
-constexpr const char* kSessionCookie = "lumen_session";
-
-std::string sign_session(const Value::Dict& data, const std::string& secret,
-                         long long exp) {
-    std::string exp_str = std::to_string(exp);
-    std::string payload = crypto::base64url_encode(
-        Value::dict(data).to_json_text());
-    std::string signing_input = exp_str + "." + payload;
-    std::string mac = crypto::base64url_encode(
-        crypto::hmac_sha256(secret, signing_input));
-    return signing_input + "." + mac;
-}
-
-// Returns false if the cookie is missing, malformed, expired, or the
-// signature does not match.  In any of those cases the session starts empty,
-// never half-filled.
-bool load_session(const std::string& cookie, const std::string& secret,
-                  Value::Dict& out) {
-    size_t dot2 = cookie.rfind('.');
-    if (dot2 == std::string::npos) return false;
-    size_t dot1 = cookie.rfind('.', dot2 - 1);
-    if (dot1 == std::string::npos) return false;
-
-    std::string exp_str = cookie.substr(0, dot1);
-    std::string payload = cookie.substr(dot1 + 1, dot2 - dot1 - 1);
-    std::string given   = cookie.substr(dot2 + 1);
-
-    std::string signing_input = exp_str + "." + payload;
-    std::string expected = crypto::base64url_encode(
-        crypto::hmac_sha256(secret, signing_input));
-    if (!crypto::constant_time_equal(given, expected)) return false;
-
-    // The MAC just verified proves this cookie was minted by us with this
-    // exact exp_str, so branching on its value now leaks nothing an attacker
-    // could use — they would need a valid signature to get here at all.
-    long long exp = 0;
-    try {
-        size_t consumed = 0;
-        exp = std::stoll(exp_str, &consumed);
-        if (consumed != exp_str.size()) return false;
-    } catch (...) {
-        return false;
-    }
-    const long long now = static_cast<long long>(std::time(nullptr));
-    if (now >= exp) return false;
-
-    std::string json_text;
-    if (!crypto::base64url_decode(payload, json_text)) return false;
-
-    Value v;
-    if (!Value::parse_json(json_text, v) || !v.is_dict()) return false;
-    out = v.as_dict();
-    return true;
-}
-
-// Verifies an HS256 JWT and returns the claims.
-//
-// It checks alg, signature and expiry.  A token with alg "none", or with RS256
-// when we expect HS256, is rejected: accepting whatever alg the token names is
-// the classic JWT library vulnerability.
-bool verify_jwt(const std::string& token, const std::string& secret,
-                const std::string& issuer, Value& claims_out) {
-    size_t p1 = token.find('.');
-    if (p1 == std::string::npos) return false;
-    size_t p2 = token.find('.', p1 + 1);
-    if (p2 == std::string::npos) return false;
-
-    std::string signing_input = token.substr(0, p2);
-    std::string given_sig     = token.substr(p2 + 1);
-
-    std::string expected = crypto::base64url_encode(
-        crypto::hmac_sha256(secret, signing_input));
-    if (!crypto::constant_time_equal(given_sig, expected)) return false;
-
-    std::string header_text, payload_text;
-    if (!crypto::base64url_decode(token.substr(0, p1), header_text)) return false;
-    if (!crypto::base64url_decode(token.substr(p1 + 1, p2 - p1 - 1), payload_text))
-        return false;
-
-    Value header;
-    if (!Value::parse_json(header_text, header) || !header.is_dict()) return false;
-    {
-        auto it = header.as_dict().find("alg");
-        if (it == header.as_dict().end() || !it->second.is_str() ||
-            it->second.as_str() != "HS256")
-            return false;
-    }
-
-    Value payload;
-    if (!Value::parse_json(payload_text, payload) || !payload.is_dict()) return false;
-
-    if (auto it = payload.as_dict().find("exp");
-        it != payload.as_dict().end() && it->second.is_num()) {
-        const long long now = static_cast<long long>(std::time(nullptr));
-        if (static_cast<long long>(it->second.as_float()) < now) return false;
-    }
-    if (!issuer.empty()) {
-        auto it = payload.as_dict().find("iss");
-        if (it != payload.as_dict().end() &&
-            (!it->second.is_str() || it->second.as_str() != issuer))
-            return false;
-    }
-
-    claims_out = std::move(payload);
-    return true;
-}
-
-// Authentication configuration each handler needs at runtime.
-struct AuthConfig {
-    std::string session_secret;
-    int         session_max_age = 86400;
-    bool        session_secure  = true;
-    std::string jwt_secret;
-    std::string jwt_issuer;
-};
-
-// Prepares session and claims before running the handler.
-void begin_auth(const AuthConfig& cfg, lumen::Request& req,
-                SessionState& session, Value& claims, NativeCtx& ctx) {
-    session.secret = cfg.session_secret;
-    if (!cfg.session_secret.empty()) {
-        auto cookie = req.cookie(kSessionCookie);
-        if (cookie) load_session(*cookie, cfg.session_secret, session.data);
-        session.loaded = true;
-    }
-    ctx.session = &session;
-
-    if (!cfg.jwt_secret.empty()) {
-        auto auth = req.header("authorization");
-        if (auth && auth->rfind("Bearer ", 0) == 0) {
-            ctx.jwt_ok = verify_jwt(auth->substr(7), cfg.jwt_secret,
-                                    cfg.jwt_issuer, claims);
-        }
-    }
-    ctx.jwt_claims = &claims;
-}
-
-// Rewrites the cookie only if the handler touched the session.
-void end_auth(const AuthConfig& cfg, const SessionState& session,
-              lumen::Response& res) {
-    if (!session.dirty || cfg.session_secret.empty()) return;
-
-    lumen::CookieOptions opts;
-    opts.path      = "/";
-    opts.http_only = true;                 // JS cannot read it
-    opts.secure    = cfg.session_secure;
-    opts.same_site = lumen::SameSite::Lax;
-
-    if (session.data.empty()) {
-        res.clear_cookie(kSessionCookie, opts);
-        return;
-    }
-    opts.max_age = cfg.session_max_age;
-    const long long exp = static_cast<long long>(std::time(nullptr)) + cfg.session_max_age;
-    res.cookie(kSessionCookie, sign_session(session.data, cfg.session_secret, exp), opts);
-}
+// Session signing/verification and JWT (sign_session, load_session,
+// verify_jwt, AuthConfig, begin_auth, end_auth) live in
+// include/lumen_script/auth.hpp + src/lumen_script/auth.cpp: any backend
+// that runs Lumen Script routes needs it, not just this VM (see
+// COMPILACION-NATIVA.md, phase 0) — and it is also where the session-cookie
+// expiry lives (`exp` signed alongside the payload, checked in
+// load_session): see the comment there for why a session that never expires
+// on its own was a real bug, not just a hardening nice-to-have.
 
 // ─── Parameter binding ───────────────────────────────────────────────────────
 
@@ -1370,13 +1173,25 @@ void emit_class_bodies(Module& mod, const ClassSigs& classes, const FunctionSigs
             auto ms = sig.methods.find(m.name);
             if (ms == sig.methods.end()) continue;
             Emitter emitter(diags, &fns, &classes, imports);
+            size_t  antes = diags.size();
             emitter.emit_method(c.name, m, *mod.functions[ms->second.index]);
+            if (shadow_check_activo()) {
+                DiagnosticBag shadow;
+                emitter.check_method(c.name, m, *mod.functions[ms->second.index], shadow);
+                shadow_comparar(("metodo " + c.name + "." + m.name).c_str(), diags, antes, shadow);
+            }
         }
         for (const auto& ct : c.ctors) {
             auto cs = sig.ctors.find(ct.params.size());
             if (cs == sig.ctors.end()) continue;
             Emitter emitter(diags, &fns, &classes, imports);
+            size_t  antes = diags.size();
             emitter.emit_ctor(c.name, sig.fields, ct, *mod.functions[cs->second]);
+            if (shadow_check_activo()) {
+                DiagnosticBag shadow;
+                emitter.check_ctor(c.name, sig.fields, ct, *mod.functions[cs->second], shadow);
+                shadow_comparar(("constructor " + c.name).c_str(), diags, antes, shadow);
+            }
         }
 
         // The implicit constructor: a synthetic CtorDecl with one parameter per
@@ -1394,8 +1209,16 @@ void emit_class_bodies(Module& mod, const ClassSigs& classes, const FunctionSigs
             auto cs = sig.ctors.find(c.fields.size());
             if (cs != sig.ctors.end()) {
                 Emitter emitter(diags, &fns, &classes, imports);
+                size_t  antes = diags.size();
                 emitter.emit_ctor(c.name, sig.fields, implicito,
                                   *mod.functions[cs->second]);
+                if (shadow_check_activo()) {
+                    DiagnosticBag shadow;
+                    emitter.check_ctor(c.name, sig.fields, implicito, *mod.functions[cs->second],
+                                       shadow);
+                    shadow_comparar(("constructor implicito " + c.name).c_str(), diags, antes,
+                                    shadow);
+                }
             }
         }
     }
@@ -1419,7 +1242,13 @@ FunctionSigs build_functions(Module& mod, DiagnosticBag& diags) {
         auto it = index.find(f.name);
         if (it == index.end()) continue;
         Emitter emitter(diags, &index, nullptr, &mod.program.imports);
+        size_t  antes = diags.size();
         emitter.emit_function(f, *mod.functions[it->second.index]);
+        if (shadow_check_activo()) {
+            DiagnosticBag shadow;
+            emitter.check_function(f, *mod.functions[it->second.index], shadow);
+            shadow_comparar(("funcion " + f.name).c_str(), diags, antes, shadow);
+        }
     }
     return index;
 }
@@ -1431,7 +1260,13 @@ void build_error_handlers(Module& mod, const FunctionSigs& fns,
     for (const auto& e : mod.program.errors) {
         auto    chunk = std::make_shared<Chunk>();
         Emitter emitter(diags, &fns, &sigs, &mod.program.imports, &pctx);
+        size_t  antes = diags.size();
         if (!emitter.emit_error_handler(e, *chunk)) continue;
+        if (shadow_check_activo()) {
+            DiagnosticBag shadow;
+            emitter.check_error_handler(e, *chunk, shadow);
+            shadow_comparar(("on error " + std::to_string(e.code)).c_str(), diags, antes, shadow);
+        }
         mod.error_handlers[e.code] = std::move(chunk);
     }
 }
@@ -1442,6 +1277,10 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
     // The Module owns the table and outlives any in-flight request: the
     // dispatcher keeps its shared_ptr alive while the handler runs.
     const FunctionTable* fn_table = &mod.functions;
+    // --native (phase 2): resolved once, like fn_table -- valid because
+    // compile() already finished compiling native code before this is
+    // called (see the comment on Module::native, project.hpp).
+    const NativeDispatch native_table = mod.native ? mod.native->dispatch() : NativeDispatch{};
     // Templates live in the module, like the functions: the pointer is stable
     // as long as the module is, and the reload swap changes both at the same
     // time.
@@ -1451,7 +1290,8 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
     // render().
     TemplateCtx pctx{mod.program.app.templates_dir, &mod.templates};
 
-    for (const auto& r : mod.program.routes) {
+    for (size_t ridx = 0; ridx < mod.program.routes.size(); ++ridx) {
+        const auto& r = mod.program.routes[ridx];
         if (!r.origins.empty() && r.method != "WS")
             diags.error(r.loc, "origins() is only valid on ws routes");
 
@@ -1478,16 +1318,23 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
 
             auto    ws_chunk = std::make_shared<Chunk>();
             Emitter ws_emitter(diags, &fns, &sigs, &mod.program.imports, &pctx);
+            size_t  antes = diags.size();
             if (!ws_emitter.emit_route(r, *ws_chunk)) continue;
+            if (shadow_check_activo()) {
+                DiagnosticBag shadow;
+                ws_emitter.check_route(r, *ws_chunk, shadow);
+                shadow_comparar(("ws " + r.pattern).c_str(), diags, antes, shadow);
+            }
 
             ++mod.vm_routes;
             std::string ws_where = "WS " + r.pattern;
             lumen::App::WSOptions opts;
             opts.allowed_origins = r.origins;
 
+            mod.rutas_informe.push_back({r.method, r.pattern, "ws"});
             mod.router.add_internal("GET", r.pattern,
                 lumen::App::make_ws_handler(
-                    [ws_chunk, ws_binds, ws_where, auth, fn_table, tpl_table]
+                    [ws_chunk, ws_binds, ws_where, auth, fn_table, native_table, tpl_table]
                     (lumen::WSConnection conn, lumen::Request& req,
                      lumen::Response& res) -> lumen::Task<void> {
                         NativeCtx    ctx{req, res};
@@ -1503,7 +1350,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
                         if (!prepare_args(ws_binds, fn_table, req, res, ctx, args)) co_return;
 
                         VM         vm;
-                        VM::Result result = vm.start(*ws_chunk, std::move(args), ctx, fn_table);
+                        VM::Result result = vm.start(*ws_chunk, std::move(args), ctx, fn_table, &native_table);
 
                         while (result.status == VM::Status::Suspended) {
                             Value produced = Value::null();
@@ -1559,12 +1406,19 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
 
             auto    sse_chunk = std::make_shared<Chunk>();
             Emitter sse_emitter(diags, &fns, &sigs, &mod.program.imports, &pctx);
+            size_t  antes = diags.size();
             if (!sse_emitter.emit_route(r, *sse_chunk)) continue;
+            if (shadow_check_activo()) {
+                DiagnosticBag shadow;
+                sse_emitter.check_route(r, *sse_chunk, shadow);
+                shadow_comparar(("sse " + r.pattern).c_str(), diags, antes, shadow);
+            }
 
             ++mod.vm_routes;
             std::string sse_where = "SSE " + r.pattern;
+            mod.rutas_informe.push_back({r.method, r.pattern, "sse"});
             mod.router.add_internal("GET", r.pattern,
-                [sse_chunk, sse_binds, sse_where, auth, fn_table, tpl_table](lumen::Request& req,
+                [sse_chunk, sse_binds, sse_where, auth, fn_table, native_table, tpl_table](lumen::Request& req,
                                                         lumen::Response& res)
                     -> lumen::Task<void> {
                     NativeCtx    ctx{req, res};
@@ -1584,7 +1438,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
                     ctx.response_written = true;
 
                     VM         vm;
-                    VM::Result result = vm.start(*sse_chunk, std::move(args), ctx, fn_table);
+                    VM::Result result = vm.start(*sse_chunk, std::move(args), ctx, fn_table, &native_table);
 
                     while (result.status == VM::Status::Suspended) {
                         Value produced = Value::null();
@@ -1627,6 +1481,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
         // Level 1: declarative route → native action, zero bytecode.
         if (Action a = try_declarative(r, mod.program.app.templates_dir)) {
             ++mod.declarative_routes;
+            mod.rutas_informe.push_back({r.method, r.pattern, "declarativa"});
             mod.router.add_internal(r.method, r.pattern,
                 [a](lumen::Request& req, lumen::Response& res) -> lumen::Task<void> {
                     a(req, res);
@@ -1636,12 +1491,67 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
         }
 
         // Level 2: route with logic → bytecode on the VM.
+        //
+        // bind_params validates the parameters (a default on a path one,
+        // File out of place, more than one body...) ALWAYS, regardless of
+        // which level ends up serving the route -- level 1.5 does not use
+        // `binds` directly (the native handler does its own binding,
+        // identical in the rules but over C++ types instead of Value), but
+        // a program with an invalid pattern/parameter has to fail
+        // compilation all the same, and a route generate_native_route()
+        // accepted is, by construction, a STRICTER subset of what
+        // bind_params allows (no default, no File, no body) -- it should
+        // never fail here if it already passed there.
         std::vector<ParamBind> binds;
         if (!bind_params(r, classes, binds, diags)) continue;
 
+        // Nivel 1.5: ruta compilada nativamente (Fase 4/5, --native). Mismo
+        // criterio de "todo o nada" que una funcion: generar_ruta_nativa()
+        // (native_gen.cpp), invocado durante compile() -> compilar_nativo(),
+        // ya decidio si esta ruta entera es representable (parametros
+        // escalares de patron/query sin valor por defecto, cuerpo sin
+        // sesion/JWT/render/contenedores, `await` limitado a `sleep`) -- si
+        // lo es, mod.native trae el puntero ya resuelto por dlsym() y aqui
+        // solo hace falta invocarlo. La funcion generada hace su PROPIO
+        // binding de parametros (lee req.params/req.query ella misma) y
+        // escribe la respuesta directamente sobre `res`: no pasa por
+        // bind_params/prepare_args/begin_auth ni por el VM.
+        //
+        // Una ruta con `await` (RutaNativa::asincrona) se genero como
+        // lumen::Task<void> de verdad -- su firma YA coincide exactamente
+        // con Handler (ver types.hpp), asi que se registra directa, sin
+        // ningun envoltorio: envolverla en otra corrutina que la
+        // co_await-ara solo anadiria un frame sin necesidad.
+        if (mod.native && ridx < mod.native->rutas_async_por_indice.size() &&
+            mod.native->rutas_async_por_indice[ridx]) {
+            ++mod.vm_routes;
+            mod.rutas_informe.push_back({r.method, r.pattern, "nativa (async)"});
+            mod.router.add_internal(r.method, r.pattern, mod.native->rutas_async_por_indice[ridx]);
+            continue;
+        }
+        if (mod.native && ridx < mod.native->rutas_por_indice.size() &&
+            mod.native->rutas_por_indice[ridx]) {
+            auto fn = mod.native->rutas_por_indice[ridx];
+            ++mod.vm_routes; // cuenta como ruta con logica, aunque no pase por el VM
+            mod.rutas_informe.push_back({r.method, r.pattern, "nativa"});
+            mod.router.add_internal(r.method, r.pattern,
+                [fn](lumen::Request& req, lumen::Response& res) -> lumen::Task<void> {
+                    fn(req, res);
+                    co_return;
+                });
+            continue;
+        }
+
+        // Nivel 2: ruta con logica → bytecode sobre el VM.
         auto    chunk = std::make_shared<Chunk>();
         Emitter emitter(diags, &fns, &sigs, &mod.program.imports, &pctx);
+        size_t  antes = diags.size();
         if (!emitter.emit_route(r, *chunk)) continue;
+        if (shadow_check_activo()) {
+            DiagnosticBag shadow;
+            emitter.check_route(r, *chunk, shadow);
+            shadow_comparar((r.method + " " + r.pattern).c_str(), diags, antes, shadow);
+        }
 
         ++mod.vm_routes;
         bool needs_upload = false;
@@ -1650,8 +1560,9 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
                 needs_upload = true;
 
         std::string where = r.method + " " + r.pattern;
+        mod.rutas_informe.push_back({r.method, r.pattern, "bytecode"});
         mod.router.add_internal(r.method, r.pattern,
-            [chunk, binds, where, auth, needs_upload, fn_table, tpl_table](lumen::Request& req, lumen::Response& res)
+            [chunk, binds, where, auth, needs_upload, fn_table, native_table, tpl_table](lumen::Request& req, lumen::Response& res)
                 -> lumen::Task<void> {
                 NativeCtx    ctx{req, res};
                 ctx.templates = tpl_table;
@@ -1681,7 +1592,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
                 VM  own_vm;
                 VM& vm = chunk->has_await ? own_vm : shared_vm;
 
-                VM::Result result = vm.start(*chunk, std::move(args), ctx, fn_table);
+                VM::Result result = vm.start(*chunk, std::move(args), ctx, fn_table, &native_table);
 
                 // The VM does not know how to wait: every time it stops, the real
                 // co_await happens here, on the engine, and the result is handed
@@ -1735,7 +1646,7 @@ void build_routes(Module& mod, const ClassTable& classes, const AuthConfig& auth
 // ─── Compilation ─────────────────────────────────────────────────────────────
 
 std::shared_ptr<Module> compile(const std::vector<fs::path>& inputs,
-                                DiagnosticBag& diags) {
+                                DiagnosticBag& diags, bool native) {
     auto mod = std::make_shared<Module>();
     std::error_code ec;
 
@@ -1796,8 +1707,20 @@ std::shared_ptr<Module> compile(const std::vector<fs::path>& inputs,
         // functions, methods and constructors— and only then the bodies.  That
         // way anyone can call anyone regardless of declaration order.
         auto fns  = build_functions(*mod, diags);
+        mod->function_sigs = fns;
+
         auto sigs = build_class_signatures(*mod, diags);
         emit_class_bodies(*mod, sigs, fns, diags);
+
+        // --native (Fase 3): despues de las firmas/cuerpos de clase (necesita
+        // ClassSigs para constructores/metodos) y antes de construir rutas,
+        // para que puedan capturar mod->native.get() ya resuelto -- ver el
+        // comentario sobre NativeModule en project.hpp. Solo si lo demas
+        // compilo limpio: no tiene sentido invocar g++ sobre un programa que
+        // de todas formas no se va a publicar.
+        if (native && diags.empty())
+            mod->native = compilar_nativo(mod->program, fns, sigs, ".lumen-native",
+                                          mod->native_aviso);
 
         ClassTable classes;
         build_classes(mod->program, fns, sigs, &mod->program.imports, classes, diags);

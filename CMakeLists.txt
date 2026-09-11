@@ -5,6 +5,16 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 
+# --native (Fase 4, rutas): el .so que genera compilar_nativo() para una ruta
+# enlaza liblumen_script.a de verdad (necesita Value::write_json, no inline en
+# el header -- ver COMPILACION-NATIVA.md) desde una biblioteca COMPARTIDA. Un
+# .a compilado sin -fPIC no se puede meter dentro de un .so -- de ahi esto
+# global, no solo en el target de lumen_script: mas simple que marcar cada
+# dependencia transitiva (lumen, lumen_llhttp) una por una, y el coste (PIC en
+# el binario `lumen` mismo, que no lo necesitaba) es insignificante frente a
+# tener que recompilar bajo demanda.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
@@ -110,18 +120,40 @@ add_library(lumen_script STATIC
     src/lumen_script/lexer.cpp
     src/lumen_script/parser.cpp
     src/lumen_script/crypto.cpp
+    src/lumen_script/auth.cpp
+    src/lumen_script/type.cpp
     src/lumen_script/db.cpp
     src/lumen_script/value.cpp
     src/lumen_script/json_parse.cpp
     src/lumen_script/template.cpp
     src/lumen_script/natives.cpp
     src/lumen_script/emitter.cpp
+    src/lumen_script/native_gen.cpp
+    src/lumen_script/native_build.cpp
     src/lumen_script/vm.cpp
     src/lumen_script/autotest.cpp
     src/lumen_script/project.cpp
 )
 target_include_directories(lumen_script PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(lumen_script PUBLIC lumen)
+target_link_libraries(lumen_script PUBLIC lumen ${CMAKE_DL_LIBS})
+
+# --native (phase 4/5, routes): native_build.cpp invokes g++ as a subprocess
+# to compile the .cpp a route generates -- it needs to know, at runtime of the
+# `lumen` binary, where the project's own headers are (for
+# #include <lumen/response.hpp>, <lumen_script/value.hpp>...) and where the
+# already-compiled liblumen_script.a/liblumen.a ended up. liblumen_script is
+# needed for Value::write_json (not inline); liblumen for
+# lumen::core::EpollLoop::post -- needed by any route with `await`, because
+# the Task<void> a coroutine generates schedules itself to self-destruct
+# there once it finishes (see Task<void>::promise_type::FinalAwaitable in
+# task.hpp) -- found in practice (undefined symbol loading the .so) testing
+# the first route with `await sleep(...)`, not guessed beforehand.
+# There is no way for an already-linked binary to guess these paths on its
+# own: they are baked in here, at CMake's own compile time.
+target_compile_definitions(lumen_script PRIVATE
+    LUMEN_NATIVE_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
+    LUMEN_NATIVE_SCRIPT_LIB="$<TARGET_FILE:lumen_script>"
+    LUMEN_NATIVE_LIB="$<TARGET_FILE:lumen>")
 
 if(LUMEN_SQLITE)
     find_path(SQLITE3_INC sqlite3.h)
@@ -170,6 +202,17 @@ target_compile_options(lumen_script PRIVATE -Wall -Wextra)
 add_executable(lumen-bin src/lumen_script/main.cpp)
 set_target_properties(lumen-bin PROPERTIES OUTPUT_NAME lumen)
 target_link_libraries(lumen-bin PRIVATE lumen_script)
+# --native (Fase 5, `await`): sin esto, el .so que dlopen() carga en tiempo
+# de ejecucion NO comparte los `inline thread_local` de task.hpp
+# (lumen::detail::current_loop/current_token, que HttpConnection::dispatch()
+# deja puestos antes de cada peticion) con este ejecutable -- cada uno se
+# lleva su propia copia privada, siempre a null en la del .so. Sin loop,
+# SleepAwaitable::await_suspend() resume el acto, sin esperar nada: `await
+# sleep(200)` en una ruta nativa respondia en ~3ms en vez de ~200ms,
+# encontrado probando la primera ruta con `await` de verdad contra HTTP, no
+# adivinado de antemano. -rdynamic exporta los simbolos de este binario al
+# tabla dinamica para que el .so resuelva contra ELLOS, no cree los suyos.
+target_link_options(lumen-bin PRIVATE -rdynamic)
 
 # Frontend development tools.
 add_executable(dump_tokens src/lumen_script/tools/dump_tokens.cpp)
@@ -189,6 +232,66 @@ enable_testing()
 add_executable(test_templates tests/templates.cpp)
 target_link_libraries(test_templates PRIVATE lumen_script)
 add_test(NAME templates COMMAND test_templates)
+
+# --native phase 1 (COMPILACION-NATIVA.md): compares Emitter::check_expr/
+# check_call against the real compilation, expression by expression. It lives
+# here, not in tests/run_tests.sh, because it calls the library directly
+# instead of the binary: it is a test of an internal piece not wired up yet.
+add_executable(test_check_expr_shadow tests/check_expr_shadow.cpp)
+target_link_libraries(test_check_expr_shadow PRIVATE lumen_script)
+add_test(NAME check_expr_shadow COMMAND test_check_expr_shadow)
+
+add_executable(test_check_stmt_shadow tests/check_stmt_shadow.cpp)
+target_link_libraries(test_check_stmt_shadow PRIVATE lumen_script)
+add_test(NAME check_stmt_shadow COMMAND test_check_stmt_shadow)
+
+# The other half of phase 1: not just that check_expr/check_stmt reproduce
+# the same diagnostics (above), but that the emitter consuming the IR
+# produces bytecode that BEHAVES the same when actually run on the VM.
+add_executable(test_emit_ir_shadow tests/emit_ir_shadow.cpp)
+target_link_libraries(test_emit_ir_shadow PRIVATE lumen_script)
+add_test(NAME emit_ir_shadow COMMAND test_emit_ir_shadow)
+
+# --native phase 2: generates real C++ from the IR, compiles it with the
+# system compiler (invokes `g++` as a subprocess) and compares its execution
+# against the VM -- the phase's acceptance criterion.
+add_executable(test_native_gen_shadow tests/native_gen_shadow.cpp)
+target_link_libraries(test_native_gen_shadow PRIVATE lumen_script)
+add_test(NAME native_gen_shadow COMMAND test_native_gen_shadow)
+
+# The other half: compile_native() for real (invokes g++, dlopen, dlsym) and
+# dispatch inside the VM (VM::start with the native table wired up) give the
+# same result as bytecode -- see the comment in tests/native_build_shadow.cpp.
+add_executable(test_native_build_shadow tests/native_build_shadow.cpp)
+target_link_libraries(test_native_build_shadow PRIVATE lumen_script)
+add_test(NAME native_build_shadow COMMAND test_native_build_shadow)
+
+# User classes: generates the C++ for a class and its methods directly
+# (without going through compile_native(), which today has nothing to offer
+# a class-only program -- see the comment in tests/native_class_shadow.cpp)
+# and compares its execution against the VM.
+add_executable(test_native_class_shadow tests/native_class_shadow.cpp)
+target_link_libraries(test_native_class_shadow PRIVATE lumen_script)
+add_test(NAME native_class_shadow COMMAND test_native_class_shadow)
+
+# Phase 4: one HTTP route compiled to native, end to end, through the real
+# compile() (parsing, build_routes, compile_native) -- not a Program built by
+# hand -- compared against the same route served by bytecode. Needs g++ to
+# find <lumen/response.hpp> and link liblumen_script.a: same macros
+# native_build.cpp already uses (see the comment on LUMEN_NATIVE_INCLUDE_DIR
+# on the lumen_script target), so there is no need to repeat them here.
+add_executable(test_native_route_shadow tests/native_route_shadow.cpp)
+target_link_libraries(test_native_route_shadow PRIVATE lumen_script)
+# Same reason as lumen-bin above, and the same kind of symptom found the same
+# way (by testing for real, not guessed beforehand): state.incr()/state.get()
+# (phase 5.9) resolve against SharedState::instance(), a function-local
+# `static` in natives.cpp -- without -rdynamic, the .so that compile_native()
+# dlopen()s here carries its OWN copy (liblumen_script.a linked again inside
+# the .so), so a bytecode state.incr() and a --native one, in the SAME test,
+# incremented DIFFERENT counters -- this test caught it (sequence 1,2,1,1,2
+# instead of 1,2,3,3,3) before this comment was written.
+target_link_options(test_native_route_shadow PRIVATE -rdynamic)
+add_test(NAME native_route_shadow COMMAND test_native_route_shadow)
 
 # The postgres placeholder translator is a pure function: it is tested without a
 # server by including the driver's .cpp, to test THE code and not a copy.
